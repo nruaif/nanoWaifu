@@ -169,12 +169,12 @@ def train(config_path):
             param.requires_grad = False
 
     all_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(image_tagger.parameters())
-    optimizer = ScheduleFreeAdamW(all_params, lr=config['training']['learning_rate'], weight_decay=1e-2)
+    optimizer = ScheduleFreeAdamW(all_params, lr=config['training']['learning_rate'], weight_decay=1e-2, betas=(0.9, 0.95))
 
     # Resume from checkpoint if specified
     start_epoch = 0
     global_step = 0
-    resume_path = config.get('resume_from', "/workspace/shinon/t2i/nanoWaifu/outputs/ckpt_step_145000.pth")
+    resume_path = config['training'].get('resume_from', "")
 
     if resume_path and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
@@ -259,8 +259,13 @@ def train(config_path):
                 for key in sorted(unexpected):
                     print(f"  - {key}")
 
-            # Attempt to load optimizer state if available and compatible
-            if isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint:
+            # Load image tagger state if it exists
+            if "tagger_state_dict" in checkpoint:
+                missing_t, _ = image_tagger.load_state_dict(checkpoint["tagger_state_dict"], strict=False)
+                print(f"Loaded ImageTagger state. Missing keys: {len(missing_t)}")
+                
+            # Load optimizer state if it exists
+            if "optimizer_state_dict" in checkpoint:
                 try:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                     print("Loaded optimizer state.")
@@ -387,8 +392,12 @@ def train(config_path):
 
                 # Save Checkpoint (Unwrap DDP)
                 model_to_save = model.module if is_ddp else model
+                tagger_to_save = image_tagger.module if is_ddp and isinstance(image_tagger, DDP) else image_tagger
+                
                 ckpt_state = {
                     "model_state_dict": model_to_save.state_dict(),
+                    "tagger_state_dict": tagger_to_save.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
                     "global_step": global_step,
                     "config": config
                 }
