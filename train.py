@@ -349,10 +349,13 @@ def train(config_path):
             pbar.update(1)
 
             current_lr = optimizer.param_groups[0]['lr']
+            active_image_tags = image_tags.sum(dim=1).mean().item() if image_tags is not None else 0.0
+            
             logs = {
                 "loss": loss.item(),
                 "loss_head_v": loss_head.item(),
                 "loss_backbone_x": loss_backbone.item(),
+                "active_image_tags": active_image_tags,
                 "lr": current_lr,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
@@ -388,10 +391,12 @@ def train(config_path):
                 model.eval()
                 optimizer.eval()
                 with torch.no_grad():
-                    # Random tags for sampling: activate ~10% of tags randomly
-                    sample_tags = (torch.rand(4, num_tags, device=device) < 0.1).float()
-                    sample_coords = torch.tensor([[0.0, 0.0, 1.0, 1.0]] * 4, device=device)
-                    latent_samples = sample_flow(model, config['training']['image_size'], 4,
+                    # Use real tags and coords from the current batch for sampling
+                    num_samples = min(4, tags.shape[0])
+                    sample_tags = tags[:num_samples]
+                    sample_coords = coords[:num_samples]
+                    
+                    latent_samples = sample_flow(model, config['training']['image_size'], num_samples,
                                           sample_tags, sample_coords, device, cfg_scale=cfg_scale)
                     # Un-normalize and decode latents to pixels
                     with torch.no_grad():
