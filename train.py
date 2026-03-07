@@ -333,7 +333,14 @@ def train(config_path):
             v_head, x_backbone = model(xt, t * 1000, tags, coords, image_tags=image_tags, drop_rate=drop_rate)
             loss_head = torch.mean((v_head - ut) ** 2)
             loss_backbone = torch.mean((x_backbone - x1) ** 2)
-            loss = loss_head + loss_backbone
+            
+            # L1 penalty on image tags to encourage sparsity
+            tagger_l1_weight = config['training'].get('tagger_l1_weight', 1e-4)
+            loss_l1 = 0.0
+            if tagger_l1_weight > 0.0 and image_tags is not None:
+                loss_l1 = tagger_l1_weight * torch.mean(torch.abs(image_tags))
+
+            loss = loss_head + loss_backbone + loss_l1
 
         optimizer.zero_grad()
         loss.backward()
@@ -355,6 +362,7 @@ def train(config_path):
                 "loss": loss.item(),
                 "loss_head_v": loss_head.item(),
                 "loss_backbone_x": loss_backbone.item(),
+                "loss_l1_tags": loss_l1.item() if isinstance(loss_l1, torch.Tensor) else loss_l1,
                 "active_image_tags": active_image_tags,
                 "lr": current_lr,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,

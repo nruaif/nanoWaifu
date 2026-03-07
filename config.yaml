@@ -12,6 +12,7 @@ training:
   num_workers: 2
   class_dropout_prob: 0.1
   cfg_scale: 4.0
+  tagger_l1_weight: 1.0e-4
   drop_rate: 0.5  # TREAD token drop rate (0.0 = no routing, 0.5 = 50% bypassed)
   output_dir: "outputs"
   wandb_project: "nanoWaifu-DiT"

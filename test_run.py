@@ -119,8 +119,11 @@ def test_flow_matching():
     ut = x1 - x0
 
     vt, x_bb = model(xt, t * 1000, tags, coords, image_tags=image_tags, drop_rate=0.5)
-    loss = torch.mean((vt - ut) ** 2)
-    print(f"  Loss: {loss.item():.4f}")
+    loss_head = torch.mean((vt - ut) ** 2)
+    loss_bb = torch.mean((x_bb - x1) ** 2)
+    loss_l1 = 1e-4 * torch.mean(torch.abs(image_tags))
+    loss = loss_head + loss_bb + loss_l1
+    print(f"  Loss (Total): {loss.item():.4f} | L1: {loss_l1.item():.4f}")
 
     # Sampling (no image tags, no routing)
     samples = sample_flow_test(model, 1, tags[:1], coords[:1], "cpu", steps=5)
