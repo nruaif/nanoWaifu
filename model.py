@@ -458,18 +458,24 @@ class TREADDiTBackbone(DiTBackbone):
         if self.training:
             mask = torch.rand(tag_vec.shape[0], device=tag_vec.device) < self.class_dropout_prob
             tag_vec = tag_vec * (~mask).float().unsqueeze(1)
+            
+        # L2 Normalize text tag vector (like cosine sim) to length 1
+        tag_vec_norm = F.normalize(tag_vec, p=2, dim=1)
         
-        y_emb = self.tag_embedder(tag_vec)
+        y_emb = self.tag_embedder(tag_vec_norm)
         coord_emb = self.coord_embedder(crop_coords)
         c = t_emb + y_emb + coord_emb
         
         # Add learned image tag embedding (50% chance during training, always during eval if provided)
         if image_tags is not None:
+            # L2 Normalize image tag vector (like cosine sim) to length 1
+            img_vec_norm = F.normalize(image_tags, p=2, dim=1)
+            
             if self.training:
                 img_mask = (torch.rand(image_tags.shape[0], device=image_tags.device) < 0.5).float().unsqueeze(1)
-                c = c + self.image_tag_embedder(image_tags) * img_mask
+                c = c + self.image_tag_embedder(img_vec_norm) * img_mask
             else:
-                c = c + self.image_tag_embedder(image_tags)
+                c = c + self.image_tag_embedder(img_vec_norm)
 
         # Process initial blocks (before routing)
         for i in range(self.routing_start):
