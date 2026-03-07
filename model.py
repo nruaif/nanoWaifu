@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import timm
 
 
 def modulate(x, shift, scale):
@@ -127,7 +128,8 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.img_size = img_size
         self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # 7x7 conv with padding=3 for local receptive field, stride=patch_size
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=7, stride=patch_size, padding=3)
 
     def forward(self, x):
         x = self.proj(x)
@@ -140,14 +142,14 @@ class DiTBackbone(nn.Module):
     """
     def __init__(
         self,
-        input_size=64,
-        patch_size=4,
-        in_channels=3,
+        input_size=16,
+        patch_size=1,
+        in_channels=128,
         hidden_size=384,
         depth=6,
         num_heads=6,
         mlp_ratio=4.0,
-        num_classes=100,
+        num_tags=100,
         class_dropout_prob=0.1,
     ):
         super().__init__()
@@ -156,12 +158,16 @@ class DiTBackbone(nn.Module):
         self.in_channels = in_channels
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.num_classes = num_classes
+        self.num_tags = num_tags
         self.class_dropout_prob = class_dropout_prob
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = nn.Embedding(num_classes + 1, hidden_size)
+        self.tag_embedder = nn.Sequential(
+            nn.Linear(num_tags, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
         self.coord_embedder = nn.Sequential(
             nn.Linear(4, hidden_size),
             nn.SiLU(),
@@ -196,7 +202,8 @@ class DiTBackbone(nn.Module):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
-        nn.init.normal_(self.y_embedder.weight, std=0.02)
+        nn.init.normal_(self.tag_embedder[0].weight, std=0.02)
+        nn.init.normal_(self.tag_embedder[2].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
@@ -224,7 +231,7 @@ class DiTBackbone(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, class_labels, crop_coords):
+    def forward(self, x, t, tag_vec, crop_coords):
         x = self.x_embedder(x) + self.pos_embed
         
         # Save initial embedding for skip connection (N, T, D)
@@ -232,11 +239,12 @@ class DiTBackbone(nn.Module):
 
         t_emb = self.t_embedder(t)
         
+        # CFG dropout: zero out the tag vector for unconditioned samples
         if self.training:
-            mask = torch.rand(class_labels.shape[0], device=class_labels.device) < self.class_dropout_prob
-            class_labels = torch.where(mask, torch.tensor(self.num_classes, device=class_labels.device), class_labels)
+            mask = torch.rand(tag_vec.shape[0], device=tag_vec.device) < self.class_dropout_prob
+            tag_vec = tag_vec * (~mask).float().unsqueeze(1)
         
-        y_emb = self.y_embedder(class_labels)
+        y_emb = self.tag_embedder(tag_vec)
         coord_emb = self.coord_embedder(crop_coords)
         c = t_emb + y_emb + coord_emb
 
@@ -342,22 +350,22 @@ class DiT(nn.Module):
     """
     def __init__(
         self,
-        input_size=64,
-        patch_size=4,
-        in_channels=3,
+        input_size=16,
+        patch_size=1,
+        in_channels=128,
         hidden_size=384,
         depth=6,
         num_heads=6,
         mlp_ratio=4.0,
-        num_classes=100,
+        num_tags=100,
         class_dropout_prob=0.1,
     ):
         super().__init__()
-        self.num_classes = num_classes
+        self.num_tags = num_tags
         self.class_dropout_prob = class_dropout_prob
         self.backbone = DiTBackbone(
             input_size, patch_size, in_channels, hidden_size,
-            depth, num_heads, mlp_ratio, num_classes, class_dropout_prob
+            depth, num_heads, mlp_ratio, num_tags, class_dropout_prob
         )
         
         self.head = ResNetHead(
@@ -371,11 +379,202 @@ class DiT(nn.Module):
     def enable_gradient_checkpointing(self):
         self.backbone.enable_gradient_checkpointing()
 
-    def forward(self, x, t, class_labels, crop_coords):
+    def forward(self, x, t, tag_vec, crop_coords):
         # DiT Backbone forward
-        x_pred, x_start, x_end, t_emb = self.backbone(x, t, class_labels, crop_coords)
+        x_pred, x_start, x_end, t_emb = self.backbone(x, t, tag_vec, crop_coords)
         
         # Head Forward
+        out = self.head(x_start, x_end, t_emb)
+        return out, x_pred
+
+class ImageTagger(nn.Module):
+    """
+    Learned visual tagger: ConvNeXt-Small → global pool → 8192 binary channels via STE.
+    Produces a binary feature vector that captures residual visual information
+    not covered by text tags.
+    """
+    def __init__(self, num_binary_channels=8192, pretrained=True):
+        super().__init__()
+        self.num_binary_channels = num_binary_channels
+        
+        # ConvNeXt-Small backbone (fully convolutional, any input size)
+        self.backbone = timm.create_model(
+            'convnext_small',
+            pretrained=pretrained,
+            num_classes=0,  # Remove classifier, get pooled features
+        )
+        backbone_dim = self.backbone.num_features  # 768 for convnext_small
+        
+        # Project to binary channels
+        self.proj = nn.Linear(backbone_dim, num_binary_channels)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 3, H, W) raw image in [-1, 1]
+        Returns:
+            binary_tags: (B, num_binary_channels) binary {0, 1} via STE
+        """
+        # ConvNeXt expects roughly [0, 1] or ImageNet-normalized input
+        # Our images are [-1, 1], convert to [0, 1]
+        x = x * 0.5 + 0.5
+        
+        features = self.backbone(x)       # (B, 768)
+        logits = self.proj(features)       # (B, 8192)
+        
+        # STE binarization: forward = hard threshold, backward = straight-through
+        binary = (logits > 0).float()
+        binary_ste = logits + (binary - logits).detach()
+        
+        return binary_ste
+
+class TREADDiTBackbone(DiTBackbone):
+    """
+    TREAD implementation: Routes tokens from early layers to deeper layers
+    to reduce computation in intermediate blocks.
+    """
+    def __init__(self, *args, routing_start=1, routing_end=5, num_image_tags=8192, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.routing_start = routing_start
+        self.routing_end = routing_end
+        
+        # Embedder for learned binary image tags
+        self.image_tag_embedder = nn.Sequential(
+            nn.Linear(num_image_tags, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        
+    def forward(self, x, t, tag_vec, crop_coords, image_tags=None, drop_rate=0.0):
+        """
+        Args:
+            drop_rate (float): Probability 'p' of routing tokens.
+            image_tags: (B, 8192) binary image tags from ImageTagger, or None.
+        """
+        x = self.x_embedder(x) + self.pos_embed
+        x_start = x
+        
+        t_emb = self.t_embedder(t)
+        if self.training:
+            mask = torch.rand(tag_vec.shape[0], device=tag_vec.device) < self.class_dropout_prob
+            tag_vec = tag_vec * (~mask).float().unsqueeze(1)
+        
+        y_emb = self.tag_embedder(tag_vec)
+        coord_emb = self.coord_embedder(crop_coords)
+        c = t_emb + y_emb + coord_emb
+        
+        # Add learned image tag embedding (50% chance during training, always during eval if provided)
+        if image_tags is not None:
+            if self.training:
+                img_mask = (torch.rand(image_tags.shape[0], device=image_tags.device) < 0.5).float().unsqueeze(1)
+                c = c + self.image_tag_embedder(image_tags) * img_mask
+            else:
+                c = c + self.image_tag_embedder(image_tags)
+
+        # Process initial blocks (before routing)
+        for i in range(self.routing_start):
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.blocks[i], x, c, use_reentrant=False)
+            else:
+                x = self.blocks[i](x, c)
+
+        # TREAD routing logic
+        routed_tokens = None
+        indices_keep = None
+        indices = None
+        n_keep = 0
+        
+        if drop_rate > 0.0:
+            B, N, D = x.shape
+            n_keep = int(N * (1 - drop_rate))
+            
+            batch_indices = torch.arange(B, device=x.device).unsqueeze(1)
+            indices = torch.stack([torch.randperm(N, device=x.device) for _ in range(B)])
+            
+            indices_keep = indices[:, :n_keep]
+            indices_route = indices[:, n_keep:]
+            
+            routed_tokens = x[batch_indices, indices_route]
+            x = x[batch_indices, indices_keep]
+
+        # Process intermediate blocks (with reduced token count)
+        for i in range(self.routing_start, self.routing_end):
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.blocks[i], x, c, use_reentrant=False)
+            else:
+                x = self.blocks[i](x, c)
+
+        # Re-integrate routed tokens
+        if routed_tokens is not None:
+            B, N_reduced, D = x.shape
+            N_total = N_reduced + routed_tokens.shape[1]
+            
+            x_full = torch.zeros(B, N_total, D, device=x.device, dtype=x.dtype)
+            
+            indices_route = indices[:, n_keep:]
+            batch_indices = torch.arange(B, device=x.device).unsqueeze(1)
+            x_full[batch_indices, indices_keep] = x
+            x_full[batch_indices, indices_route] = routed_tokens
+            x = x_full
+
+        # Process remaining blocks
+        for i in range(self.routing_end, len(self.blocks)):
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.blocks[i], x, c, use_reentrant=False)
+            else:
+                x = self.blocks[i](x, c)
+
+        x_pred = self.final_layer(x, c)
+        x_pred = self.unpatchify(x_pred)
+
+        H_grid = W_grid = int(x.shape[1] ** 0.5)
+        x_start_fm = x_start.transpose(1, 2).reshape(x_start.shape[0], self.hidden_size, H_grid, W_grid)
+        x_end_fm = x.transpose(1, 2).reshape(x.shape[0], self.hidden_size, H_grid, W_grid)
+        
+        return x_pred, x_start_fm, x_end_fm, t_emb
+
+class TREADDiT(nn.Module):
+    """
+    Composite TREAD model: TREADDiTBackbone + ResNet Head.
+    """
+    def __init__(
+        self,
+        input_size=16,
+        patch_size=1,
+        in_channels=128,
+        hidden_size=384,
+        depth=6,
+        num_heads=6,
+        mlp_ratio=4.0,
+        num_tags=100,
+        class_dropout_prob=0.1,
+        routing_start=1,
+        routing_end=5,
+        num_image_tags=8192,
+    ):
+        super().__init__()
+        self.num_tags = num_tags
+        self.class_dropout_prob = class_dropout_prob
+        self.backbone = TREADDiTBackbone(
+            input_size, patch_size, in_channels, hidden_size,
+            depth, num_heads, mlp_ratio, num_tags, class_dropout_prob,
+            routing_start=routing_start, routing_end=routing_end,
+            num_image_tags=num_image_tags,
+        )
+        
+        self.head = ResNetHead(
+            in_channels=hidden_size,
+            out_channels=in_channels,
+            patch_size=patch_size,
+            hidden_size=1024,
+            num_blocks=3
+        )
+
+    def enable_gradient_checkpointing(self):
+        self.backbone.enable_gradient_checkpointing()
+
+    def forward(self, x, t, tag_vec, crop_coords, image_tags=None, drop_rate=0.0):
+        x_pred, x_start, x_end, t_emb = self.backbone(x, t, tag_vec, crop_coords, image_tags=image_tags, drop_rate=drop_rate)
         out = self.head(x_start, x_end, t_emb)
         return out, x_pred
 

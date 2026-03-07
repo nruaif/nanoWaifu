@@ -1,10 +1,8 @@
 import webdataset as wds
 import torch
 from torch.utils.data import DataLoader
-import pandas as pd
 import torchvision.transforms.functional as F
 import torchvision.transforms as transforms
-import random
 import io
 from PIL import Image
 import json
@@ -14,22 +12,27 @@ def warn_and_continue(exn):
     return True
 
 class WDSLoader:
-    def __init__(self, url, csv_path, image_size=64, batch_size=16, num_workers=4):
+    def __init__(self, url, tags_path, image_size=64, batch_size=16, num_workers=4):
         self.url = url
         self.image_size = image_size
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.class_map = self.load_class_map(csv_path)
-        self.num_classes = len(self.class_map)
+        self.tag_vocab = self.load_tag_vocab(tags_path)
+        self.num_tags = len(self.tag_vocab)
 
         # Transforms parameters
         self.scale = (0.5, 1.0)
         self.ratio = (3. / 4., 4. / 3.)
 
-    def load_class_map(self, csv_path):
-        # Using latin-1 encoding to avoid UnicodeDecodeError on special characters
-        df = pd.read_csv(csv_path, encoding='latin-1')
-        return dict(zip(df['character'], df['id']))
+    def load_tag_vocab(self, tags_path):
+        """Load tag vocabulary from a text file (one tag per line). Returns {tag: index} dict."""
+        tag_vocab = {}
+        with open(tags_path, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                tag = line.strip()
+                if tag and tag not in tag_vocab:
+                    tag_vocab[tag] = len(tag_vocab)
+        return tag_vocab
 
     def preprocess(self, sample):
         # Find image key
@@ -40,7 +43,6 @@ class WDSLoader:
                 break
         
         if image_key is None:
-            # Debug: Print keys if image not found (first few times)
             if not hasattr(self, "_log_missing_key_count"): self._log_missing_key_count = 0
             if self._log_missing_key_count < 5:
                 print(f"Skipping sample: No image key found. Available keys: {list(sample.keys())}")
@@ -53,20 +55,23 @@ class WDSLoader:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             print(f"Error decoding image: {e}")
-            return None # Skip broken images
+            return None
 
-        # Decode JSON for class
-        # If 'json' key missing, treat as unknown/unconditioned
+        # Decode JSON for tags
         try:
             if "json" in sample:
                 meta = json.loads(sample["json"])
             else:
-                meta = {} # Empty meta implies unknown character
+                meta = {}
             
-            char_name = meta.get("character", "unknown")
-            # Map to self.num_classes if not found. This aligns with the DiT null token index,
-            # effectively treating unknown characters as "unconditioned" samples.
-            class_id = self.class_map.get(char_name, self.num_classes)
+            tags_str = meta.get("tags", "")
+            # Build multi-hot tag vector
+            tag_vec = torch.zeros(self.num_tags, dtype=torch.float32)
+            if tags_str:
+                for tag in tags_str.split(" "):
+                    tag = tag.strip()
+                    if tag in self.tag_vocab:
+                        tag_vec[self.tag_vocab[tag]] = 1.0
         except Exception as e:
             print(f"Error parsing metadata: {e}")
             return None
@@ -74,12 +79,7 @@ class WDSLoader:
         # Random Resized Crop logic
         i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
         
-        # Original size
         W, H = image.size
-        
-        # Relative coords: top, left, height, width
-        # i (top), j (left), h, w
-        # Normalize by H, W
         rel_coords = [i / H, j / W, h / H, w / W]
         rel_coords = torch.tensor(rel_coords, dtype=torch.float32)
 
@@ -92,7 +92,7 @@ class WDSLoader:
 
         return {
             "image": image,
-            "class_id": class_id,
+            "tags": tag_vec,
             "coords": rel_coords
         }
 
@@ -102,13 +102,13 @@ class WDSLoader:
             .shuffle(1000)
             .map(self.preprocess, handler=warn_and_continue,)
             .select(lambda x: x is not None)
-            .to_tuple("image", "class_id", "coords", handler=warn_and_continue,)
+            .to_tuple("image", "tags", "coords", handler=warn_and_continue,)
             .batched(self.batch_size, partial=False)
         )
         
         loader = DataLoader(
             dataset,
-            batch_size=None, # Batched in webdataset
+            batch_size=None,
             num_workers=self.num_workers,
             pin_memory=True
         )

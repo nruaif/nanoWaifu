@@ -14,8 +14,9 @@ import wandb
 import glob
 import builtins
 
-from model import DiT
+from model import TREADDiT, ImageTagger
 from dataset import WDSLoader
+from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
 
 
 def setup_ddp():
@@ -55,21 +56,23 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
 
 
 @torch.no_grad()
-def sample_flow(model, image_size, batch_size, classes, coords, device, steps=50, cfg_scale=4.0):
+def sample_flow(model, image_size, batch_size, tag_vecs, coords, device, steps=50, cfg_scale=4.0):
     """
     Sample using Euler integration of the flow ODE with Classifier-Free Guidance.
     """
     # Handle DDP model wrapper
     model_engine = model.module if isinstance(model, DDP) else model
 
-    # Start from noise x_0
-    x = torch.randn((batch_size, 3, image_size, image_size), device=device)
+    # Start from noise x_0 — derive shape from model
+    latent_ch = model_engine.backbone.in_channels
+    latent_sz = model_engine.backbone.input_size
+    x = torch.randn((batch_size, latent_ch, latent_sz, latent_sz), device=device)
 
     dt = 1.0 / steps
     indices = torch.linspace(0, 1, steps, device=device)
 
-    # Pre-prepare null classes for unconditioned pass
-    null_classes = torch.full_like(classes, model_engine.num_classes, device=device)
+    # Null tags = all-zeros vector for unconditioned pass
+    null_tags = torch.zeros_like(tag_vecs)
 
     for i in tqdm(range(steps), desc='Sampling', leave=False):
         t = indices[i]
@@ -77,11 +80,11 @@ def sample_flow(model, image_size, batch_size, classes, coords, device, steps=50
         # Prepare inputs for batch (cond + uncond)
         x_in = torch.cat([x, x])
         t_batch = torch.full((batch_size * 2,), t.item(), device=device, dtype=torch.float)
-        c_in = torch.cat([classes, null_classes])
+        tags_in = torch.cat([tag_vecs, null_tags])
         coords_in = torch.cat([coords, coords])
 
         # Predict velocity field v_t
-        v_pred, _ = model(x_in, t_batch * 1000, c_in, coords_in)
+        v_pred, _ = model(x_in, t_batch * 1000, tags_in, coords_in)
 
         v_cond, v_uncond = v_pred.chunk(2)
         v = v_uncond + cfg_scale * (v_cond - v_uncond)
@@ -111,10 +114,19 @@ def train(config_path):
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-DiT'), config=config)
 
+    # Load VAE (frozen)
+    vae = Flux2TinyAutoEncoder.from_pretrained(
+        config['data'].get('vae_model', 'fal/FLUX.2-Tiny-AutoEncoder'),
+    ).to(device=device, dtype=torch.bfloat16)
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+    print(f"Loaded VAE: {config['data'].get('vae_model', 'fal/FLUX.2-Tiny-AutoEncoder')}")
+
     # Load Data
     wds_loader = WDSLoader(
         url=config['data']['webdataset_url'],
-        csv_path=config['data']['csv_path'],
+        tags_path=config['data']['tags_path'],
         image_size=config['training']['image_size'],
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers']
@@ -122,19 +134,29 @@ def train(config_path):
     dataloader = wds_loader.make_loader()
 
     # Init Model
-    num_classes = wds_loader.num_classes
+    num_tags = wds_loader.num_tags
     
-    model = DiT(
-        input_size=config['training']['image_size'],
-        patch_size=config['training']['patch_size'],
+    model = TREADDiT(
+        input_size=config['model']['latent_size'],
+        patch_size=config['model']['patch_size'],
         in_channels=config['model']['in_channels'],
         hidden_size=config['model']['dim'],
         depth=config['model']['depth'],
         num_heads=config['model']['heads'],
         mlp_ratio=config['model']['mlp_dim'] / config['model']['dim'],
-        num_classes=num_classes,
+        num_tags=num_tags,
         class_dropout_prob=config['training']['class_dropout_prob'],
+        routing_start=config['model'].get('routing_start', 1),
+        routing_end=config['model'].get('routing_end', 5),
+        num_image_tags=config['model'].get('num_image_tags', 8192),
     ).to(device)
+
+    # Image tagger (ConvNeXt-Small, trained jointly)
+    image_tagger = ImageTagger(
+        num_binary_channels=config['model'].get('num_image_tags', 8192),
+        pretrained=True,
+    ).to(device)
+    print(f"ImageTagger: ConvNeXt-Small -> {config['model'].get('num_image_tags', 8192)} binary channels")
 
     if config['training'].get('gradient_checkpointing', False):
         model.enable_gradient_checkpointing()
@@ -145,7 +167,8 @@ def train(config_path):
         for param in model.backbone.parameters():
             param.requires_grad = False
 
-    optimizer = ScheduleFreeAdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['training']['learning_rate'], weight_decay=1e-2)
+    all_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(image_tagger.parameters())
+    optimizer = ScheduleFreeAdamW(all_params, lr=config['training']['learning_rate'], weight_decay=1e-2)
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -260,6 +283,7 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
 
     cfg_scale = config['training'].get('cfg_scale', 4.0)
+    drop_rate = config['training'].get('drop_rate', 0.5)
 
     # Training Loop
     # Calculate max_train_steps if not explicitly provided
@@ -285,10 +309,17 @@ def train(config_path):
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        x1, class_ids, coords = batch
+        x1, tags, coords = batch
         x1 = x1.to(device)
-        class_ids = class_ids.to(device)
+        tags = tags.to(device)
         coords = coords.to(device)
+
+        # Run image tagger on raw images (before VAE encoding)
+        image_tags = image_tagger(x1)
+
+        # Encode images to latents
+        with torch.no_grad():
+            x1 = vae.encode(x1.to(dtype=torch.bfloat16), return_dict=False).float()
 
         # Flow Matching Training
         t = torch.rand((x1.shape[0],), device=device)
@@ -298,7 +329,7 @@ def train(config_path):
         ut = x1 - x0
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            v_head, x_backbone = model(xt, t * 1000, class_ids, coords)
+            v_head, x_backbone = model(xt, t * 1000, tags, coords, image_tags=image_tags, drop_rate=drop_rate)
             loss_head = torch.mean((v_head - ut) ** 2)
             loss_backbone = torch.mean((x_backbone - x1) ** 2)
             loss = loss_head + loss_backbone
@@ -356,12 +387,15 @@ def train(config_path):
                 model.eval()
                 optimizer.eval()
                 with torch.no_grad():
-                    sample_classes = torch.randint(0, num_classes, (4,), device=device)
+                    # Random tags for sampling: activate ~10% of tags randomly
+                    sample_tags = (torch.rand(4, num_tags, device=device) < 0.1).float()
                     sample_coords = torch.tensor([[0.0, 0.0, 1.0, 1.0]] * 4, device=device)
-                    samples = sample_flow(model, config['training']['image_size'], 4,
-                                          sample_classes, sample_coords, device, cfg_scale=cfg_scale)
-                    samples = (samples + 1) / 2.0
-                    samples = torch.clamp(samples, 0, 1)
+                    latent_samples = sample_flow(model, config['training']['image_size'], 4,
+                                          sample_tags, sample_coords, device, cfg_scale=cfg_scale)
+                    # Decode latents to pixels
+                    with torch.no_grad():
+                        samples = vae.decode(latent_samples.to(dtype=torch.bfloat16), return_dict=False)
+                    samples = samples.float().clamp(-1, 1) / 2.0 + 0.5
                     grid = make_grid(samples, nrow=2)
                     wandb_image = wandb.Image(grid, caption=f"Sample Step {global_step} (CFG={cfg_scale})")
                     wandb.log({"samples": wandb_image}, step=global_step)
