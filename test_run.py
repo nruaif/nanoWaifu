@@ -82,7 +82,7 @@ def test_model():
     loss.backward()
     # Verify tagger gradients flow
     assert tagger.proj.weight.grad is not None, "Tagger gradients missing!"
-    print("Backward pass successful — tagger receives gradients.")
+    print("Backward pass successful - tagger receives gradients.")
 
 
 def test_flow_matching():

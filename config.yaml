@@ -29,6 +29,7 @@ model:
   routing_start: 1  # TREAD: first routed block index
   routing_end: 5    # TREAD: last routed block index (exclusive)
   num_image_tags: 8192  # Learned binary image tag channels
+  latent_scale: 0.62  # Normalization factor for VAE latents
 
 data:
   webdataset_url: "/workspace/shinon/t2i/nanoWaifu/anime/train/000{01..47}.tar"

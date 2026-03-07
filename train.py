@@ -284,6 +284,7 @@ def train(config_path):
 
     cfg_scale = config['training'].get('cfg_scale', 4.0)
     drop_rate = config['training'].get('drop_rate', 0.5)
+    latent_scale = config['model'].get('latent_scale', 0.62)
 
     # Training Loop
     # Calculate max_train_steps if not explicitly provided
@@ -317,9 +318,9 @@ def train(config_path):
         # Run image tagger on raw images (before VAE encoding)
         image_tags = image_tagger(x1)
 
-        # Encode images to latents
+        # Encode images to latents and normalize to std ~ 1.0
         with torch.no_grad():
-            x1 = vae.encode(x1.to(dtype=torch.bfloat16), return_dict=False).float()
+            x1 = vae.encode(x1.to(dtype=torch.bfloat16), return_dict=False).float() / latent_scale
 
         # Flow Matching Training
         t = torch.rand((x1.shape[0],), device=device)
@@ -392,9 +393,9 @@ def train(config_path):
                     sample_coords = torch.tensor([[0.0, 0.0, 1.0, 1.0]] * 4, device=device)
                     latent_samples = sample_flow(model, config['training']['image_size'], 4,
                                           sample_tags, sample_coords, device, cfg_scale=cfg_scale)
-                    # Decode latents to pixels
+                    # Un-normalize and decode latents to pixels
                     with torch.no_grad():
-                        samples = vae.decode(latent_samples.to(dtype=torch.bfloat16), return_dict=False)
+                        samples = vae.decode((latent_samples * latent_scale).to(dtype=torch.bfloat16), return_dict=False)
                     samples = samples.float().clamp(-1, 1) / 2.0 + 0.5
                     grid = make_grid(samples, nrow=2)
                     wandb_image = wandb.Image(grid, caption=f"Sample Step {global_step} (CFG={cfg_scale})")
