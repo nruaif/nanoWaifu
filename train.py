@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 import wandb
 import glob
 import builtins
+import huggingface_hub
 
 from model import TREADDiT, ImageTagger
 from dataset import WDSLoader
@@ -413,6 +414,23 @@ def train(config_path):
                     grid = make_grid(samples, nrow=2)
                     wandb_image = wandb.Image(grid, caption=f"Sample Step {global_step} (CFG={cfg_scale})")
                     wandb.log({"samples": wandb_image}, step=global_step)
+                
+                # Upload to HuggingFace every 2 saves
+                save_count = global_step // config['training']['save_image_every_steps']
+                if save_count % 2 == 0 and save_count > 0:
+                    print("Uploading checkpoints to Hugging Face Hub (Shio-Koube/ViT-tagger)...")
+                    try:
+                        api = huggingface_hub.HfApi()
+                        api.create_repo(repo_id="Shio-Koube/ViT-tagger", exist_ok=True, repo_type="model")
+                        api.upload_folder(
+                            folder_path=config['training']['output_dir'],
+                            repo_id="Shio-Koube/ViT-tagger",
+                            repo_type="model",
+                            commit_message=f"Upload checkpoint step {global_step}"
+                        )
+                        print("Upload successful!")
+                    except Exception as e:
+                        print(f"Failed to upload to Hugging Face Hub: {e}")
 
                 model.train()
                 optimizer.train()

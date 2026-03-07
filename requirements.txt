@@ -8,3 +8,4 @@ numpy
 tqdm
 Pillow
 pytorch-optimizer
+huggingface_hub
