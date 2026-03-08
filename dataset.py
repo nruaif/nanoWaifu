@@ -76,24 +76,29 @@ class WDSLoader:
             print(f"Error parsing metadata: {e}")
             return None
 
-        # Random Resized Crop logic
-        i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
-        
+        # Random Resized Crop logic for View 1
+        i1, j1, h1, w1 = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
         W, H = image.size
-        rel_coords = [i / H, j / W, h / H, w / W]
-        rel_coords = torch.tensor(rel_coords, dtype=torch.float32)
+        rel_coords1 = torch.tensor([i1 / H, j1 / W, h1 / H, w1 / W], dtype=torch.float32)
 
-        # Apply crop and resize
-        image = F.resized_crop(image, i, j, h, w, size=(self.image_size, self.image_size))
+        # Apply crop and resize for View 1
+        image1 = F.resized_crop(image, i1, j1, h1, w1, size=(self.image_size, self.image_size))
+        image1 = F.to_tensor(image1)
+        image1 = (image1 - 0.5) * 2.0 
+
+        # Random Resized Crop logic for View 2
+        i2, j2, h2, w2 = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
         
-        # To Tensor and Normalize [-1, 1]
-        image = F.to_tensor(image)
-        image = (image - 0.5) * 2.0 
+        # Apply crop and resize for View 2
+        image2 = F.resized_crop(image, i2, j2, h2, w2, size=(self.image_size, self.image_size))
+        image2 = F.to_tensor(image2)
+        image2 = (image2 - 0.5) * 2.0 
 
         return {
-            "image": image,
+            "image1": image1,
+            "coords1": rel_coords1,
+            "image2": image2,
             "tags": tag_vec,
-            "coords": rel_coords
         }
 
     def make_loader(self):
@@ -102,7 +107,7 @@ class WDSLoader:
             .shuffle(1000)
             .map(self.preprocess, handler=warn_and_continue,)
             .select(lambda x: x is not None)
-            .to_tuple("image", "tags", "coords", handler=warn_and_continue,)
+            .to_tuple("image1", "coords1", "image2", "tags", handler=warn_and_continue,)
             .batched(self.batch_size, partial=False)
         )
         

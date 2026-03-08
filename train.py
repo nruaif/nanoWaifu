@@ -8,16 +8,14 @@ import yaml
 import os
 import argparse
 import numpy as np
-from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 import wandb
 import glob
 import builtins
 import huggingface_hub
 
-from model import TREADDiT, ImageTagger
+from model import CoAtNeXtEncoder, SIGReg
 from dataset import WDSLoader
-from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
 
 
 def setup_ddp():
@@ -56,46 +54,6 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
                 print(f"Error removing {ckpt}: {e}")
 
 
-@torch.no_grad()
-def sample_flow(model, image_size, batch_size, tag_vecs, coords, device, steps=50, cfg_scale=4.0):
-    """
-    Sample using Euler integration of the flow ODE with Classifier-Free Guidance.
-    """
-    # Handle DDP model wrapper
-    model_engine = model.module if isinstance(model, DDP) else model
-
-    # Start from noise x_0 — derive shape from model
-    latent_ch = model_engine.backbone.in_channels
-    latent_sz = model_engine.backbone.input_size
-    x = torch.randn((batch_size, latent_ch, latent_sz, latent_sz), device=device)
-
-    dt = 1.0 / steps
-    indices = torch.linspace(0, 1, steps, device=device)
-
-    # Null tags = all-zeros vector for unconditioned pass
-    null_tags = torch.zeros_like(tag_vecs)
-
-    for i in tqdm(range(steps), desc='Sampling', leave=False):
-        t = indices[i]
-
-        # Prepare inputs for batch (cond + uncond)
-        x_in = torch.cat([x, x])
-        t_batch = torch.full((batch_size * 2,), t.item(), device=device, dtype=torch.float)
-        tags_in = torch.cat([tag_vecs, null_tags])
-        coords_in = torch.cat([coords, coords])
-
-        # Predict velocity field v_t
-        v_pred, _ = model(x_in, t_batch * 1000, tags_in, coords_in)
-
-        v_cond, v_uncond = v_pred.chunk(2)
-        v = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        # Euler step: x_{t+dt} = x_t + v_t * dt
-        x = x + v * dt
-
-    return x
-
-
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
 
@@ -113,18 +71,9 @@ def train(config_path):
 
     # Initialize WandB only on rank 0
     if rank == 0:
-        wandb.init(project=config.get('wandb_project', 'nanoWaifu-DiT'), config=config)
+        wandb.init(project=config.get('wandb_project', 'nanoWaifu-SSL'), config=config)
 
-    # Load VAE (frozen)
-    vae = Flux2TinyAutoEncoder.from_pretrained(
-        config['data'].get('vae_model', 'fal/FLUX.2-Tiny-AutoEncoder'),
-    ).to(device=device, dtype=torch.bfloat16)
-    vae.eval()
-    for p in vae.parameters():
-        p.requires_grad = False
-    print(f"Loaded VAE: {config['data'].get('vae_model', 'fal/FLUX.2-Tiny-AutoEncoder')}")
-
-    # Load Data
+    # Load Data (Direct RGB returns, no need for VAE compression target coords)
     wds_loader = WDSLoader(
         url=config['data']['webdataset_url'],
         tags_path=config['data']['tags_path'],
@@ -134,42 +83,18 @@ def train(config_path):
     )
     dataloader = wds_loader.make_loader()
 
-    # Init Model
+    # Init CoAtNeXt Pure SSL Model
     num_tags = wds_loader.num_tags
-    
-    model = TREADDiT(
-        input_size=config['model']['latent_size'],
-        patch_size=config['model']['patch_size'],
-        in_channels=config['model']['in_channels'],
-        hidden_size=config['model']['dim'],
-        depth=config['model']['depth'],
-        num_heads=config['model']['heads'],
-        mlp_ratio=config['model']['mlp_dim'] / config['model']['dim'],
-        num_tags=num_tags,
-        class_dropout_prob=config['training']['class_dropout_prob'],
-        routing_start=config['model'].get('routing_start', 1),
-        routing_end=config['model'].get('routing_end', 5),
-        num_image_tags=config['model'].get('num_image_tags', 8192),
+    model = CoAtNeXtEncoder(
+        backbone_model=config['model'].get('backbone_model', 'coatnext_nano_rw_224.sw_in1k'),
+        proj_dim=config['model'].get('proj_dim', 8192),
+        pretrained=True
     ).to(device)
 
-    # Image tagger (ConvNeXt-Small, trained jointly)
-    image_tagger = ImageTagger(
-        num_binary_channels=config['model'].get('num_image_tags', 8192),
-        pretrained=True,
-    ).to(device)
-    print(f"ImageTagger: ConvNeXt-Small -> {config['model'].get('num_image_tags', 8192)} binary channels")
+    print(f"Initialized Pure LeJEPA SSL Model: {config['model'].get('backbone_model', 'coatnext_nano_rw_224.sw_in1k')}")
+    print(f"Using Projection Dim: {config['model'].get('proj_dim', 8192)}")
 
-    if config['training'].get('gradient_checkpointing', False):
-        model.enable_gradient_checkpointing()
-        print("Gradient checkpointing enabled.")
-
-    if config['training'].get('freeze_backbone', False):
-        print("Freezing backbone parameters...")
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-
-    all_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(image_tagger.parameters())
-    optimizer = ScheduleFreeAdamW(all_params, lr=config['training']['learning_rate'], weight_decay=1e-2, betas=(0.9, 0.95))
+    optimizer = ScheduleFreeAdamW(model.parameters(), lr=config['training']['learning_rate'], weight_decay=1e-2, betas=(0.9, 0.95))
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -181,101 +106,14 @@ def train(config_path):
         try:
             checkpoint = torch.load(resume_path, map_location=device)
 
-            # Extract state dict whether it's wrapped or raw
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                state_dict = checkpoint["model_state_dict"]
-            else:
-                state_dict = checkpoint
-
-            model_state = model.state_dict()
-            new_state_dict = {}
-
-            # Remap keys
-            for k, v in state_dict.items():
-                target_key = None
-                
-                # Check for old keys and map to new architecture
-                if "attn.in_proj_weight" in k:
-                    target_key = k.replace("attn.in_proj_weight", "attn.qkv.weight")
-                elif "attn.in_proj_bias" in k:
-                    target_key = k.replace("attn.in_proj_bias", "attn.qkv.bias")
-                elif "attn.out_proj.weight" in k:
-                    target_key = k.replace("attn.out_proj.weight", "attn.proj.weight")
-                elif "attn.out_proj.bias" in k:
-                    target_key = k.replace("attn.out_proj.bias", "attn.proj.bias")
-                elif "mlp.0.weight" in k:
-                    target_key = k.replace("mlp.0.weight", "fc1.weight")
-                elif "mlp.0.bias" in k:
-                    target_key = k.replace("mlp.0.bias", "fc1.bias")
-                elif "mlp.2.weight" in k:
-                    target_key = k.replace("mlp.2.weight", "fc2.weight")
-                elif "mlp.2.bias" in k:
-                    target_key = k.replace("mlp.2.bias", "fc2.bias")
-                else:
-                    target_key = k # No change needed for other keys
-
-                # Try backbone prefix match if not found directly
-                if target_key not in model_state and f"backbone.{target_key}" in model_state:
-                     target_key = f"backbone.{target_key}"
-                
-                # Debug print for MLP keys
-                if "mlp.0.weight" in k:
-                    print(f"DEBUG: Processing {k} -> {target_key}")
-                    if target_key in model_state:
-                        print(f"  Found in model_state. Shape match: {model_state[target_key].shape == v.shape} ({model_state[target_key].shape} vs {v.shape})")
-                    else:
-                        print(f"  NOT found in model_state. Keys similar to {target_key}: {[x for x in model_state.keys() if 'fc1' in x and 'blocks.0' in x]}")
-
-                # Final check if key exists in model
-                if target_key in model_state:
-                     if model_state[target_key].shape == v.shape:
-                        new_state_dict[target_key] = v
-                     else:
-                        print(f"Skipping key {k} -> {target_key} due to shape mismatch: {v.shape} vs {model_state[target_key].shape}")
-                else:
-                    # If we still can't find it, maybe it's an exact match (e.g. non-block params)
-                    if k in model_state:
-                         if model_state[k].shape == v.shape:
-                             new_state_dict[k] = v
-                    elif f"backbone.{k}" in model_state:
-                         if model_state[f"backbone.{k}"].shape == v.shape:
-                             new_state_dict[f"backbone.{k}"] = v
-
-            missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded checkpoint. Missing keys (expected for new head): {len(missing)}")
-
-            if new_state_dict:
-                print(f"Loaded keys: {len(new_state_dict)}")
-                for key in sorted(new_state_dict.keys()):
-                    print(f"  + {key}")
-
-            if missing:
-                print("Missing keys:")
-                for key in sorted(missing):
-                    print(f"  - {key}")
-            
-            if unexpected:
-                print(f"Unexpected keys: {len(unexpected)}")
-                for key in sorted(unexpected):
-                    print(f"  - {key}")
-
-            # Load image tagger state if it exists
-            if "tagger_state_dict" in checkpoint:
-                missing_t, _ = image_tagger.load_state_dict(checkpoint["tagger_state_dict"], strict=False)
-                print(f"Loaded ImageTagger state. Missing keys: {len(missing_t)}")
-                
-            # Load optimizer state if it exists
-            if "optimizer_state_dict" in checkpoint:
-                try:
+                model.load_state_dict(checkpoint["model_state_dict"])
+                if "optimizer_state_dict" in checkpoint:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                    print("Loaded optimizer state.")
-                except Exception as e:
-                    print(f"Could not load optimizer state (expected since architecture changed): {e}")
-
-            # Load global step
-            if isinstance(checkpoint, dict) and "global_step" in checkpoint:
-                global_step = checkpoint["global_step"]
-                print(f"Resuming from global step: {global_step}")
+                if "global_step" in checkpoint:
+                    global_step = checkpoint["global_step"]
+            else:
+                model.load_state_dict(checkpoint)
 
             print("Successfully loaded checkpoint.")
         except Exception as e:
@@ -288,11 +126,9 @@ def train(config_path):
     # model.compile() # Optional, can enable if needed
     os.makedirs(config['training']['output_dir'], exist_ok=True)
 
-    cfg_scale = config['training'].get('cfg_scale', 4.0)
-    drop_rate = config['training'].get('drop_rate', 0.5)
-    latent_scale = config['model'].get('latent_scale', 0.62)
+    lamb_lejepa = config['training'].get('lejepa_lambda', 0.02)
+    l1_weight = config['training'].get('l1_weight', 1e-4)
 
-    # Training Loop
     # Calculate max_train_steps if not explicitly provided
     max_train_steps = config['training'].get('max_train_steps', config['training']['num_epochs'] * 1000)
 
@@ -302,10 +138,9 @@ def train(config_path):
     else:
         pbar = None
 
-    # Create iterator
     data_iter = iter(dataloader)
 
-    # Training Loop
+    # Main Training Loop
     while global_step < max_train_steps:
         model.train()
         optimizer.train()
@@ -316,43 +151,37 @@ def train(config_path):
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        x1, tags, coords = batch
-        x1 = x1.to(device)
-        tags = tags.to(device)
-        coords = coords.to(device)
-
-        # Run image tagger on raw images (before VAE encoding)
-        image_tags = image_tagger(x1)
-
-        # Encode images to latents and normalize to std ~ 1.0
-        with torch.no_grad():
-            x1 = vae.encode(x1.to(dtype=torch.bfloat16), return_dict=False).float() / latent_scale
-
-        # Flow Matching Training
-        t = torch.rand((x1.shape[0],), device=device)
-        x0 = torch.randn_like(x1)
-        t_reshaped = t.view(-1, 1, 1, 1)
-        xt = (1 - t_reshaped) * x0 + t_reshaped * x1
-        ut = x1 - x0
+        # We take advantage of the dual views added to dataset.py
+        # Expected from WDSLoader: image1, coords1, image2, tags
+        x1, _, x2, _ = batch
+        x1 = x1.to(device, non_blocking=True)
+        x2 = x2.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            v_head, x_backbone = model(xt, t * 1000, tags, coords, image_tags=image_tags, drop_rate=drop_rate)
-            loss_head = torch.mean((v_head - ut) ** 2)
-            loss_backbone = torch.mean((x_backbone - x1) ** 2)
-            
-            # L1 penalty on image tags to encourage sparsity
-            tagger_l1_weight = config['training'].get('tagger_l1_weight', 1e-4)
-            loss_l1 = 0.0
-            if tagger_l1_weight > 0.0 and image_tags is not None:
-                loss_l1 = tagger_l1_weight * torch.mean(torch.abs(image_tags))
+            # Forward pass raw images
+            bin1, logits1 = model(x1)
+            bin2, logits2 = model(x2)
 
-            loss = loss_head + loss_backbone + loss_l1
+        # LeJEPA losses operate in float32 (SIGReg disables autocast internally)
+        # Stack views: (2, N, proj_dim)
+        proj = torch.stack([logits1.float(), logits2.float()], dim=0)
+
+        # Invariance: each view should predict the mean of all views (official formulation)
+        inv_loss = (proj.mean(0) - proj).square().mean()
+
+        # Uniformity: SIGReg on the primary view's continuous projections
+        sigreg_loss = SIGReg(logits1, global_step=global_step, num_slices=256, chunk_size=32)
+
+        # Sparsity: L1 norm on the binary STE outputs
+        l1_loss = l1_weight * torch.mean(torch.abs(bin1.float()))
+
+        # Composite LeJEPA Total Loss
+        loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + l1_loss
 
         optimizer.zero_grad()
         loss.backward()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
         global_step += 1
@@ -362,14 +191,15 @@ def train(config_path):
             pbar.update(1)
 
             current_lr = optimizer.param_groups[0]['lr']
-            active_image_tags = image_tags.sum(dim=1).mean().item() if image_tags is not None else 0.0
+            active_binary_tags = bin1.sum(dim=1).mean().item()
             
             logs = {
                 "loss": loss.item(),
-                "loss_head_v": loss_head.item(),
-                "loss_backbone_x": loss_backbone.item(),
-                "loss_l1_tags": loss_l1.item() if isinstance(loss_l1, torch.Tensor) else loss_l1,
-                "active_image_tags": active_image_tags,
+                "loss_lejepa_combined": (lamb_lejepa * sigreg_loss + (1 - lamb_lejepa) * inv_loss).item(),
+                "loss_sigreg": sigreg_loss.item(),
+                "loss_inv": inv_loss.item(),
+                "loss_l1": l1_loss.item(),
+                "active_binary_tags": active_binary_tags,
                 "lr": current_lr,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
@@ -381,22 +211,20 @@ def train(config_path):
                 wandb_log = {f"train/{k}": v for k, v in logs.items()}
                 wandb.log(wandb_log, step=global_step)
 
-        # Sample and save checkpoint (only on rank 0)
-        if global_step % config['training']['save_image_every_steps'] == 0:
+        # Save checkpoint (only on rank 0)
+        if global_step % config['training'].get('save_every_steps', 1000) == 0:
             # Synchronize all processes before checkpoint
             if is_ddp:
                 dist.barrier()
 
             if rank == 0:
-                print("\nSampling and Saving Checkpoint...")
+                print("\nSaving Checkpoint...")
 
                 # Save Checkpoint (Unwrap DDP)
                 model_to_save = model.module if is_ddp else model
-                tagger_to_save = image_tagger.module if is_ddp and isinstance(image_tagger, DDP) else image_tagger
                 
                 ckpt_state = {
                     "model_state_dict": model_to_save.state_dict(),
-                    "tagger_state_dict": tagger_to_save.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "global_step": global_step,
                     "config": config
@@ -404,46 +232,23 @@ def train(config_path):
                 ckpt_path = os.path.join(config['training']['output_dir'], f'ckpt_step_{global_step}.pth')
                 torch.save(ckpt_state, ckpt_path)
                 cleanup_checkpoints(config['training']['output_dir'], config.get('max_checkpoints', 3), rank)
-
-                # Sample
-                model.eval()
-                optimizer.eval()
-                with torch.no_grad():
-                    # Use real tags and coords from the current batch for sampling
-                    num_samples = min(4, tags.shape[0])
-                    sample_tags = tags[:num_samples]
-                    sample_coords = coords[:num_samples]
-                    
-                    latent_samples = sample_flow(model, config['training']['image_size'], num_samples,
-                                          sample_tags, sample_coords, device, cfg_scale=cfg_scale)
-                    # Un-normalize and decode latents to pixels
-                    with torch.no_grad():
-                        samples = vae.decode((latent_samples * latent_scale).to(dtype=torch.bfloat16), return_dict=False)
-                    samples = samples.float().clamp(-1, 1) / 2.0 + 0.5
-                    grid = make_grid(samples, nrow=2)
-                    wandb_image = wandb.Image(grid, caption=f"Sample Step {global_step} (CFG={cfg_scale})")
-                    wandb.log({"samples": wandb_image}, step=global_step)
                 
                 # Upload to HuggingFace every 2 saves
-                save_count = global_step // config['training']['save_image_every_steps']
+                save_count = global_step // config['training']['save_every_steps']
                 if save_count % 2 == 0 and save_count > 0:
-                    print("Uploading checkpoints to Hugging Face Hub (Shio-Koube/ViT-tagger)...")
+                    print("Uploading checkpoints to Hugging Face Hub (Shio-Koube/Pure-CoAtNeXt-SSL)...")
                     try:
                         api = huggingface_hub.HfApi()
-                        api.create_repo(repo_id="Shio-Koube/ViT-tagger", exist_ok=True, repo_type="model")
+                        api.create_repo(repo_id="Shio-Koube/Pure-CoAtNeXt-SSL", exist_ok=True, repo_type="model")
                         api.upload_folder(
                             folder_path=config['training']['output_dir'],
-                            repo_id="Shio-Koube/ViT-tagger",
+                            repo_id="Shio-Koube/Pure-CoAtNeXt-SSL",
                             repo_type="model",
                             commit_message=f"Upload checkpoint step {global_step}"
                         )
                         print("Upload successful!")
                     except Exception as e:
                         print(f"Failed to upload to Hugging Face Hub: {e}")
-
-                model.train()
-                optimizer.train()
-                print("Checkpoint and sampling complete.\n")
 
             # Synchronize again after checkpoint
             if is_ddp:
@@ -452,7 +257,7 @@ def train(config_path):
     print("Training Complete.")
     if rank == 0:
         pbar.close()
-        final_path = os.path.join(config['training']['output_dir'], 'dit_model_final.pth')
+        final_path = os.path.join(config['training']['output_dir'], 'coatnext_ssl_final.pth')
         model_to_save = model.module if is_ddp else model
         torch.save(model_to_save.state_dict(), final_path)
         wandb.finish()

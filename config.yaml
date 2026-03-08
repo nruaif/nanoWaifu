@@ -3,36 +3,22 @@ training:
   learning_rate: 3.0e-4
   num_epochs: 100
   max_train_steps: 1000000
-  gradient_checkpointing: true
-  freeze_backbone: false
   log_every_steps: 10
 
-  save_image_every_steps: 5000
-  image_size: 256  # Raw image size (before VAE encoding)
-  num_workers: 2
-  class_dropout_prob: 0.1
-  cfg_scale: 4.0
-  tagger_l1_weight: 1.0e-4
-  drop_rate: 0.5  # TREAD token drop rate (0.0 = no routing, 0.5 = 50% bypassed)
+  save_every_steps: 1000  # Renamed from save_image_every_steps
+  image_size: 224  # Raw image size (matching coatnext_nano_rw_224)
+  num_workers: 4
+  l1_weight: 1.0e-4
+  lejepa_lambda: 0.02
   output_dir: "outputs"
-  wandb_project: "nanoWaifu-DiT"
+  wandb_project: "nanoWaifu-SSL"
   resume_from: "" # Path to checkpoint to resume from
   max_checkpoints: 3
 
 model:
-  dim: 1536
-  depth: 24
-  heads: 24
-  mlp_dim: 6144 # 4 * dim
-  in_channels: 128  # VAE latent channels
-  latent_size: 16   # image_size / 16 (VAE 16x downsample)
-  patch_size: 1     # 1:1 latent pixels to tokens
-  routing_start: 1  # TREAD: first routed block index
-  routing_end: 5    # TREAD: last routed block index (exclusive)
-  num_image_tags: 8192  # Learned binary image tag channels
-  latent_scale: 0.62  # Normalization factor for VAE latents
+  proj_dim: 8192
+  backbone_model: "coatnext_nano_rw_224.sw_in1k"
 
 data:
   webdataset_url: "/workspace/shinon/t2i/nanoWaifu/anime/train/000{01..47}.tar"
   tags_path: "tags.txt"
-  vae_model: "fal/FLUX.2-Tiny-AutoEncoder"
