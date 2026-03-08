@@ -4,9 +4,9 @@ import timm
 
 def SIGReg(x, global_step, num_slices=256, chunk_size=32, t_max=3.0, n_points=17):
     """SIGReg with Epps-Pulley statistic. x is (N, K) tensor.
-       Matches the official LeJEPA EppsPulley+SlicingUnivariateTest formulation.
-       - Integrates over [0, t_max] with doubled weights (symmetric CF trick).
-       - Scales by batch size N (as in the official repo).
+       Matches official LeJEPA MINIMAL.md exactly:
+       - Integrates over [0, t_max] with symmetry-doubled weights.
+       - Scales by N, then averages over slices (statistic.mean()).
        - Chunked projection to reduce peak memory."""
     with torch.amp.autocast('cuda', enabled=False): # accumulate in float32
         x = x.float()
@@ -46,11 +46,14 @@ def SIGReg(x, global_step, num_slices=256, chunk_size=32, t_max=3.0, n_points=17
             # Epps-Pulley integrand: |(ECF(t) - phi(t))|^2 * weight
             err = (cos_mean - phi).square() + sin_mean.square()  # (chunk, n_points)
 
-            # Integrate via trapezoidal rule with pre-fused weights
-            T_total = T_total + (err @ w_phi).sum()
+            # Per-slice statistics: (chunk,), scaled by N
+            slice_stats = (err @ w_phi) * N
 
-        # Scale by N as per official implementation
-        return T_total * N
+            # Accumulate (will average over num_slices at the end)
+            T_total = T_total + slice_stats.sum()
+
+        # Average over slices — matches MINIMAL.md: statistic.mean()
+        return T_total / num_slices
 
 class CoAtNeXtEncoder(nn.Module):
     """
