@@ -1,6 +1,21 @@
 import torch
 import torch.nn as nn
-from model import CoAtNeXtEncoder, SIGReg
+from model import CoAtNeXtEncoder
+import torch.nn.functional as F
+
+def info_nce_loss(z1, z2, temperature=0.07):
+    N = z1.size(0)
+    z1 = F.normalize(z1, p=2, dim=1)
+    z2 = F.normalize(z2, p=2, dim=1)
+    z = torch.cat([z1, z2], dim=0)
+    sim = (z @ z.T) / temperature
+    mask = torch.eye(2 * N, device=z.device, dtype=torch.bool)
+    sim.masked_fill_(mask, -9e15)
+    labels = torch.cat([
+        torch.arange(N, 2 * N, device=z.device),
+        torch.arange(0, N, device=z.device),
+    ])
+    return F.cross_entropy(sim, labels)
 
 def test_model():
     print("Testing CoAtNeXtEncoder Forward & Backward Pass...")
@@ -29,16 +44,15 @@ def test_model():
     assert logits1.shape == (2, proj_dim)
     
     # Calculate losses
-    lamb_lejepa = 0.02
+    nce_temperature = 0.07
     l1_weight = 1e-4
     
-    inv_loss = (logits1 - logits2).square().mean()
-    sigreg_loss = SIGReg(logits1, global_step=0, num_slices=256, chunk_size=32)
+    infonce_loss = info_nce_loss(logits1, logits2, temperature=nce_temperature)
     l1_loss = l1_weight * torch.mean(torch.abs(bin1))
     
-    total_loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + l1_loss
+    total_loss = infonce_loss + l1_loss
     
-    print(f"  Total Loss: {total_loss.item():.4f} | SIGReg: {sigreg_loss.item():.4f} | INV: {inv_loss.item():.4f} | L1: {l1_loss.item():.4f}")
+    print(f"  Total Loss: {total_loss.item():.4f} | InfoNCE: {infonce_loss.item():.4f} | L1: {l1_loss.item():.4f}")
     
     # Backward pass
     total_loss.backward()

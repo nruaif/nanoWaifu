@@ -2,62 +2,9 @@ import torch
 import torch.nn as nn
 import timm
 
-def SIGReg(x, global_step, num_slices=256, chunk_size=32, t_max=3.0, n_points=17):
-    """SIGReg with Epps-Pulley statistic. x is (N, K) tensor.
-       Matches official LeJEPA MINIMAL.md exactly:
-       - Integrates over [0, t_max] with symmetry-doubled weights.
-       - Scales by N, then averages over slices (statistic.mean()).
-       - Chunked projection to reduce peak memory."""
-    with torch.amp.autocast('cuda', enabled=False): # accumulate in float32
-        x = x.float()
-        N, K = x.shape
-        device = x.device
-
-        # Precompute integration grid [0, t_max] with symmetry-doubled weights
-        t = torch.linspace(0, t_max, n_points, device=device)  # (n_points,)
-        dt = t_max / (n_points - 1)
-        weights = torch.full((n_points,), 2 * dt, device=device)  # doubled for symmetry
-        weights[0] = dt  # t=0 endpoint only gets single weight
-        weights[-1] = dt # t=t_max endpoint only gets single weight
-        phi = torch.exp(-0.5 * t ** 2)  # Standard Normal CF: exp(-t^2/2)
-        # Precompute weights * phi together for efficiency
-        w_phi = weights * phi  # (n_points,)
-
-        # Random projection matrix (seeded deterministically per step)
-        g = torch.Generator(device=device).manual_seed(global_step)
-        A = torch.randn((K, num_slices), generator=g, device=device)
-        A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-10)  # Column-normalize
-
-        T_total = torch.tensor(0.0, device=device)
-
-        if chunk_size < 1:
-            chunk_size = num_slices
-
-        for i in range(0, num_slices, chunk_size):
-            # Project: (N, chunk)
-            x_proj = x @ A[:, i:i+chunk_size]  # (N, chunk)
-            # Expand for integration: (N, chunk, n_points)
-            x_t = x_proj.unsqueeze(2) * t  # (N, chunk, n_points)
-
-            # ECF via cos and sin (avoids complex tensors)
-            cos_mean = x_t.cos().mean(0)  # (chunk, n_points)
-            sin_mean = x_t.sin().mean(0)  # (chunk, n_points)
-
-            # Epps-Pulley integrand: |(ECF(t) - phi(t))|^2 * weight
-            err = (cos_mean - phi).square() + sin_mean.square()  # (chunk, n_points)
-
-            # Per-slice statistics: (chunk,), scaled by N
-            slice_stats = (err @ w_phi) * N
-
-            # Accumulate (will average over num_slices at the end)
-            T_total = T_total + slice_stats.sum()
-
-        # Average over slices — matches MINIMAL.md: statistic.mean()
-        return T_total / num_slices
-
 class CoAtNeXtEncoder(nn.Module):
     """
-    Pure LeJEPA SSL Encoder using CoAtNeXt backbone.
+    Pure SSL Encoder using CoAtNeXt backbone.
     Processes images, pools features, and projects them to an 8192-dim space.
     Binarizes the representation via Straight-Through Estimator (STE).
     """
