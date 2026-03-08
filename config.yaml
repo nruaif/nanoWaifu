@@ -10,6 +10,7 @@ training:
   num_workers: 4
   l1_weight: 1.0e-4
   lejepa_lambda: 0.02
+  cosine_lambda: 0.1  # Weight for pairwise cosine similarity loss (angular alignment)
   output_dir: "outputs"
   wandb_project: "nanoWaifu-SSL"
   resume_from: "" # Path to checkpoint to resume from

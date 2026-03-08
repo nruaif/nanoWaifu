@@ -13,6 +13,10 @@ import wandb
 import glob
 import builtins
 import huggingface_hub
+from torchvision.utils import make_grid
+import torch.nn.functional as F
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from model import CoAtNeXtEncoder, SIGReg
 from dataset import WDSLoader
@@ -128,6 +132,7 @@ def train(config_path):
 
     lamb_lejepa = config['training'].get('lejepa_lambda', 0.02)
     l1_weight = config['training'].get('l1_weight', 1e-4)
+    cosine_lambda = config['training'].get('cosine_lambda', 0.1)
 
     # Calculate max_train_steps if not explicitly provided
     max_train_steps = config['training'].get('max_train_steps', config['training']['num_epochs'] * 1000)
@@ -169,6 +174,9 @@ def train(config_path):
         # Invariance: each view should predict the mean of all views (official formulation)
         inv_loss = (proj.mean(0) - proj).square().mean()
 
+        # Cosine similarity loss: angular alignment between the two views (scale-invariant)
+        cos_loss = (1 - F.cosine_similarity(logits1.float(), logits2.float(), dim=1)).mean()
+
         # Uniformity: SIGReg on the primary view's continuous projections
         sigreg_loss = SIGReg(logits1, global_step=global_step, num_slices=256, chunk_size=32)
 
@@ -176,7 +184,7 @@ def train(config_path):
         l1_loss = l1_weight * torch.mean(torch.abs(bin1.float()))
 
         # Composite LeJEPA Total Loss
-        loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + l1_loss
+        loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + cosine_lambda * cos_loss + l1_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -198,7 +206,9 @@ def train(config_path):
                 "loss_lejepa_combined": (lamb_lejepa * sigreg_loss + (1 - lamb_lejepa) * inv_loss).item(),
                 "loss_sigreg": sigreg_loss.item(),
                 "loss_inv": inv_loss.item(),
+                "loss_cos": cos_loss.item(),
                 "loss_l1": l1_loss.item(),
+                "cosine_sim": (1 - cos_loss.item()),  # actual sim value (1 = identical)
                 "active_binary_tags": active_binary_tags,
                 "lr": current_lr,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
@@ -232,6 +242,42 @@ def train(config_path):
                 ckpt_path = os.path.join(config['training']['output_dir'], f'ckpt_step_{global_step}.pth')
                 torch.save(ckpt_state, ckpt_path)
                 cleanup_checkpoints(config['training']['output_dir'], config.get('max_checkpoints', 3), rank)
+
+                # --- Eval: 4×2 image grid with per-pair cosine similarity ---
+                model.eval()
+                optimizer.eval()
+                with torch.no_grad():
+                    n_pairs = 4
+                    imgs1 = x1[:n_pairs].float()  # (4, 3, H, W) in [-1, 1]
+                    imgs2 = x2[:n_pairs].float()
+                    _, lgt1 = model(imgs1.to(device))
+                    _, lgt2 = model(imgs2.to(device))
+                    pair_cos = F.cosine_similarity(lgt1, lgt2, dim=1)  # (4,)
+
+                    # Unnormalize images to [0, 1] for display
+                    imgs1_vis = (imgs1 * 0.5 + 0.5).clamp(0, 1).cpu()
+                    imgs2_vis = (imgs2 * 0.5 + 0.5).clamp(0, 1).cpu()
+
+                    # Build 4×2 grid: each row is (x1, x2), left col = view1, right col = view2
+                    fig, axes = plt.subplots(4, 2, figsize=(5, 10))
+                    for idx in range(n_pairs):
+                        sim = pair_cos[idx].item()
+                        img1_np = imgs1_vis[idx].permute(1, 2, 0).numpy()
+                        img2_np = imgs2_vis[idx].permute(1, 2, 0).numpy()
+                        axes[idx, 0].imshow(img1_np)
+                        axes[idx, 0].set_title(f"View 1" if idx == 0 else "")
+                        axes[idx, 0].axis('off')
+                        axes[idx, 1].imshow(img2_np)
+                        axes[idx, 1].set_title(f"View 2" if idx == 0 else "")
+                        axes[idx, 1].axis('off')
+                        # Annotate cosine sim on the right image
+                        axes[idx, 1].set_xlabel(f"cos_sim={sim:.3f}", fontsize=9)
+                    plt.suptitle(f"Step {global_step} | Avg cos_sim={pair_cos.mean().item():.3f}", fontsize=10)
+                    plt.tight_layout()
+                    wandb.log({"eval/view_pairs": wandb.Image(fig)}, step=global_step)
+                    plt.close(fig)
+                model.train()
+                optimizer.train()
                 
                 # Upload to HuggingFace every 2 saves
                 save_count = global_step // config['training']['save_every_steps']
