@@ -22,6 +22,42 @@ from model import CoAtNeXtEncoder, SIGReg
 from dataset import WDSLoader
 
 
+def info_nce_loss(z1, z2, temperature=0.07):
+    """Symmetric InfoNCE (SimCLR-style) contrastive loss.
+
+    Pulls positive pairs (z1[i], z2[i]) together and pushes
+    all other cross-batch pairs apart in cosine space.
+
+    Args:
+        z1, z2: (N, D) decoded logits from the two views
+        temperature: softmax temperature (lower = sharper, typical 0.07-0.2)
+    Returns:
+        scalar InfoNCE loss
+    """
+    N = z1.size(0)
+    # L2-normalize so dot product = cosine similarity
+    z1 = F.normalize(z1, p=2, dim=1)
+    z2 = F.normalize(z2, p=2, dim=1)
+
+    # Concatenate both views: (2N, D)
+    z = torch.cat([z1, z2], dim=0)
+
+    # Full (2N x 2N) cosine similarity matrix, scaled by temperature
+    sim = (z @ z.T) / temperature
+
+    # Mask out self-similarities on the diagonal
+    mask = torch.eye(2 * N, device=z.device, dtype=torch.bool)
+    sim.masked_fill_(mask, -9e15)
+
+    # Labels: for sample i in z1, the positive is at index N+i (in z2), and vice versa
+    labels = torch.cat([
+        torch.arange(N, 2 * N, device=z.device),  # z1[i]'s positive is z2[i] at idx N+i
+        torch.arange(0, N, device=z.device),       # z2[i]'s positive is z1[i] at idx i
+    ])
+
+    return F.cross_entropy(sim, labels)
+
+
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -132,7 +168,8 @@ def train(config_path):
 
     lamb_lejepa = config['training'].get('lejepa_lambda', 0.02)
     l1_weight = config['training'].get('l1_weight', 1e-4)
-    cosine_lambda = config['training'].get('cosine_lambda', 0.1)
+    nce_lambda = config['training'].get('nce_lambda', 0.1)
+    nce_temperature = config['training'].get('nce_temperature', 0.07)
 
     # Calculate max_train_steps if not explicitly provided
     max_train_steps = config['training'].get('max_train_steps', config['training']['num_epochs'] * 1000)
@@ -175,7 +212,8 @@ def train(config_path):
         inv_loss = (proj.mean(0) - proj).square().mean()
 
         # Cosine similarity loss: angular alignment between the two views (scale-invariant)
-        cos_loss = (1 - F.cosine_similarity(logits1.float(), logits2.float(), dim=1)).mean()
+        # Replaced by InfoNCE: pushes positives together AND negatives apart
+        infonce_loss = info_nce_loss(logits1.float(), logits2.float(), temperature=nce_temperature)
 
         # Uniformity: SIGReg on the primary view's continuous projections
         sigreg_loss = SIGReg(logits1, global_step=global_step, num_slices=256, chunk_size=32)
@@ -184,7 +222,7 @@ def train(config_path):
         l1_loss = l1_weight * torch.mean(torch.abs(bin1.float()))
 
         # Composite LeJEPA Total Loss
-        loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + cosine_lambda * cos_loss + l1_loss
+        loss = (lamb_lejepa * sigreg_loss) + ((1 - lamb_lejepa) * inv_loss) + nce_lambda * infonce_loss + l1_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -206,9 +244,8 @@ def train(config_path):
                 "loss_lejepa_combined": (lamb_lejepa * sigreg_loss + (1 - lamb_lejepa) * inv_loss).item(),
                 "loss_sigreg": sigreg_loss.item(),
                 "loss_inv": inv_loss.item(),
-                "loss_cos": cos_loss.item(),
+                "loss_nce": infonce_loss.item(),
                 "loss_l1": l1_loss.item(),
-                "cosine_sim": (1 - cos_loss.item()),  # actual sim value (1 = identical)
                 "active_binary_tags": active_binary_tags,
                 "lr": current_lr,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
