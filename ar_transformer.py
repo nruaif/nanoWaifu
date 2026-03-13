@@ -224,11 +224,14 @@ class ARTransformer(nn.Module):
         
         patch_embeddings = self.patch_proj(patch_latents)
         global_tags = self.class_emb(class_indices, offsets)
-        cond_embeddings = global_tags.unsqueeze(1)
         
-        if B == 1 and cond_embeddings.size(0) > 1:
-            cond_embeddings = cond_embeddings[0:1]
+        # If packing multiple samples into B=1, handle global_tags mismatch
+        if B == 1 and global_tags.size(0) > 1:
+            # For now, take only the first one to match sequence start
+            # A more advanced version would use image-specific tags for each position
+            global_tags = global_tags[0:1]
             
+        cond_embeddings = global_tags.unsqueeze(1)
         sos = self.sos_token.expand(B, -1, -1)
         
         # Input: [Cond, SOS, P1, ..., PL-1]
