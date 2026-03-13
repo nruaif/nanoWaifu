@@ -130,26 +130,69 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+class DenoisingMLPBlock(nn.Module):
+    def __init__(self, hidden_dim, cond_dim):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 3 * hidden_dim)
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        
+    def forward(self, x, c):
+        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)
+        x_norm = self.norm(x)
+        x_norm = x_norm * (1 + scale) + shift
+        return x + gate * self.mlp(x_norm)
+
 class DenoisingMLP(nn.Module):
     def __init__(self, dim, latent_dim, hidden_dim=1024):
         super().__init__()
-        # Input: noise(latent_dim) + cond(dim) + tags(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(latent_dim + dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim)
+        self.time_embed = nn.Sequential(
+            nn.Linear(256, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
         )
+        self.cond_proj = nn.Linear(dim * 3, hidden_dim)
+        
+        self.x_proj = nn.Linear(latent_dim, hidden_dim)
+        
+        self.blocks = nn.ModuleList([
+            DenoisingMLPBlock(hidden_dim, hidden_dim) for _ in range(4)
+        ])
+        
+        self.final_norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
+        self.final_proj = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, noise, cond, tags):
-        # noise: (B, L, latent_dim)
-        # cond: (B, L, dim)
-        # tags: (B, L, dim)
-        x = torch.cat([noise, cond, tags], dim=-1)
-        return self.mlp(x)
+    def timestep_embedding(self, t, dim, max_period=10000):
+        # t: (B, L, 1) or (B, N)
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t * freqs[None, None, :]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        return embedding
+
+    def forward(self, x_t, context, tags, t):
+        t_freq = self.timestep_embedding(t, 256)
+        t_emb = self.time_embed(t_freq)
+        
+        c = self.cond_proj(torch.cat([t_emb, context, tags], dim=-1))
+        
+        x = self.x_proj(x_t)
+        for block in self.blocks:
+            x = block(x, c)
+            
+        x = self.final_norm(x)
+        return self.final_proj(x)
 
 class ARTransformer(nn.Module):
     def __init__(
@@ -211,10 +254,10 @@ class ARTransformer(nn.Module):
                 nn.init.zeros_(block.mlp.w3.bias)
         
         # Final layer of denoising MLP
-        nn.init.zeros_(self.denoise_mlp.mlp[-1].weight)
-        nn.init.zeros_(self.denoise_mlp.mlp[-1].bias)
+        nn.init.zeros_(self.denoise_mlp.final_proj.weight)
+        nn.init.zeros_(self.denoise_mlp.final_proj.bias)
 
-    def forward(self, patch_latents, class_indices, positions, offsets=None, block_mask=None, noise=None):
+    def forward(self, patch_latents, class_indices, positions, offsets=None, block_mask=None, x_t=None, t=None):
         """
         patch_latents: (B, L, 256) - ternary values {-1, 0, 1}
         positions: (B, L+2, 2) - Includes Cond and SOS coordinates
@@ -225,10 +268,7 @@ class ARTransformer(nn.Module):
         patch_embeddings = self.patch_proj(patch_latents)
         global_tags = self.class_emb(class_indices, offsets)
         
-        # If packing multiple samples into B=1, handle global_tags mismatch
         if B == 1 and global_tags.size(0) > 1:
-            # For now, take only the first one to match sequence start
-            # A more advanced version would use image-specific tags for each position
             global_tags = global_tags[0:1]
             
         cond_embeddings = global_tags.unsqueeze(1)
@@ -245,12 +285,17 @@ class ARTransformer(nn.Module):
             
         x = self.norm_f(x)
         
-        if noise is None:
-            noise = torch.randn(B, x.size(1), self.latent_dim, device=device)
+        # Slicing x to match target length (drop Cond output, keep SOS to PL-1 output)
+        x_for_pred = x[:, 1:]
+        
+        if x_t is None:
+            x_t = torch.randn(B, x_for_pred.size(1), self.latent_dim, device=device)
+        if t is None:
+            t = torch.ones(B, x_for_pred.size(1), 1, device=device)
             
         # Condition MLP on transformer hidden states and global tags
-        tags_expanded = global_tags.unsqueeze(1).expand(-1, x.size(1), -1)
-        pred_x = self.denoise_mlp(noise, x, tags_expanded)
+        tags_expanded = global_tags.unsqueeze(1).expand(-1, x_for_pred.size(1), -1)
+        pred_x = self.denoise_mlp(x_t, x_for_pred, tags_expanded, t)
             
         return pred_x
 
@@ -297,15 +342,23 @@ class ARTransformer(nn.Module):
             
             x_last = self.norm_f(x[:, -1:])
             
-            noise = torch.randn(B, 1, self.latent_dim, device=device)
+            x_t = torch.randn(B, 1, self.latent_dim, device=device)
             tags_expanded = global_tags.unsqueeze(1)
             
-            pred_x = self.denoise_mlp(noise, x_last, tags_expanded)
+            steps = 10
+            for step_idx in range(steps):
+                t_val = step_idx / steps
+                t = torch.full((B, 1, 1), t_val, device=device)
+                
+                v_pred = self.denoise_mlp(x_t, x_last, tags_expanded, t)
+                if t_val < 0.999:
+                    v = (v_pred - x_t) / (1.0 - t_val)
+                    x_t = x_t + v * (1.0 / steps)
+                else:
+                    x_t = v_pred
             
             # Binary/Ternary quantization for the next step input
-            # Using simple sign for now, or could keep it continuous if desired.
-            # "bit latent" suggests we want it to be discrete.
-            next_latent = torch.where(pred_x > 0.5, 1.0, torch.where(pred_x < -0.5, -1.0, 0.0))
+            next_latent = torch.where(x_t > 0.5, 1.0, torch.where(x_t < -0.5, -1.0, 0.0))
             
             generated_latents.append(next_latent)
             

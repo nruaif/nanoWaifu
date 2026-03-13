@@ -8,7 +8,7 @@ model:
 
 data:
   webdataset_url: "dataset/{00000..00010}.tar"
-  csv_path: "characters.csv"
+  csv_path: "tags.txt"
 
 training:
   image_size: 256

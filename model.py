@@ -117,12 +117,12 @@ class FinalLayer(nn.Module):
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
         super().__init__()
-        self.num_patches = (img_size // patch_size // 2) ** 2
+        self.num_patches = (img_size // patch_size) ** 2
         self.unshuffle = nn.PixelUnshuffle(patch_size)
         self.proj = nn.Conv2d(in_chans * patch_size ** 2, embed_dim, kernel_size=7, padding=3)
 
     def forward(self, x):
-        # x = self.unshuffle(x)
+        x = self.unshuffle(x)
         x = self.proj(x)
         return x.flatten(2).transpose(1, 2)
 
@@ -149,8 +149,19 @@ class DiTBackbone(nn.Module):
         # Image Embedder
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
 
-        # Text Projection
+        # Text Projection (Sequence)
         self.text_proj = nn.Linear(text_embed_dim, hidden_size)
+
+        # Text Embedder (Global Conditioning - 4 Layer MLP)
+        self.y_embedder = nn.Sequential(
+            nn.Linear(text_embed_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
 
         # Timestep & Coord Embedders
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -231,8 +242,12 @@ class DiTBackbone(nn.Module):
         x_start_resnet = x.clone()
         # ----------------------------------------------------------------------
 
-        # 2. Prepare Text Tokens
+        # 2. Prepare Text Tokens (Sequence + Global Pooling)
         text_emb = self.text_proj(text_tokens)
+        
+        # Pooled text for global conditioning
+        text_pooled = text_tokens.mean(dim=1)
+        y_emb = self.y_embedder(text_pooled)
 
         # 3. Concatenate: [Text, Image] -> Treated equally
         # Shape: (B, N_total, D) where N_total = N_txt + N_img
@@ -242,7 +257,7 @@ class DiTBackbone(nn.Module):
         # 4. Prepare Conditioning
         t_emb = self.t_embedder(t)
         coord_emb = self.coord_embedder(crop_coords)
-        c = t_emb + coord_emb
+        c = t_emb + coord_emb + y_emb
 
         # 5. Run First 2 Blocks (Full Sequence)
         for i in range(2):

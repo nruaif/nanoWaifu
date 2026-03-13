@@ -226,6 +226,10 @@ class WDSLoader:
         self.ratio = (3. / 4., 4. / 3.)
 
     def load_class_map(self, csv_path):
+        if csv_path.endswith('.txt'):
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                tags = [line.strip() for line in f if line.strip()]
+            return {tag: i for i, tag in enumerate(tags)}
         # Using latin-1 encoding to avoid UnicodeDecodeError on special characters
         df = pd.read_csv(csv_path, encoding='latin-1')
         return dict(zip(df['character'], df['id']))
@@ -276,17 +280,17 @@ class WDSLoader:
 
             # Resolution Bucketing
             # H = 256 - n*32, W = 256 + n*32, n from -4 to 4
-            buckets = [(256 - n * 32, 256 + n * 32) for n in range(-4, 5)]
+            buckets = [(256 - n * 32, 256 + n * 32) for n in range(-2, 3)]
             bucket_ars = [bw / bh for bh, bw in buckets]
-            
+
             w, h = image.size
             img_ar = w / h
-            
+
             # Find closest bucket by aspect ratio
             best_bucket_idx = min(range(len(bucket_ars)), key=lambda i: abs(bucket_ars[i] - img_ar))
             target_h, target_w = buckets[best_bucket_idx]
             target_ar = bucket_ars[best_bucket_idx]
-            
+
             # Resize to cover
             if img_ar > target_ar:
                 # Image is wider than bucket, match height
@@ -296,9 +300,9 @@ class WDSLoader:
                 # Image is taller than bucket, match width
                 new_w = target_w
                 new_h = int(target_w / img_ar)
-            
+
             image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-            
+
             # Center crop to bucket size
             left = (new_w - target_w) // 2
             top = (new_h - target_h) // 2
@@ -307,10 +311,10 @@ class WDSLoader:
             # To Tensor and Normalize [-1, 1]
             image = F.to_tensor(image)
             image = (image - 0.5) * 2.0
-            
+
             # Dummy coords for backward compatibility
             rel_coords = torch.tensor([0.0, 0.0, 1.0, 1.0])
-            
+
             return {
                 "image": image,
                 "prompt": full_prompt,
@@ -340,7 +344,7 @@ class WDSLoader:
             num_workers=self.num_workers,
             pin_memory=True,
             batch_size=self.batch_size,
-            collate_fn=lambda x: x # Return as list for packing
+            collate_fn=lambda x: x  # Return as list for packing
         )
 
         return loader

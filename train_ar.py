@@ -51,7 +51,7 @@ def get_class_indices(prompts, class_map, device):
         offsets.append(offsets[-1] + len(indices))
     return torch.tensor(all_indices, device=device), torch.tensor(offsets[:-1], device=device)
 
-def get_2d_positions(lengths, resolutions, device):
+def get_2d_positions(resolutions, max_len, device):
     all_pos = []
     for (H, W) in resolutions:
         pos = [[0.0, 0.0], [0.0, 0.0]] # Cond, SOS
@@ -60,8 +60,11 @@ def get_2d_positions(lengths, resolutions, device):
         for r in range(H):
             for c in range(W):
                 pos.append([xs[c].item(), ys[r].item()])
-        all_pos.extend(pos)
-    return torch.tensor(all_pos, device=device).unsqueeze(0)
+        pad_len = max_len - (H * W)
+        for _ in range(pad_len):
+            pos.append([0.0, 0.0])
+        all_pos.append(pos)
+    return torch.tensor(all_pos, device=device)
 
 # --- Core Logic ---
 
@@ -75,9 +78,20 @@ def prepare_batch(batch, vae, device):
         packed_prompts.append(prompt)
         resolutions.append((H, W))
     
-    tokens_flat = torch.cat(packed_tokens, dim=0).unsqueeze(0)
-    lengths = [len(t) + 2 for t in packed_tokens]
-    return tokens_flat, packed_prompts, lengths, resolutions
+    max_len = max([t.size(0) for t in packed_tokens])
+    padded_tokens = []
+    masks = []
+    
+    for t in packed_tokens:
+        pad_len = max_len - t.size(0)
+        padded_t = F.pad(t, (0, 0, 0, pad_len))
+        mask = torch.cat([torch.ones(t.size(0)), torch.zeros(pad_len)])
+        padded_tokens.append(padded_t)
+        masks.append(mask)
+        
+    tokens_batched = torch.stack(padded_tokens).to(device)
+    masks_batched = torch.stack(masks).to(device).bool()
+    return tokens_batched, masks_batched, packed_prompts, resolutions
 
 def calculate_loss(pred_x, target_latents):
     # pred_x: (B, L, 256)
@@ -168,19 +182,35 @@ def train(config_path):
         except StopIteration: data_iter = iter(dataloader); batch = next(data_iter)
 
         # Forward
-        tokens_flat, prompts, lengths, resolutions = prepare_batch(batch, vae, device)
+        tokens_batched, masks_batched, prompts, resolutions = prepare_batch(batch, vae, device)
         # Convert indices {0, 1, 2} to latents {-1, 0, 1}
-        latents_flat = tokens_flat.float() - 1.0
+        latents_batched = tokens_batched.float() - 1.0
         
         class_indices, offsets = get_class_indices(prompts, class_map, device)
-        positions = get_2d_positions(lengths, resolutions, device)
+        max_len = latents_batched.size(1)
+        positions = get_2d_positions(resolutions, max_len, device)
         
-        # In ARTransformer, forward(patch_latents, ...) returns pred_x for all positions
-        # x[1] (SOS) predicts latents[0], x[2] (P0) predicts latents[1], etc.
-        pred_x = model(latents_flat, class_indices, positions, offsets=offsets)
+        B, L, _ = latents_batched.shape
+        t = torch.rand(B, L, 1, device=device)
+        noise = torch.randn_like(latents_batched)
         
-        # Shift to align: pred_x[:, 1:] predicts latents_flat[:, :]
-        loss = calculate_loss(pred_x[:, 1:], latents_flat)
+        # Flow matching interpolation
+        x_t = (1 - t) * noise + t * latents_batched
+        
+        # Construct proper causal + padding block_mask for the AR sequence
+        # The sequence length in AR transformer will be L+1 (cond, SOS, L-1 patches)
+        padding_mask = torch.cat([torch.ones(B, 2, device=device, dtype=torch.bool), masks_batched[:, :-1]], dim=1)
+        L_x = padding_mask.size(1)
+        causal_mask = torch.triu(torch.ones(L_x, L_x, device=device), diagonal=1).bool()
+        invalid = (~padding_mask.unsqueeze(2)) | (~padding_mask.unsqueeze(1)) | causal_mask.unsqueeze(0)
+        block_mask = torch.zeros(B, 1, L_x, L_x, device=device)
+        block_mask.masked_fill_(invalid.unsqueeze(1), -float('inf'))
+        
+        # In ARTransformer, forward(...) now handles slicing and predicting all shifted positions
+        pred_x = model(latents_batched, class_indices, positions, offsets=offsets, block_mask=block_mask, x_t=x_t, t=t)
+        
+        # Loss only on unpadded elements (using masks_batched)
+        loss = F.mse_loss(pred_x[masks_batched], latents_batched[masks_batched])
 
         # Backward
         optimizer.zero_grad()

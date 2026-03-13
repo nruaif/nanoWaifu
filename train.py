@@ -86,19 +86,14 @@ def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_pro
 
 @torch.no_grad()
 def sample_flow(model, vae, tokenizer, text_encoder, latent_size, batch_size, prompts, coords, device,
-                steps=50, cfg_scale=1.4, sparse_drop_ratio=1.0, noise=None):
+                steps=50, cfg_scale=1.4, noise=None):
     """
-    Sample using RK4 integration.
-    Args:
-        noise: Optional (B, C, H, W) tensor. If provided, uses this exact noise instead of sampling random noise.
+    Sample using Euler integration with true CFG.
     """
     # 1. Initialize Latent Gaussian Noise
     if noise is not None:
-        # Clone to ensure we don't modify the stored fixed noise in place during integration
         x = noise.clone().to(device)
-        # Ensure batch size matches provided noise
         if x.shape[0] != batch_size:
-            # If we have more noise than needed, slice it. If less, repeat it.
             if x.shape[0] > batch_size:
                 x = x[:batch_size]
             else:
@@ -110,6 +105,8 @@ def sample_flow(model, vae, tokenizer, text_encoder, latent_size, batch_size, pr
 
     # 2. Pre-encode text
     text_tokens, _ = encode_prompt_with_llm(tokenizer, text_encoder, prompts, device)
+    # Create null text tokens (all zeros) for CFG
+    null_text_tokens = torch.zeros_like(text_tokens)
 
     if coords.shape[0] != batch_size:
         coords = coords.repeat(batch_size, 1)
@@ -117,10 +114,21 @@ def sample_flow(model, vae, tokenizer, text_encoder, latent_size, batch_size, pr
     def get_v(x_current, t_current):
         t_scaled = torch.full((x_current.shape[0],), t_current, device=device)
 
-        _, v_cond = model(x_current, t_scaled, text_tokens, coords, token_drop_ratio=0)
-        _, v_sparse = model(x_current, t_scaled, text_tokens, coords, token_drop_ratio=0.75)
+        # Batch conditioned and unconditioned for efficiency
+        x_in = torch.cat([x_current, x_current], dim=0)
+        t_in = torch.cat([t_scaled, t_scaled], dim=0)
+        text_in = torch.cat([text_tokens, null_text_tokens], dim=0)
+        coords_in = torch.cat([coords, coords], dim=0)
 
-        return v_sparse + cfg_scale * (v_cond - v_sparse)
+        # model returns (x1_head, x1_base)
+        x1_out, _ = model(x_in, t_in, text_in, coords_in, token_drop_ratio=0)
+        
+        x1_cond, x1_uncond = x1_out.chunk(2, dim=0)
+        x1_cfg = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
+
+        # Derive v = (x1 - xt) / (1 - t)
+        v = (x1_cfg - x_current) / (1.0 - t_current + 1e-7)
+        return v
 
     # 3. Euler Loop
     for i in tqdm(range(steps), desc='Euler Sampling', leave=False):
@@ -337,17 +345,17 @@ def train(config_path):
         x1 = latents
         t_reshaped = t.view(-1, 1, 1, 1)
         xt = (1 - t_reshaped) * x0 + t_reshaped * x1
-        ut = x1 - x0
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            v_head, v_base = model(
+            # Model now predicts x1 directly
+            x1_head, x1_base = model(
                 xt, t, text_embeds, coords,
                 token_drop_ratio=current_token_drop_ratio
             )
-            loss_head = ((v_head - ut) ** 2).mean()
-            loss_base = ((v_base - ut) ** 2).mean()
+            loss_head = ((x1_head - x1) ** 2).mean()
+            loss_base = ((x1_base - x1) ** 2).mean()
 
-            loss = loss_head + loss_base * 1 / 4
+            loss = loss_head + loss_base * 0.25
 
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
