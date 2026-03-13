@@ -274,22 +274,43 @@ class WDSLoader:
             elif not isinstance(image, Image.Image):
                 return None
 
-            # Random Resized Crop logic
-            i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
-
-            # Original size
-            W, H = image.size
-
-            # Relative coords: top, left, height, width
-            rel_coords = [i / H, j / W, h / H, w / W]
-            rel_coords = torch.tensor(rel_coords, dtype=torch.float32)
-
-            # Apply crop and resize
-            image = F.resized_crop(image, i, j, h, w, size=(self.image_size, self.image_size))
+            # Resolution Bucketing
+            # H = 256 - n*32, W = 256 + n*32, n from -4 to 4
+            buckets = [(256 - n * 32, 256 + n * 32) for n in range(-4, 5)]
+            bucket_ars = [bw / bh for bh, bw in buckets]
+            
+            w, h = image.size
+            img_ar = w / h
+            
+            # Find closest bucket by aspect ratio
+            best_bucket_idx = min(range(len(bucket_ars)), key=lambda i: abs(bucket_ars[i] - img_ar))
+            target_h, target_w = buckets[best_bucket_idx]
+            target_ar = bucket_ars[best_bucket_idx]
+            
+            # Resize to cover
+            if img_ar > target_ar:
+                # Image is wider than bucket, match height
+                new_h = target_h
+                new_w = int(target_h * img_ar)
+            else:
+                # Image is taller than bucket, match width
+                new_w = target_w
+                new_h = int(target_w / img_ar)
+            
+            image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            
+            # Center crop to bucket size
+            left = (new_w - target_w) // 2
+            top = (new_h - target_h) // 2
+            image = image.crop((left, top, left + target_w, top + target_h))
 
             # To Tensor and Normalize [-1, 1]
             image = F.to_tensor(image)
             image = (image - 0.5) * 2.0
+            
+            # Dummy coords for backward compatibility
+            rel_coords = torch.tensor([0.0, 0.0, 1.0, 1.0])
+            
             return {
                 "image": image,
                 "prompt": full_prompt,
@@ -312,13 +333,14 @@ class WDSLoader:
             .map(self.preprocess, handler=warn_and_continue)
             .select(lambda x: x is not None)
             .to_tuple("image", "prompt", "coords", handler=warn_and_continue)
-            .batched(self.batch_size, partial=False)
         )
 
-        loader = wds.WebLoader(
+        loader = DataLoader(
             dataset,
             num_workers=self.num_workers,
-            pin_memory=True, batch_size=None
+            pin_memory=True,
+            batch_size=self.batch_size,
+            collate_fn=lambda x: x # Return as list for packing
         )
 
         return loader
