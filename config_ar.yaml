@@ -1,0 +1,24 @@
+model:
+  latent_discrete: 256
+  latent_continuous: 0
+  dim: 512
+  depth: 12
+  heads: 8
+  vae_path: "vae_binary/latest.pt"
+
+data:
+  webdataset_url: "dataset/{00000..00010}.tar"
+  csv_path: "characters.csv"
+
+training:
+  image_size: 256
+  batch_size: 4
+  learning_rate: 0.0001
+  max_train_steps: 1000000
+  log_every_steps: 100
+  save_image_every_steps: 1000
+  output_dir: "outputs_ar"
+  num_workers: 4
+  sample_temperature: 1.0
+
+wandb_project: "nanoWaifu-AR"
