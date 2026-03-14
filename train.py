@@ -118,30 +118,13 @@ def train(config_path):
         num_blocks=config['model'].get('fcdm_depth', 2),
         num_classes=num_classes,
         patch_size=config['model'].get('patch_size', 16),
-        use_t_cond=False
+        use_t_cond=True
     ).to(device, memory_format=torch.channels_last)
-
-    # Teacher model (EMA)
-    model_teacher = FCDM(
-        in_channels=3,
-        base_channels=config['model'].get('fcdm_dim', 128),
-        num_blocks=config['model'].get('fcdm_depth', 2),
-        num_classes=num_classes,
-        patch_size=config['model'].get('patch_size', 16),
-        use_t_cond=False
-    ).to(device, memory_format=torch.channels_last)
-    model_teacher.load_state_dict(model.state_dict())
-    for p in model_teacher.parameters():
-        p.requires_grad = False
-    
-    # Projector for Lrep (Mid block student [4C] to Mid block teacher [4C])
-    # Mid block is stage 3, channel count is model.c * 4
-    projector = nn.Conv2d(model.c * 4, model.c * 4, kernel_size=1).to(device)
 
     # Optimizer setup (Muon for 2D params, AdamW for others)
     params_2d = []
     params_1d = []
-    for name, param in list(model.named_parameters()) + list(projector.named_parameters()):
+    for name, param in model.named_parameters():
         if param.requires_grad:
             meaningful_dims = sum(1 for s in param.shape if s > 1)
             if meaningful_dims == 2:
@@ -185,7 +168,6 @@ def train(config_path):
             checkpoint = torch.load(resume_path, map_location=device)
             model_to_load = model.module if hasattr(model, 'module') else model
             model_to_load.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            model_teacher.load_state_dict(checkpoint["model_state_dict"], strict=False)
             global_step = checkpoint["global_step"]
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
@@ -198,13 +180,7 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
     cfg_scale = config['training'].get('cfg_scale', 4.0)
     max_train_steps = config['training'].get('max_train_steps', 1000000)
-    ema_decay = config['training'].get('ema_decay', 0.999)
     patch_size = config['model'].get('patch_size', 16)
-    
-    # Calculate index of the last mid block
-    # Stage 1: l blocks, Stage 2: 2l blocks, Stage 3: 4l blocks
-    m_raw = model.module if hasattr(model, 'module') else model
-    mid_idx = m_raw.l + (m_raw.l * 2) + (m_raw.l * 4)
 
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
@@ -237,57 +213,22 @@ def train(config_path):
                 fixed_noise = torch.randn_like(images[:16])
                 print(f"\n[Step {global_step}] Locked 16 'general' prompts for fixed validation.")
 
-        # Dual-Timestep Scheduling
+        # Standard Timestep Scheduling
         t = torch.rand((images.shape[0],), device=device)
-        s = torch.rand((images.shape[0],), device=device)
-        
-        # Patch-wise token mask
-        h_p, w_p = images.shape[2] // patch_size, images.shape[3] // patch_size
-        mask = (torch.rand((images.shape[0], 1, h_p, w_p), device=device) < 0.5).float()
-        mask_up = F.interpolate(mask, size=(images.shape[2], images.shape[3]), mode='nearest')
-        
         t_reshaped = t.view(-1, 1, 1, 1)
-        s_reshaped = s.view(-1, 1, 1, 1)
-        
-        # Tau: mix of t and s based on mask
-        tau = mask_up * s_reshaped + (1 - mask_up) * t_reshaped
         
         noise = torch.randn_like(images)
-        # Student Input (heterogeneous noise)
-        x_tau = (1 - tau) * images + tau * noise
-        
-        # Teacher Input (uniform less noisy input)
-        tau_min = torch.min(t, s)
-        tau_min_reshaped = tau_min.view(-1, 1, 1, 1)
-        x_tau_min = (1 - tau_min_reshaped) * images + tau_min_reshaped * noise
+        # Uniform noise level
+        xt = (1 - t_reshaped) * images + t_reshaped * noise
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # Student forward with feature extraction from last Mid block
-            student_out, student_feats = model(x_tau, t, y_indices, y_offsets, feat_layers=[mid_idx])
+            # Model predicts clean image x1 directly
+            x1_pred = model(xt, t, y_indices, y_offsets)
             
-            # Teacher forward with feature extraction from last Mid block
-            with torch.no_grad():
-                teacher_out, teacher_feats = model_teacher(x_tau_min, tau_min, y_indices, y_offsets, feat_layers=[mid_idx])
-            
-            # Extract features
-            f_s = student_feats[mid_idx] # (B, 4C, 8, 8)
-            f_t = teacher_feats[mid_idx] # (B, 4C, 8, 8)
-            
-            # Project student feature to match teacher
-            #f_s_proj = projector(f_s)
-            
-            # Normalize for cosine similarity
-            f_s_proj = F.normalize(f_s, dim=1)
-            f_t = F.normalize(f_t, dim=1)
-            
-            # Lrep = 1 - cos(h, f) to keep it positive
-            loss_rep = 1 - (f_s_proj * f_t).sum(dim=1).mean()
-            
-            # Standard Diffusion loss (MSE)
-            loss_mse = F.mse_loss(student_out, images) + F.l1_loss(teacher_out, images)
-            
-            # Total loss
-            loss = loss_mse + loss_rep
+            # Loss is L1 + L2
+            loss_l1 = F.l1_loss(x1_pred, images)
+            loss_l2 = F.mse_loss(x1_pred, images)
+            loss = loss_l1 + loss_l2
 
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
@@ -296,20 +237,14 @@ def train(config_path):
         optimizer_muon.step()
         optimizer_adamw.step()
 
-        # Teacher EMA Update
-        with torch.no_grad():
-            m_student = model.module if hasattr(model, 'module') else model
-            for p_s, p_t in zip(m_student.parameters(), model_teacher.parameters()):
-                p_t.data.mul_(ema_decay).add_(p_s.data, alpha=1 - ema_decay)
-
         global_step += 1
 
         if rank == 0:
             pbar.update(1)
             logs = {
                 "loss": loss.item(),
-                "loss_mse": loss_mse.item(),
-                "loss_rep": loss_rep.item(),
+                "loss_l1": loss_l1.item(),
+                "loss_l2": loss_l2.item(),
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
             
@@ -321,6 +256,7 @@ def train(config_path):
                 avg_logs = {f"train/{k}": v / config['training']['log_every_steps'] for k, v in running_metrics.items()}
                 wandb.log(avg_logs, step=global_step)
                 running_metrics = {}
+
         if global_step % config['training']['save_image_every_steps'] == 0:
             if is_ddp: dist.barrier()
             if rank == 0:
