@@ -4,42 +4,24 @@ training:
   num_epochs: 100
   max_train_steps: 1000000
   gradient_checkpointing: true
-  freeze_backbone: false
   log_every_steps: 10
 
   save_image_every_steps: 5000
   image_size: 256
-  patch_size: 1   # For 32x32 latents, patch_size 2 gives 16x16=256 patches
-  num_workers: 2
-  class_dropout_prob: 0
+  num_workers: 4 # Set to 0 for Windows compatibility, increase on Linux
+  class_dropout_prob: 0.1
   cfg_scale: 1.4
   output_dir: "outputs"
   wandb_project: "nanoWaifu-T2I"
-  resume_from: "" # Starting fresh for T2I
+  resume_from: "outputs/"
   max_checkpoints: 3
 
 model:
-  fcdm_dim: 128
+  fcdm_dim: 384
   fcdm_depth: 2
   in_channels: 3 # RGB
-  patch_size: 16
+  patch_size: 8 # PixelUnshuffle factor
 
 data:
-  webdataset_url: '/teamspace/studios/this_studio/nanoWaifu-T2I/anime/train/00{001..006}.tar'
-  csv_path: "characters.csv"
+  webdataset_url: 'https://huggingface.co/datasets/Shio-Koube/150k-anime/resolve/main/train/00{001..006}.tar'
   use_advanced_captions: true  # Enable advanced caption processing with tag dropping
-
-sprint:
-  enabled: true
-  token_drop_ratio: 0.75  # 0.0 to 0.75 - higher = more aggressive dropping
-  encoder_depth: 2        # Number of blocks for encoder (dense shallow)
-  middle_depth:  20       # Number of blocks for middle (sparse deep)
-  decoder_depth: 2        # Number of blocks for decoder (dense with fusion)
-  
-  # Two-stage training schedule
-  two_stage_training: true
-  stage1_steps: 900000    # Long pre-training with token dropping
-  stage2_steps: 100000    # Short fine-tuning with full tokens (0% drop)
-  
-  # Inference optimization
-  use_pdg: true          # Path-Drop Guidance for inference (not yet implemented)
