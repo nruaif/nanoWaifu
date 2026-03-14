@@ -339,12 +339,12 @@ class WDSLoader:
             .to_tuple("image", "prompt", "coords", handler=warn_and_continue)
         )
 
-        loader = DataLoader(
+        loader = wds.WebLoader(
             dataset,
+            batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            batch_size=self.batch_size,
-            collate_fn=lambda x: x  # Return as list for packing
+            collate_fn=lambda x: x
         )
 
         return loader
