@@ -191,13 +191,14 @@ def train(config_path):
     while global_step < max_train_steps:
         model.train()
         try:
-            batch = next(data_iter)
+            batch_list = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
-            batch = next(data_iter)
+            batch_list = next(data_iter)
 
-        images, prompts, _ = batch
-        images = images.to(device)
+        # Batch is now a list of samples: [(img, prompt, coords), ...]
+        images_list = [s[0].to(device) for s in batch_list]
+        prompts = [s[1] for s in batch_list]
         
         # Classifier-free guidance dropout handled in TagProcessor
         dropout_prob = config['training'].get('class_dropout_prob', 0.1)
@@ -207,23 +208,39 @@ def train(config_path):
             general_candidates = [p for p in prompts if "general" in p]
             if len(general_candidates) >= 16:
                 fixed_prompts = general_candidates[:16]
-                fixed_noise = torch.randn((16, 3, image_size, image_size), device=device)
-                print(f"\n[Step {global_step}] Locked 16 'general' prompts for fixed validation.")
+                fixed_noise = [torch.randn_like(img) for img in images_list[:16]]
+                print(f"\n[Step {global_step}] Locked 16 'general' prompts and their noise shapes for fixed validation.")
 
-        t = torch.rand((images.shape[0],), device=device)
-        x0 = torch.randn_like(images)
-        x1 = images
-        t_reshaped = t.view(-1, 1, 1, 1)
-        xt = (1 - t_reshaped) * x0 + t_reshaped * x1
-
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # Model predicts x1 directly (X-prediction)
-            x1_pred = model(xt, t, y_indices, y_offsets)
-            loss = ((x1_pred - x1) ** 2).mean()
-
+        # For Flow Matching with varying sizes, we must process each image's flow
+        # since they can't be stacked into a single tensor if sizes differ.
+        # Alternatively, we can group by size, but for now, we'll loop or pad.
+        # Given FCDM is fully convolutional, we can process them one by one or in a loop.
+        
+        total_loss = 0
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
-        loss.backward()
+        
+        for i, img in enumerate(images_list):
+            t_single = torch.rand((1,), device=device)
+            x0 = torch.randn_like(img)
+            x1 = img
+            xt = (1 - t_single) * x0 + t_single * x1
+            
+            # Extract y info for single sample
+            # Since offsets are absolute, we need to slice indices
+            start_off = y_offsets[i].item()
+            end_off = y_offsets[i+1].item() if i+1 < len(y_offsets) else len(y_indices)
+            y_indices_single = y_indices[start_off:end_off]
+            y_offsets_single = torch.zeros(1, dtype=torch.long, device=device)
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                x1_pred = model(xt.unsqueeze(0), t_single, y_indices_single, y_offsets_single)
+                loss = F.mse_loss(x1_pred.squeeze(0), x1)
+                loss = loss / len(images_list) # average loss
+            
+            loss.backward()
+            total_loss += loss.item()
+
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer_muon.step()
         optimizer_adamw.step()
@@ -233,7 +250,7 @@ def train(config_path):
         if rank == 0:
             pbar.update(1)
             logs = {
-                "loss": loss.item(),
+                "loss": total_loss,
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
             pbar.set_postfix(**logs)

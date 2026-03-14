@@ -210,17 +210,19 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
                 steps=50, cfg_scale=1.4, noise=None):
     """
     Sample using Euler integration with true CFG for FCDM.
+    Handles list of noise tensors for varying sizes.
     """
     # 1. Initialize Image Gaussian Noise
     if noise is not None:
-        x = noise.clone().to(device)
-        if x.shape[0] != batch_size:
-            if x.shape[0] > batch_size:
-                x = x[:batch_size]
-            else:
-                x = x.repeat(int(batch_size / x.shape[0]) + 1, 1, 1, 1)[:batch_size]
+        if isinstance(noise, list):
+            x_list = [n.clone().to(device) for n in noise[:batch_size]]
+        else:
+            x = noise.clone().to(device)
+            # If single tensor, we assume fixed size for all in batch
+            x_list = [x[i] if i < x.shape[0] else x[0] for i in range(batch_size)]
     else:
-        x = torch.randn((batch_size, 3, image_size, image_size), device=device)
+        # Default to image_size x image_size if no noise provided
+        x_list = [torch.randn(3, image_size, image_size, device=device) for _ in range(batch_size)]
 
     dt = 1.0 / steps
 
@@ -231,23 +233,27 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
     null_indices = torch.full((batch_size,), fill_value=tag_processor.num_classes, dtype=torch.long, device=device)
     null_offsets = torch.arange(batch_size, dtype=torch.long, device=device)
 
-    def get_v(x_current, t_current):
-        t_scaled = torch.full((x_current.shape[0],), t_current, device=device)
-
+    def get_v_single(x_curr, t_curr, idx):
+        t_scaled = torch.full((1,), t_curr, device=device)
+        
         # Conditioned forward
-        x1_cond = model(x_current, t_scaled, y_indices, y_offsets)
+        start_off = y_offsets[idx].item()
+        end_off = y_offsets[idx+1].item() if idx+1 < len(y_offsets) else len(y_indices)
+        y_ind = y_indices[start_off:end_off]
+        y_off = torch.zeros(1, dtype=torch.long, device=device)
+        
+        x1_cond = model(x_curr.unsqueeze(0), t_scaled, y_ind, y_off).squeeze(0)
         
         # Unconditioned forward
-        x1_uncond = model(x_current, t_scaled, null_indices, null_offsets)
+        y_ind_null = null_indices[idx:idx+1]
+        y_off_null = torch.zeros(1, dtype=torch.long, device=device)
+        x1_uncond = model(x_curr.unsqueeze(0), t_scaled, y_ind_null, y_off_null).squeeze(0)
         
         x1_cfg = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
-
-        # Derive v = (x1 - xt) / (1 - t)
-        v = (x1_cfg - x_current) / (1.0 - t_current + 1e-7)
+        v = (x1_cfg - x_curr) / (1.0 - t_curr + 1e-7)
         return v
 
     # 3. Euler Loop
-    # Use tqdm if available, otherwise just loop
     try:
         from tqdm.auto import tqdm
         pbar = tqdm(range(steps), desc='Euler Sampling', leave=False)
@@ -256,8 +262,18 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
 
     for i in pbar:
         t = i / steps
-        v = get_v(x, t)
-        x = x + v * dt
+        new_x_list = []
+        for j, x_curr in enumerate(x_list):
+            v = get_v_single(x_curr, t, j)
+            new_x_list.append(x_curr + v * dt)
+        x_list = new_x_list
 
-    images = (x / 2 + 0.5).clamp(0, 1)
+    # Final images
+    images = [(x / 2 + 0.5).clamp(0, 1) for x in x_list]
+    # If all same size, stack them
+    try:
+        images = torch.stack(images)
+    except:
+        # Keep as list if different sizes (caller needs to handle)
+        pass
     return images

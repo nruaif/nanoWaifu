@@ -196,6 +196,10 @@ def transform_sample(sample):
     }
 
 
+def wds_collate_fn(x):
+    # Just return the list of samples, don't try to stack them because of bucketing
+    return x
+
 class WDSLoader:
     def __init__(self, url, csv_path=None, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
         """
@@ -360,7 +364,7 @@ class WDSLoader:
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            collate_fn=lambda x: x
+            collate_fn=wds_collate_fn
         )
 
         return loader
