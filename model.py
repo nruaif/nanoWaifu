@@ -85,16 +85,18 @@ class TimestepEmbedder(nn.Module):
 
 class FCDM(nn.Module):
     """Fully Convolutional Diffusion Model U-Net [cite: 71, 72]"""
-    def __init__(self, in_channels=3, base_channels=128, num_blocks=2, num_classes=12476, patch_size=16):
+    def __init__(self, in_channels=3, base_channels=128, num_blocks=2, num_classes=12476, patch_size=16, use_t_cond=True):
         super().__init__()
         self.c = base_channels
         self.l = num_blocks
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.num_classes = num_classes
+        self.use_t_cond = use_t_cond
         
         # Conditioning embeddings (+1 for null token)
-        self.t_embedder = TimestepEmbedder(self.c * 4)
+        if self.use_t_cond:
+            self.t_embedder = TimestepEmbedder(self.c * 4)
         # Using EmbeddingBag for multi-label support
         self.y_embedder = nn.EmbeddingBag(num_classes + 1, self.c * 4, mode='mean')
         cond_dim = self.c * 4
@@ -129,44 +131,69 @@ class FCDM(nn.Module):
         self.conv_out = nn.Conv2d(self.c, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
         self.shuffle = nn.PixelShuffle(patch_size)
 
-    def forward(self, x, t, y_indices, y_offsets=None):
+    def forward(self, x, t, y_indices, y_offsets=None, feat_layers=None):
         """
         x: (B, C, H, W)
         t: (B,)
         y_indices: (Total_Tags,) or (B, Tags_Per_Sample)
         y_offsets: (B,) if y_indices is flattened
+        feat_layers: Optional list of layer indices to return features from (e.g. [2, 6])
         """
         # Conditioning
-        c = self.t_embedder(t) + self.y_embedder(y_indices, y_offsets)
+        c = self.y_embedder(y_indices, y_offsets)
+        if self.use_t_cond:
+            c = c + self.t_embedder(t)
         
         # Pixel Unshuffle and project
         x = self.unshuffle(x)
         x = self.conv_in(x)
         
+        feats = {}
         # Stage 1
-        for block in self.enc1: x = block(x, c)
+        for i, block in enumerate(self.enc1):
+            x = block(x, c)
+            if feat_layers and (i + 1) in feat_layers:
+                feats[i + 1] = x
+        
         skip1 = x
         x = self.down1(x)
         
         # Stage 2
-        for block in self.enc2: x = block(x, c)
+        for i, block in enumerate(self.enc2):
+            x = block(x, c)
+            curr_layer = self.l + i + 1
+            if feat_layers and curr_layer in feat_layers:
+                feats[curr_layer] = x
+        
         skip2 = x
         x = self.down2(x)
         
         # Stage 3
-        for block in self.mid: x = block(x, c)
+        for i, block in enumerate(self.mid):
+            x = block(x, c)
+            curr_layer = self.l + (self.l * 2) + i + 1
+            if feat_layers and curr_layer in feat_layers:
+                feats[curr_layer] = x
             
         # Stage 2 (Decode)
         x = self.up2(x)
         x = torch.cat([x, skip2], dim=1) # U-Net Skip connection
         x = self.skip_proj2(x)
-        for block in self.dec2: x = block(x, c)
+        for i, block in enumerate(self.dec2):
+            x = block(x, c)
+            curr_layer = self.l + (self.l * 2) + (self.l * 4) + i + 1
+            if feat_layers and curr_layer in feat_layers:
+                feats[curr_layer] = x
             
         # Stage 1 (Decode)
         x = self.up1(x)
         x = torch.cat([x, skip1], dim=1)
         x = self.skip_proj1(x)
-        for block in self.dec1: x = block(x, c)
+        for i, block in enumerate(self.dec1):
+            x = block(x, c)
+            curr_layer = self.l + (self.l * 2) + (self.l * 4) + (self.l * 2) + i + 1
+            if feat_layers and curr_layer in feat_layers:
+                feats[curr_layer] = x
             
         # Output
         x = x.permute(0, 2, 3, 1)
@@ -174,6 +201,9 @@ class FCDM(nn.Module):
         x = x.permute(0, 3, 1, 2)
         x = self.conv_out(x)
         x = self.shuffle(x)
+        
+        if feat_layers:
+            return x, feats
         return x
 
 class TagProcessor:
