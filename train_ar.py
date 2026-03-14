@@ -228,7 +228,7 @@ def train(config_path):
     data_iter = iter(dataloader)
     if rank == 0:
         pbar = tqdm(total=max_steps, initial=global_step, desc="Training")
-
+    model.compile()
     while global_step < max_steps:
         try:
             batch = next(data_iter)
