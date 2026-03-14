@@ -73,12 +73,14 @@ def get_class_indices(prompts, class_map, device):
 def get_2d_positions(resolutions, max_len, device):
     all_pos = []
     for (H, W) in resolutions:
-        pos = [[0.0, 0.0], [0.0, 0.0]]  # Cond, SOS
+        pos = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]  # Cond, Size, SOS
         xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
-        xs, ys = torch.linspace(-xlim, xlim, W), torch.linspace(-ylim, ylim, H)
+        xs = torch.linspace(-xlim, xlim, W)
+        ys = torch.linspace(-ylim, ylim, H)
         for r in range(H):
             for c in range(W):
                 pos.append([xs[c].item(), ys[r].item()])
+        pos.append([0.0, 0.0])  # EOS
         pad_len = max_len - (H * W)
         for _ in range(pad_len):
             pos.append([0.0, 0.0])
@@ -274,13 +276,14 @@ def train(config_path):
 
         pred_x = model(
             latents_batched, class_indices, positions,
-            grid_HW=grid_HW,  # <-- pass it in
+            grid_HW=grid_HW,
             offsets=offsets,
             block_mask=block_mask,
             x_t=x_t, t=t
         )
-
-        loss = F.mse_loss(pred_x[masks_batched], latents_batched[masks_batched])
+        pred_patches = pred_x[:, :L]
+        loss = F.mse_loss(pred_patches[masks_batched], latents_batched[masks_batched])
+        #loss = F.mse_loss(pred_x[masks_batched], latents_batched[masks_batched])
 
         # Backward
         optimizer.zero_grad()

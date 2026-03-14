@@ -182,17 +182,14 @@ class DenoisingMLP(nn.Module):
         x = self.final_norm(x)
         return self.final_proj(x)
 
-
-# --- NEW: Size Embedding ---
 class SizeEmbedding(nn.Module):
+    """Fourier-embeds (H, W) patch-grid dimensions into model dim."""
     def __init__(self, dim: int, fourier_dim: int = 128, max_period: float = 10000.0):
         super().__init__()
         self.fourier_dim = fourier_dim
         self.max_period = max_period
-        # _fourier returns fourier_dim per input (half cos, half sin)
-        # cat([h_emb, w_emb]) = fourier_dim * 2
         self.mlp = nn.Sequential(
-            nn.Linear(fourier_dim * 2, dim),  # was fourier_dim * 4, wrong
+            nn.Linear(fourier_dim * 2, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
@@ -207,16 +204,14 @@ class SizeEmbedding(nn.Module):
             * torch.arange(half, device=x.device, dtype=torch.float32)
             / half
         )
-        args = x[:, None] * freqs[None]  # (B, half)
-        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, fourier_dim)
+        args = x[:, None] * freqs[None]
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, H: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-        h_emb = self._fourier(H.float())  # (B, fourier_dim)
-        w_emb = self._fourier(W.float())  # (B, fourier_dim)
-        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))  # (B, fourier_dim*2) -> (B, dim)
+        h_emb = self._fourier(H.float())
+        w_emb = self._fourier(W.float())
+        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))
 
-
-# --- ARTransformer (updated) ---
 
 class ARTransformer(nn.Module):
     def __init__(
@@ -235,10 +230,13 @@ class ARTransformer(nn.Module):
 
         self.class_emb = nn.EmbeddingBag(num_classes, dim, mode='mean')
         self.patch_proj = nn.Linear(latent_dim, dim)
-        self.sos_token = nn.Parameter(torch.randn(1, 1, dim))
 
-        # NEW: size conditioning
-        self.size_emb = SizeEmbedding(dim)
+        # Special tokens
+        self.sos_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.eos_token = nn.Parameter(torch.randn(1, 1, dim))  # NEW
+
+        # Size token projection
+        self.size_emb = SizeEmbedding(dim)                     # NEW
 
         self.rope = GGRoPE2d(num_heads, dim // num_heads)
 
@@ -274,10 +272,10 @@ class ARTransformer(nn.Module):
 
     def forward(
         self,
-        patch_latents,      # (B, L, latent_dim)
+        patch_latents,   # (B, L, latent_dim)
         class_indices,
-        positions,          # (B, L+2, 2)
-        grid_HW,            # NEW: (B, 2) int tensor — patch grid (H, W) per sample
+        positions,       # (B, L+4, 2) — Cond, Size, SOS, P1..PL, EOS
+        grid_HW,         # (B, 2) int tensor — patch grid (H, W)
         offsets=None,
         block_mask=None,
         x_t=None,
@@ -286,28 +284,35 @@ class ARTransformer(nn.Module):
         B, L, _ = patch_latents.shape
         device = patch_latents.device
 
-        patch_embeddings = self.patch_proj(patch_latents)
+        patch_embeddings = self.patch_proj(patch_latents)  # (B, L, dim)
         global_tags = self.class_emb(class_indices, offsets)
 
         if B == 1 and global_tags.size(0) > 1:
             global_tags = global_tags[0:1]
 
-        # Size embedding added into cond token
-        H_patches = grid_HW[:, 0]   # (B,)
-        W_patches = grid_HW[:, 1]   # (B,)
-        size_embed = self.size_emb(H_patches, W_patches)   # (B, dim)
+        # Special tokens
+        size_embed = self.size_emb(grid_HW[:, 0], grid_HW[:, 1])  # (B, dim)
+        cond_token = global_tags.unsqueeze(1)                       # (B, 1, dim)
+        size_token = size_embed.unsqueeze(1)                        # (B, 1, dim)
+        sos = self.sos_token.expand(B, -1, -1)                      # (B, 1, dim)
+        eos = self.eos_token.expand(B, -1, -1)                      # (B, 1, dim)
 
-        cond_embeddings = (global_tags + size_embed).unsqueeze(1)   # (B, 1, dim)
-        sos = self.sos_token.expand(B, -1, -1)
+        # Input:  [Cond, Size, SOS, P1, ..., PL-1, EOS]
+        # Target: [P1,   P2,  P3,  ..., PL,  EOS-pred  ] (shifted by 1)
+        # We feed EOS at the end so the model learns to predict it after last patch
+        x = torch.cat([cond_token, size_token, sos, patch_embeddings[:, :-1], eos], dim=1)
 
-        x = torch.cat([cond_embeddings, sos, patch_embeddings[:, :-1]], dim=1)
         pos_seq = positions[:, :x.size(1)]
 
         for block in self.blocks:
             x = block(x, self.rope, pos_seq, block_mask)
 
         x = self.norm_f(x)
-        x_for_pred = x[:, 1:]
+
+        # Drop Cond output, keep Size through EOS outputs for prediction
+        # x[:, 0] = Cond output  -> discard
+        # x[:, 1:] = Size, SOS, P1..PL-1, EOS outputs -> predict P1..PL + EOS
+        x_for_pred = x[:, 1:]  # (B, L+2, dim)  Size/SOS/patches/EOS hidden states
 
         if x_t is None:
             x_t = torch.randn(B, x_for_pred.size(1), self.latent_dim, device=device)
@@ -316,14 +321,14 @@ class ARTransformer(nn.Module):
 
         tags_expanded = global_tags.unsqueeze(1).expand(-1, x_for_pred.size(1), -1)
         pred_x = self.denoise_mlp(x_t, x_for_pred, tags_expanded, t)
-        return pred_x
+        return pred_x  # (B, L+2, latent_dim)
 
     @torch.no_grad()
     def generate(
             self,
             class_indices,
-            grid_H: int,        # NEW: explicit patch grid height
-            grid_W: int,        # NEW: explicit patch grid width
+            grid_H: int,
+            grid_W: int,
             device='cuda',
     ):
         B = 1 if class_indices.dim() == 1 else class_indices.size(0)
@@ -337,15 +342,15 @@ class ARTransformer(nn.Module):
 
         global_tags = self.class_emb(class_indices, offsets)
 
-        # Size embedding — same H, W for all samples in this generation call
         grid_HW = torch.tensor([[grid_H, grid_W]], device=device).expand(B, -1)
-        H_patches = grid_HW[:, 0].float()
-        W_patches = grid_HW[:, 1].float()
-        size_embed = self.size_emb(H_patches, W_patches)   # (B, dim)
+        size_embed = self.size_emb(grid_HW[:, 0].float(), grid_HW[:, 1].float())
 
-        cond = (global_tags + size_embed).unsqueeze(1)
-        sos = self.sos_token.expand(B, -1, -1)
-        current_seq_emb = torch.cat([cond, sos], dim=1)
+        cond  = global_tags.unsqueeze(1)       # (B, 1, dim)
+        size  = size_embed.unsqueeze(1)        # (B, 1, dim)
+        sos   = self.sos_token.expand(B, -1, -1)
+
+        # Sequence starts as [Cond, Size, SOS]
+        current_seq_emb = torch.cat([cond, size, sos], dim=1)
 
         # Coordinate scheme matching get_2d_positions() in training
         xlim = math.sqrt(grid_W / grid_H)
@@ -353,10 +358,13 @@ class ARTransformer(nn.Module):
         xs = torch.linspace(-xlim, xlim, grid_W, device=device)
         ys = torch.linspace(-ylim, ylim, grid_H, device=device)
 
-        def get_pos(idx):
-            if idx in (0, 1):
+        # Position indices: 0=Cond, 1=Size, 2=SOS, 3..=patches, last=EOS
+        def get_pos(idx, total_patches):
+            if idx in (0, 1, 2):
                 return [0.0, 0.0]
-            patch_idx = idx - 2
+            patch_idx = idx - 3
+            if patch_idx >= total_patches:  # EOS position
+                return [0.0, 0.0]
             r, c = patch_idx // grid_W, patch_idx % grid_W
             return [xs[c].item(), ys[r].item()]
 
@@ -366,7 +374,8 @@ class ARTransformer(nn.Module):
         for i in range(max_patches):
             seq_len = current_seq_emb.size(1)
             positions = torch.tensor(
-                [get_pos(j) for j in range(seq_len)], device=device
+                [get_pos(j, max_patches) for j in range(seq_len)],
+                device=device
             ).unsqueeze(0).expand(B, -1, -1)
 
             x = current_seq_emb
@@ -374,7 +383,6 @@ class ARTransformer(nn.Module):
                 x = block(x, self.rope, positions)
 
             x_last = self.norm_f(x[:, -1:])
-
             x_t = torch.randn(B, 1, self.latent_dim, device=device)
             tags_expanded = global_tags.unsqueeze(1)
 
@@ -397,7 +405,7 @@ class ARTransformer(nn.Module):
 
             if current_seq_emb.size(1) > self.max_seq_len:
                 current_seq_emb = torch.cat(
-                    [current_seq_emb[:, :1], current_seq_emb[:, -(self.max_seq_len - 1):]],
+                    [current_seq_emb[:, :2], current_seq_emb[:, -(self.max_seq_len - 2):]],
                     dim=1
                 )
 
