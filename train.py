@@ -274,10 +274,10 @@ def train(config_path):
             f_t = teacher_feats[mid_idx] # (B, 4C, 8, 8)
             
             # Project student feature to match teacher
-            f_s_proj = projector(f_s) 
+            #f_s_proj = projector(f_s)
             
             # Normalize for cosine similarity
-            f_s_proj = F.normalize(f_s_proj, dim=1)
+            f_s_proj = F.normalize(f_s, dim=1)
             f_t = F.normalize(f_t, dim=1)
             
             # Lrep = 1 - cos(h, f) to keep it positive
