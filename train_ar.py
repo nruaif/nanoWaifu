@@ -310,8 +310,8 @@ def train(config_path):
             latest = max(checkpoints, key=lambda x: int(re.search(r'_step_(\d+)\.pth', x).group(1)))
             print(f"🔄 Resuming from: {latest}")
             ckpt = torch.load(latest, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'])
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            #optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             global_step = ckpt['global_step']
             if rank == 0:
                 print(f"✅ Resumed at step {global_step}")
