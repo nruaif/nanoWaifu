@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_FLEX = False
 
-HAS_FLEX = False
+
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
