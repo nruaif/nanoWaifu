@@ -184,16 +184,15 @@ class DenoisingMLP(nn.Module):
 
 
 # --- NEW: Size Embedding ---
-
 class SizeEmbedding(nn.Module):
-    """Fourier-embeds (H, W) patch-grid dimensions into model dim."""
     def __init__(self, dim: int, fourier_dim: int = 128, max_period: float = 10000.0):
         super().__init__()
         self.fourier_dim = fourier_dim
         self.max_period = max_period
-        # Projects [sin/cos(H), sin/cos(W)] -> dim
+        # _fourier returns fourier_dim per input (half cos, half sin)
+        # cat([h_emb, w_emb]) = fourier_dim * 2
         self.mlp = nn.Sequential(
-            nn.Linear(fourier_dim * 4, dim),
+            nn.Linear(fourier_dim * 2, dim),  # was fourier_dim * 4, wrong
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
@@ -201,24 +200,20 @@ class SizeEmbedding(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def _fourier(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B,) float -> (B, fourier_dim*2)"""
+        """x: (B,) -> (B, fourier_dim)"""
         half = self.fourier_dim // 2
         freqs = torch.exp(
             -math.log(self.max_period)
             * torch.arange(half, device=x.device, dtype=torch.float32)
             / half
         )
-        args = x[:, None] * freqs[None]           # (B, half)
+        args = x[:, None] * freqs[None]  # (B, half)
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, fourier_dim)
 
     def forward(self, H: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-        """
-        H, W: (B,) int tensors — patch-grid height and width
-        returns: (B, dim)
-        """
-        h_emb = self._fourier(H.float())   # (B, fourier_dim)
-        w_emb = self._fourier(W.float())   # (B, fourier_dim)
-        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))  # (B, dim)
+        h_emb = self._fourier(H.float())  # (B, fourier_dim)
+        w_emb = self._fourier(W.float())  # (B, fourier_dim)
+        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))  # (B, fourier_dim*2) -> (B, dim)
 
 
 # --- ARTransformer (updated) ---
