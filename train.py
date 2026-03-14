@@ -12,14 +12,10 @@ from tqdm.auto import tqdm
 import wandb
 import glob
 import builtins
-from diffusers import AutoencoderKL, AutoModel
-from transformers import AutoTokenizer
-import timm
-from model import DiT
+import random
+from model import FCDM, TagProcessor, sample_flow
 from dataset import WDSLoader
-from text_encoder import encode_prompt_with_llm
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
 import bitsandbytes as bnb
 
@@ -84,71 +80,11 @@ def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_pro
     print(f"Checkpoint saved to {ckpt_path}")
 
 
-@torch.no_grad()
-def sample_flow(model, vae, tokenizer, text_encoder, latent_size, batch_size, prompts, coords, device,
-                steps=50, cfg_scale=1.4, noise=None):
-    """
-    Sample using Euler integration with true CFG.
-    """
-    # 1. Initialize Latent Gaussian Noise
-    if noise is not None:
-        x = noise.clone().to(device)
-        if x.shape[0] != batch_size:
-            if x.shape[0] > batch_size:
-                x = x[:batch_size]
-            else:
-                x = x.repeat(int(batch_size / x.shape[0]) + 1, 1, 1, 1)[:batch_size]
-    else:
-        x = torch.randn((batch_size, 16, latent_size, latent_size), device=device)
-
-    dt = 1.0 / steps
-
-    # 2. Pre-encode text
-    text_tokens, _ = encode_prompt_with_llm(tokenizer, text_encoder, prompts, device)
-    # Create null text tokens (all zeros) for CFG
-    null_text_tokens = torch.zeros_like(text_tokens)
-
-    if coords.shape[0] != batch_size:
-        coords = coords.repeat(batch_size, 1)
-
-    def get_v(x_current, t_current):
-        t_scaled = torch.full((x_current.shape[0],), t_current, device=device)
-
-        # Batch conditioned and unconditioned for efficiency
-        x_in = torch.cat([x_current, x_current], dim=0)
-        t_in = torch.cat([t_scaled, t_scaled], dim=0)
-        text_in = torch.cat([text_tokens, null_text_tokens], dim=0)
-        coords_in = torch.cat([coords, coords], dim=0)
-
-        # model returns (x1_head, x1_base)
-        x1_out, _ = model(x_in, t_in, text_in, coords_in, token_drop_ratio=0)
-        
-        x1_cond, x1_uncond = x1_out.chunk(2, dim=0)
-        x1_cfg = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
-
-        # Derive v = (x1 - xt) / (1 - t)
-        v = (x1_cfg - x_current) / (1.0 - t_current + 1e-7)
-        return v
-
-    # 3. Euler Loop
-    for i in tqdm(range(steps), desc='Euler Sampling', leave=False):
-        t = i / steps
-        v = get_v(x, t)
-        x = x + v * dt
-
-    latents = x / vae.config.scaling_factor + vae.config.shift_factor
-    images = vae.decode(latents, return_dict=False)
-    images = (images / 2 + 0.5).clamp(0, 1)
-    return images
-
-
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
-    # seed_everything(42)
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
-
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -159,18 +95,9 @@ def train(config_path):
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-T2I'), config=config)
 
-    # Load Models
-    vae = AutoModel.from_pretrained(config['model']['vae_model'], trust_remote_code=True,
-                                    torch_dtype=torch.bfloat16).to(device).eval()
-    vae.requires_grad_(False)
-    vae.config.scaling_factor = 0.62
-    vae.config.shift_factor = 0
-    vae.compile()
-    tokenizer = AutoTokenizer.from_pretrained(config['model']['text_encoder_model'])
-    text_encoder = AutoModel.from_pretrained(config['model']['text_encoder_model']).to(device).eval()
-    text_encoder.requires_grad_(False)
-    text_encoder.compile
-    print(f"Using LLM text encoder: {config['model']['text_encoder_model']}")
+    # Tag Processor
+    tag_processor = TagProcessor("tags.txt")
+    num_classes = tag_processor.num_classes
 
     # Load Data
     wds_loader = WDSLoader(
@@ -183,26 +110,17 @@ def train(config_path):
     )
     dataloader = wds_loader.make_loader()
 
-    sprint_config = config.get('sprint', {})
-    sprint_enabled = sprint_config.get('enabled', False)
-    latent_size = config['training']['image_size'] // 8
+    image_size = config['training']['image_size']
 
-    model = DiT(
-        input_size=latent_size,
-        patch_size=config['training']['patch_size'],
-        in_channels=config['model']['in_channels'],
-        hidden_size=config['model']['dim'],
-        depth=config['model']['depth'],
-        num_heads=config['model']['heads'],
-        mlp_ratio=config['model']['mlp_dim'] / config['model']['dim'],
-        text_embed_dim=config['model']['context_dim'],
+    model = FCDM(
+        in_channels=3,
+        base_channels=config['model'].get('fcdm_dim', 128),
+        num_blocks=config['model'].get('fcdm_depth', 2),
+        num_classes=num_classes,
+        patch_size=config['model'].get('patch_size', 16)
     ).to(device)
 
-    if config['training'].get('gradient_checkpointing', False):
-        model.enable_gradient_checkpointing()
-        print("Gradient checkpointing enabled.")
-
-    # Optimizer setup
+    # Optimizer setup (Muon for 2D params, AdamW for others)
     params_2d = []
     params_1d = []
     for name, param in model.named_parameters():
@@ -213,10 +131,16 @@ def train(config_path):
             else:
                 params_1d.append(param)
 
-    optimizer_muon = torch.optim.Muon(
-        params_2d, lr=config['training']['learning_rate'],
-        momentum=0.95, nesterov=True, adjust_lr_fn="match_rms_adamw"
-    )
+    # Fallback to AdamW if Muon is not available or appropriate
+    # The original train.py used Muon, so I'll try to keep it if it's in the environment.
+    try:
+        optimizer_muon = torch.optim.Muon(
+            params_2d, lr=config['training']['learning_rate'],
+            momentum=0.95, nesterov=True, adjust_lr_fn="match_rms_adamw"
+        )
+    except AttributeError:
+        print("Muon optimizer not found in torch.optim, using AdamW for all parameters.")
+        optimizer_muon = bnb.optim.AdamW8bit(params_2d, lr=config['training']['learning_rate'])
 
     optimizer_adamw = bnb.optim.AdamW8bit(
         params_1d, lr=config['training']['learning_rate'],
@@ -225,12 +149,9 @@ def train(config_path):
 
     optimizers = [optimizer_muon, optimizer_adamw]
 
-    # --- RESUME LOGIC & FIXED DATA SETUP ---
-    start_epoch = 0
+    # --- RESUME LOGIC ---
     global_step = 0
     resume_path = config.get('resume_from', "outputs/")
-
-    # Initialize containers for fixed data
     fixed_prompts = None
     fixed_noise = None
 
@@ -245,34 +166,12 @@ def train(config_path):
         if resume_path and os.path.exists(resume_path):
             print(f"Resuming from checkpoint: {resume_path}")
             checkpoint = torch.load(resume_path, map_location=device)
-
             model_to_load = model.module if hasattr(model, 'module') else model
             model_to_load.load_state_dict(checkpoint["model_state_dict"], strict=False)
-
-            # Load optimizers
-            if "optimizer_muon_state_dict" in checkpoint and "optimizer_adamw_state_dict" in checkpoint:
-                try:
-                    optimizer_muon.load_state_dict(checkpoint["optimizer_muon_state_dict"])
-                    optimizer_adamw.load_state_dict(checkpoint["optimizer_adamw_state_dict"])
-                except Exception as e:
-                    print(f"Warning: Could not load optimizer states: {e}")
-
-            global_step = checkpoint["global_step"] - 10
-            if "rng_state" in checkpoint: torch.set_rng_state(checkpoint["rng_state"].cpu())
-            if "cuda_rng_state" in checkpoint: torch.cuda.set_rng_state(checkpoint["cuda_rng_state"].cpu())
-
-            # Load fixed data if available
-            # if "fixed_prompts" in checkpoint and checkpoint["fixed_prompts"] is not None:
-            #    fixed_prompts = checkpoint["fixed_prompts"]
-            #    print(f"Loaded {len(fixed_prompts)} fixed prompts from checkpoint.")
-
+            global_step = checkpoint["global_step"]
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
-                print("Loaded fixed noise from checkpoint.")
-
             print(f"Successfully resumed at step {global_step}")
-        else:
-            print(f"No checkpoint found at {resume_path}, starting from scratch.")
 
     if is_ddp:
         dist.barrier()
@@ -281,11 +180,6 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
     cfg_scale = config['training'].get('cfg_scale', 4.0)
     max_train_steps = config['training'].get('max_train_steps', 1000000)
-
-    # SPRINT settings
-    two_stage_training = sprint_config.get('two_stage_training', False)
-    stage1_steps = sprint_config.get('stage1_steps', max_train_steps)
-    base_token_drop_ratio = sprint_config.get('token_drop_ratio', 0.75)
 
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
@@ -296,66 +190,36 @@ def train(config_path):
 
     while global_step < max_train_steps:
         model.train()
-        model.compile()
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        images, prompts, coords = batch
+        images, prompts, _ = batch
         images = images.to(device)
-        coords = coords.to(device)
-        if rank == 0 and fixed_prompts is None:
-            # Look for prompts containing "general"
-            general_candidates = [p for p in prompts if "general" in p]
+        
+        # Classifier-free guidance dropout handled in TagProcessor
+        dropout_prob = config['training'].get('class_dropout_prob', 0.1)
+        y_indices, y_offsets = tag_processor.process_prompts(prompts, device, dropout_prob=dropout_prob)
 
-            # If we found at least 16, lock them in
+        if rank == 0 and fixed_prompts is None:
+            general_candidates = [p for p in prompts if "general" in p]
             if len(general_candidates) >= 16:
                 fixed_prompts = general_candidates[:16]
-                fixed_noise = torch.randn((16, 16, latent_size, latent_size), device=device)
-                print(f"\n[Step {global_step}] Found and locked 16 'general' prompts for fixed validation.")
-            # Optional: if you want to take fewer than 16 if that's all that exists, you can modify logic here.
+                fixed_noise = torch.randn((16, 3, image_size, image_size), device=device)
+                print(f"\n[Step {global_step}] Locked 16 'general' prompts for fixed validation.")
 
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                latents = (vae.encode(
-                    images, return_dict=False) - vae.config.shift_factor) * vae.config.scaling_factor
-                text_embeds, text_mask = encode_prompt_with_llm(
-                    tokenizer, text_encoder, prompts, device,
-                    max_sequence_length=config['model'].get('llm_max_seq_length', 64)
-                )
-                dropout_prob = config['training'].get('class_dropout_prob', 0.1)
-                if dropout_prob > 0:
-                    batch_size_curr = text_embeds.shape[0]
-                    drop_mask = torch.rand(batch_size_curr, device=device) < dropout_prob
-                    text_embeds[drop_mask] = 0.0
-
-        if sprint_enabled and two_stage_training:
-            current_token_drop_ratio = base_token_drop_ratio if global_step < stage1_steps else 0.0
-        else:
-            current_token_drop_ratio = base_token_drop_ratio if sprint_enabled else 0.0
-
-        torch.manual_seed(global_step)
-        # if torch.rand(1).item() < 0.1:
-        #    current_token_drop_ratio = 0.0
-
-        t = torch.rand((latents.shape[0],), device=device)
-        x0 = torch.randn_like(latents)
-        x1 = latents
+        t = torch.rand((images.shape[0],), device=device)
+        x0 = torch.randn_like(images)
+        x1 = images
         t_reshaped = t.view(-1, 1, 1, 1)
         xt = (1 - t_reshaped) * x0 + t_reshaped * x1
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # Model now predicts x1 directly
-            x1_head, x1_base = model(
-                xt, t, text_embeds, coords,
-                token_drop_ratio=current_token_drop_ratio
-            )
-            loss_head = ((x1_head - x1) ** 2).mean()
-            loss_base = ((x1_base - x1) ** 2).mean()
-
-            loss = loss_head + loss_base * 0.25
+            # Model predicts x1 directly (X-prediction)
+            x1_pred = model(xt, t, y_indices, y_offsets)
+            loss = ((x1_pred - x1) ** 2).mean()
 
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
@@ -370,9 +234,6 @@ def train(config_path):
             pbar.update(1)
             logs = {
                 "loss": loss.item(),
-                "loss_head": loss_head.item(),
-                "loss_base": loss_base.item(),
-                # "loss_drift": loss_drift.item(),
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
             pbar.set_postfix(**logs)
@@ -382,41 +243,24 @@ def train(config_path):
         if global_step % config['training']['save_image_every_steps'] == 0:
             if is_ddp: dist.barrier()
             if rank == 0:
-                # Save fixed data (prompts/noise) to the checkpoint for future runs
                 save_checkpoint(model, optimizers, rank, config['training']['output_dir'],
                                 global_step, config, fixed_prompts, fixed_noise)
 
                 print("\nSampling...")
                 model.eval()
                 with torch.no_grad():
-                    # Determine what to use for sampling
-                    if fixed_prompts is not None and fixed_noise is not None:
-                        # Case A: We found our 'general' prompts and locked them
-                        use_prompts = fixed_prompts
-                        use_noise = fixed_noise
-                        caption_prefix = "Fixed"
-                    else:
-                        # Case B: We haven't found 16 'general' prompts yet.
-                        # Fallback to current batch + random noise just to see *something*
-                        use_prompts = prompts[:16]
-                        use_noise = None  # Will generate random inside sample_flow
-                        caption_prefix = "Random (Waiting for General)"
-
-                    sample_coords = torch.tensor([[0.0, 0.0, 1.0, 1.0]] * len(use_prompts), device=device)
-
+                    use_prompts = fixed_prompts if fixed_prompts is not None else prompts[:16]
+                    use_noise = fixed_noise if fixed_noise is not None else None
+                    
                     samples = sample_flow(
-                        model, vae, tokenizer, text_encoder, latent_size, len(use_prompts),
-                        use_prompts, sample_coords, device,
+                        model.module if hasattr(model, 'module') else model, 
+                        tag_processor, image_size, len(use_prompts),
+                        use_prompts, device,
                         cfg_scale=cfg_scale,
                         noise=use_noise
                     )
-
-                    # samples = (samples + 1) / 2.0
-                    # samples = torch.clamp(samples, 0, 1)
                     grid = make_grid(samples, nrow=4)
-
-                    wandb.log({"samples": wandb.Image(grid,
-                                                      caption=f"Step {global_step} [{caption_prefix}]: {use_prompts[0]}...")},
+                    wandb.log({"samples": wandb.Image(grid, caption=f"Step {global_step}: {use_prompts[0]}...")},
                               step=global_step)
                 model.train()
             if is_ddp: dist.barrier()
@@ -433,5 +277,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
     args = parser.parse_args()
-
     train(args.config)

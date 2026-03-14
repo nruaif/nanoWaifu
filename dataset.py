@@ -6,6 +6,7 @@ import torchvision.transforms.functional as F
 import torchvision.transforms as transforms
 import random
 import io
+import math
 from PIL import Image
 import json
 import numpy as np
@@ -278,9 +279,24 @@ class WDSLoader:
             elif not isinstance(image, Image.Image):
                 return None
 
-            # Resolution Bucketing
-            # H = 256 - n*32, W = 256 + n*32, n from -4 to 4
-            buckets = [(256 - n * 32, 256 + n * 32) for n in range(-2, 3)]
+            # Resolution Bucketing based on image_size
+            # We create buckets with same total pixel count (image_size^2) but different ARs
+            base_size = self.image_size
+            target_area = base_size ** 2
+            
+            # Common aspect ratios for anime/manga
+            # 1:1, 3:4, 4:3, 9:16, 16:9
+            aspect_ratios = [1.0, 0.75, 1.33, 0.56, 1.78]
+            buckets = []
+            for ar in aspect_ratios:
+                # w * h = area, w / h = ar  =>  h^2 * ar = area => h = sqrt(area / ar)
+                h = int(math.sqrt(target_area / ar))
+                w = int(h * ar)
+                # Round to nearest multiple of 16 for FCDM/Patching compatibility
+                h = (h // 16) * 16
+                w = (w // 16) * 16
+                buckets.append((h, w))
+            
             bucket_ars = [bw / bh for bh, bw in buckets]
 
             w, h = image.size
