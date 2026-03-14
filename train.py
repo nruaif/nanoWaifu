@@ -206,6 +206,7 @@ def train(config_path):
 
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
+        running_metrics = {}
     else:
         pbar = None
 
@@ -279,8 +280,8 @@ def train(config_path):
             f_s_proj = F.normalize(f_s_proj, dim=1)
             f_t = F.normalize(f_t, dim=1)
             
-            # Lrep = -cos(h, f)
-            loss_rep = -(f_s_proj * f_t).sum(dim=1).mean()
+            # Lrep = 1 - cos(h, f) to keep it positive
+            loss_rep = 1 - (f_s_proj * f_t).sum(dim=1).mean()
             
             # Standard Diffusion loss (MSE)
             loss_mse = F.mse_loss(student_out, images)
@@ -311,10 +312,15 @@ def train(config_path):
                 "loss_rep": loss_rep.item(),
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
+            
+            for k, v in logs.items():
+                running_metrics[k] = running_metrics.get(k, 0.0) + float(v)
+            
             pbar.set_postfix(**logs)
             if global_step % config['training']['log_every_steps'] == 0:
-                wandb.log({f"train/{k}": v for k, v in logs.items()}, step=global_step)
-
+                avg_logs = {f"train/{k}": v / config['training']['log_every_steps'] for k, v in running_metrics.items()}
+                wandb.log(avg_logs, step=global_step)
+                running_metrics = {}
         if global_step % config['training']['save_image_every_steps'] == 0:
             if is_ddp: dist.barrier()
             if rank == 0:
