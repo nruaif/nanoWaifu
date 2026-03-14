@@ -1,21 +1,21 @@
 model:
   latent_discrete: 256
-  latent_continuous: 0
-  dim: 512
-  depth: 12
+  latent_continuous: 32
+  dim: 1024
+  depth: 16
   heads: 8
-  vae_path: "vae_binary/latest.pt"
+  vae_path: "/root/latest.pt"
 
 data:
-  webdataset_url: "dataset/{00000..00010}.tar"
+  webdataset_url: "/root/data/train/{00001..00021}.tar"
   csv_path: "tags.txt"
 
 training:
   image_size: 256
-  batch_size: 4
-  learning_rate: 0.0001
+  batch_size: 64
+  learning_rate: 0.001
   max_train_steps: 1000000
-  log_every_steps: 100
+  log_every_steps: 10
   save_image_every_steps: 1000
   output_dir: "outputs_ar"
   num_workers: 4
