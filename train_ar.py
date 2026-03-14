@@ -80,10 +80,12 @@ def get_2d_positions(resolutions, max_len, device):
         for r in range(H):
             for c in range(W):
                 pos.append([xs[c].item(), ys[r].item()])
-        pos.append([0.0, 0.0])  # EOS
+        # Padding for shorter sequences
         pad_len = max_len - (H * W)
         for _ in range(pad_len):
             pos.append([0.0, 0.0])
+        # EOS always last
+        pos.append([0.0, 0.0])
         all_pos.append(pos)
     return torch.tensor(all_pos, device=device)
 
@@ -255,8 +257,13 @@ def train(config_path):
 
         x_t = (1 - t) * noise + t * latents_batched
 
-        padding_mask = torch.cat([torch.ones(B, 2, device=device, dtype=torch.bool), masks_batched[:, :-1]], dim=1)
-        L_x = padding_mask.size(1)
+        padding_mask = torch.cat([
+            torch.ones(B, 3, device=device, dtype=torch.bool),  # Cond, Size, SOS (was 2)
+            masks_batched[:, :-1],  # P1..PL-1
+            torch.ones(B, 1, device=device, dtype=torch.bool),  # EOS always valid
+        ], dim=1)
+
+        L_x = padding_mask.size(1)  # now L+4, will match q_len=67
         valid_lens = padding_mask.sum(dim=1)
 
         def causal_padding_mask_mod(b, h, q_idx, kv_idx):
@@ -264,14 +271,11 @@ def train(config_path):
             not_padding = (q_idx < valid_lens[b]) & (kv_idx < valid_lens[b])
             return causal & not_padding
 
-        causal_mask = torch.triu(torch.ones(L_x, L_x, device=device), diagonal=1).bool()
-        invalid = (~padding_mask.unsqueeze(2)) | (~padding_mask.unsqueeze(1)) | causal_mask.unsqueeze(0)
-        block_mask = torch.zeros(B, 1, L_x, L_x, device=device)
-        block_mask.masked_fill_(invalid.unsqueeze(1), -float('inf'))
         block_mask = create_block_mask(
             causal_padding_mask_mod,
             B=B, H=None, Q_LEN=L_x, KV_LEN=L_x, device=device, _compile=True
         )
+
         grid_HW = torch.tensor(resolutions, device=device)
 
         pred_x = model(
