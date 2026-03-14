@@ -23,5 +23,5 @@ model:
   patch_size: 8 # PixelUnshuffle factor
 
 data:
-  webdataset_url: '/root/data/00{001..019}.tar'
+  webdataset_url: '/root/data/train/00{001..019}.tar'
   use_advanced_captions: true  # Enable advanced caption processing with tag dropping
