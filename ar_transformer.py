@@ -8,7 +8,6 @@ from torch.nn.attention.flex_attention import create_block_mask
 # Check for FlexAttention (PyTorch 2.5+)
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-
     HAS_FLEX = True
 except ImportError:
     HAS_FLEX = False
@@ -38,32 +37,22 @@ class GGRoPE2d(nn.Module):
         n_freqs = head_dim // 2
         n_zero_freqs = round(p_zero_freqs * n_freqs)
 
-        # Frequency magnitudes
         omega_F = torch.cat((
             torch.zeros(n_zero_freqs),
             min_freq * (max_freq / min_freq) ** torch.linspace(0, 1, n_freqs - n_zero_freqs),
         ))
 
-        # Directions
         phi_hF = torch.arange(n_heads * n_freqs).reshape(n_heads, n_freqs) * direction_spacing
         directions_hF2 = torch.stack((torch.cos(phi_hF), torch.sin(phi_hF)), dim=-1)
 
-        # Store freqs: (n_heads, n_freqs, 2)
         self.register_buffer("freqs_hF2", omega_F.unsqueeze(-1) * directions_hF2)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, positions_BL2: torch.Tensor) -> Tuple[
         torch.Tensor, torch.Tensor]:
-        """
-        q, k: (B, h, L, d)
-        positions_BL2: (B, L, 2) - normalized coordinates
-        """
-        # theta = (freqs_hF2[h, F, 2] * positions_BL2[B, L, 2]).sum(-1) -> (B, h, L, F)
         theta = torch.einsum('hfz, blz -> bhlf', self.freqs_hF2, positions_BL2)
-
         cos = torch.cos(theta)
         sin = torch.sin(theta)
 
-        # Apply RoPE: (B, h, L, F)
         def rotate_apply(x):
             x1, x2 = x.float().chunk(2, dim=-1)
             out1 = x1 * cos - x2 * sin
@@ -86,24 +75,20 @@ class CausalSelfAttention(nn.Module):
         B, L, C = x.shape
         q, k, v = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
 
-        # Apply 2D GGRoPE
         q, k = rope(q, k, positions)
 
         if HAS_FLEX:
             def score_mod(score, b, h, q_idx, kv_idx):
                 return 15.0 * torch.tanh(score / 15.0)
-
             y = flex_attention(q, k, v, block_mask=block_mask, score_mod=score_mod)
         else:
             attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
             attn = 15.0 * torch.tanh(attn / 15.0)
-
             if block_mask is not None:
                 attn = attn + block_mask
             else:
                 mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
                 attn = attn.masked_fill(mask, -float('inf'))
-
             attn = F.softmax(attn, dim=-1)
             y = attn @ v
 
@@ -120,8 +105,6 @@ class GLU_ReLU2_MLP(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # GLU with ReLU^2
-        # (w1(x) * ReLU(w2(x))^2) * w3
         x = self.w1(x) * torch.relu(self.w2(x)).pow(2)
         x = self.w3(x)
         return self.dropout(x)
@@ -173,18 +156,14 @@ class DenoisingMLP(nn.Module):
             nn.Linear(dim, dim)
         )
         self.cond_proj = nn.Linear(dim * 3, hidden_dim)
-
         self.x_proj = nn.Linear(latent_dim, hidden_dim)
-
         self.blocks = nn.ModuleList([
             DenoisingMLPBlock(hidden_dim, hidden_dim) for _ in range(4)
         ])
-
         self.final_norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
         self.final_proj = nn.Linear(hidden_dim, latent_dim)
 
     def timestep_embedding(self, t, dim, max_period=10000):
-        # t: (B, L, 1) or (B, N)
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
@@ -196,16 +175,53 @@ class DenoisingMLP(nn.Module):
     def forward(self, x_t, context, tags, t):
         t_freq = self.timestep_embedding(t, 256)
         t_emb = self.time_embed(t_freq)
-
         c = self.cond_proj(torch.cat([t_emb, context, tags], dim=-1))
-
         x = self.x_proj(x_t)
         for block in self.blocks:
             x = block(x, c)
-
         x = self.final_norm(x)
         return self.final_proj(x)
 
+
+# --- NEW: Size Embedding ---
+
+class SizeEmbedding(nn.Module):
+    """Fourier-embeds (H, W) patch-grid dimensions into model dim."""
+    def __init__(self, dim: int, fourier_dim: int = 128, max_period: float = 10000.0):
+        super().__init__()
+        self.fourier_dim = fourier_dim
+        self.max_period = max_period
+        # Projects [sin/cos(H), sin/cos(W)] -> dim
+        self.mlp = nn.Sequential(
+            nn.Linear(fourier_dim * 4, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def _fourier(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B,) float -> (B, fourier_dim*2)"""
+        half = self.fourier_dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half, device=x.device, dtype=torch.float32)
+            / half
+        )
+        args = x[:, None] * freqs[None]           # (B, half)
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, fourier_dim)
+
+    def forward(self, H: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        """
+        H, W: (B,) int tensors — patch-grid height and width
+        returns: (B, dim)
+        """
+        h_emb = self._fourier(H.float())   # (B, fourier_dim)
+        w_emb = self._fourier(W.float())   # (B, fourier_dim)
+        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))  # (B, dim)
+
+
+# --- ARTransformer (updated) ---
 
 class ARTransformer(nn.Module):
     def __init__(
@@ -222,16 +238,13 @@ class ARTransformer(nn.Module):
         self.max_seq_len = max_seq_len
         self.latent_dim = latent_dim
 
-        # Class Embedding (Global tags)
         self.class_emb = nn.EmbeddingBag(num_classes, dim, mode='mean')
-
-        # Patch Projection (Input bit latents are mapped to transformer dim)
         self.patch_proj = nn.Linear(latent_dim, dim)
-
-        # Special tokens
         self.sos_token = nn.Parameter(torch.randn(1, 1, dim))
 
-        # 2D GGRoPE
+        # NEW: size conditioning
+        self.size_emb = SizeEmbedding(dim)
+
         self.rope = GGRoPE2d(num_heads, dim // num_heads)
 
         self.blocks = nn.ModuleList([
@@ -240,8 +253,6 @@ class ARTransformer(nn.Module):
         ])
 
         self.norm_f = nn.LayerNorm(dim)
-
-        # Denoising MLP (4 layers total inside Sequential)
         self.denoise_mlp = DenoisingMLP(dim, latent_dim)
 
         self.apply(self._init_weights)
@@ -256,25 +267,27 @@ class ARTransformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def zero_init_outputs(self):
-        """Zero initialize output layers of attention and MLP for stability."""
         for block in self.blocks:
             nn.init.zeros_(block.attn.proj.weight)
             if block.attn.proj.bias is not None:
                 nn.init.zeros_(block.attn.proj.bias)
-
             nn.init.zeros_(block.mlp.w3.weight)
             if block.mlp.w3.bias is not None:
                 nn.init.zeros_(block.mlp.w3.bias)
-
-        # Final layer of denoising MLP
         nn.init.zeros_(self.denoise_mlp.final_proj.weight)
         nn.init.zeros_(self.denoise_mlp.final_proj.bias)
 
-    def forward(self, patch_latents, class_indices, positions, offsets=None, block_mask=None, x_t=None, t=None):
-        """
-        patch_latents: (B, L, 256) - ternary values {-1, 0, 1}
-        positions: (B, L+2, 2) - Includes Cond and SOS coordinates
-        """
+    def forward(
+        self,
+        patch_latents,      # (B, L, latent_dim)
+        class_indices,
+        positions,          # (B, L+2, 2)
+        grid_HW,            # NEW: (B, 2) int tensor — patch grid (H, W) per sample
+        offsets=None,
+        block_mask=None,
+        x_t=None,
+        t=None,
+    ):
         B, L, _ = patch_latents.shape
         device = patch_latents.device
 
@@ -284,21 +297,21 @@ class ARTransformer(nn.Module):
         if B == 1 and global_tags.size(0) > 1:
             global_tags = global_tags[0:1]
 
-        cond_embeddings = global_tags.unsqueeze(1)
+        # Size embedding added into cond token
+        H_patches = grid_HW[:, 0]   # (B,)
+        W_patches = grid_HW[:, 1]   # (B,)
+        size_embed = self.size_emb(H_patches, W_patches)   # (B, dim)
+
+        cond_embeddings = (global_tags + size_embed).unsqueeze(1)   # (B, 1, dim)
         sos = self.sos_token.expand(B, -1, -1)
 
-        # Input: [Cond, SOS, P1, ..., PL-1]
         x = torch.cat([cond_embeddings, sos, patch_embeddings[:, :-1]], dim=1)
-
-        # Ensure positions match sequence length
         pos_seq = positions[:, :x.size(1)]
 
         for block in self.blocks:
             x = block(x, self.rope, pos_seq, block_mask)
 
         x = self.norm_f(x)
-
-        # Slicing x to match target length (drop Cond output, keep SOS to PL-1 output)
         x_for_pred = x[:, 1:]
 
         if x_t is None:
@@ -306,20 +319,19 @@ class ARTransformer(nn.Module):
         if t is None:
             t = torch.ones(B, x_for_pred.size(1), 1, device=device)
 
-        # Condition MLP on transformer hidden states and global tags
         tags_expanded = global_tags.unsqueeze(1).expand(-1, x_for_pred.size(1), -1)
         pred_x = self.denoise_mlp(x_t, x_for_pred, tags_expanded, t)
-
         return pred_x
 
     @torch.no_grad()
     def generate(
             self,
             class_indices,
-            max_patches=256,
-            device='cuda'
+            grid_H: int,        # NEW: explicit patch grid height
+            grid_W: int,        # NEW: explicit patch grid width
+            device='cuda',
     ):
-        B = class_indices.size(0) if hasattr(class_indices, 'size') and class_indices.dim() > 1 else 1
+        B = 1 if class_indices.dim() == 1 else class_indices.size(0)
 
         if class_indices.dim() == 1:
             offsets = torch.tensor([0], device=device)
@@ -329,26 +341,38 @@ class ARTransformer(nn.Module):
             class_indices = class_indices.flatten()
 
         global_tags = self.class_emb(class_indices, offsets)
-        cond = global_tags.unsqueeze(1)
-        sos = self.sos_token.expand(B, -1, -1)
 
+        # Size embedding — same H, W for all samples in this generation call
+        grid_HW = torch.tensor([[grid_H, grid_W]], device=device).expand(B, -1)
+        H_patches = grid_HW[:, 0].float()
+        W_patches = grid_HW[:, 1].float()
+        size_embed = self.size_emb(H_patches, W_patches)   # (B, dim)
+
+        cond = (global_tags + size_embed).unsqueeze(1)
+        sos = self.sos_token.expand(B, -1, -1)
         current_seq_emb = torch.cat([cond, sos], dim=1)
 
-        grid_size = int(math.sqrt(max_patches))
+        # Coordinate scheme matching get_2d_positions() in training
+        xlim = math.sqrt(grid_W / grid_H)
+        ylim = math.sqrt(grid_H / grid_W)
+        xs = torch.linspace(-xlim, xlim, grid_W, device=device)
+        ys = torch.linspace(-ylim, ylim, grid_H, device=device)
 
-        def get_pos(idx, grid_size):
-            if idx == 0: return [0.0, 0.0]  # Cond
-            if idx == 1: return [0.0, 0.0]  # SOS
+        def get_pos(idx):
+            if idx in (0, 1):
+                return [0.0, 0.0]
             patch_idx = idx - 2
-            r, c = patch_idx // grid_size, patch_idx % grid_size
-            return [2 * (c / (grid_size - 1)) - 1, 2 * (r / (grid_size - 1)) - 1]
+            r, c = patch_idx // grid_W, patch_idx % grid_W
+            return [xs[c].item(), ys[r].item()]
 
         generated_latents = []
+        max_patches = grid_H * grid_W
 
         for i in range(max_patches):
             seq_len = current_seq_emb.size(1)
-            positions = torch.tensor([get_pos(j, grid_size) for j in range(seq_len)], device=device).unsqueeze(
-                0).expand(B, -1, -1)
+            positions = torch.tensor(
+                [get_pos(j) for j in range(seq_len)], device=device
+            ).unsqueeze(0).expand(B, -1, -1)
 
             x = current_seq_emb
             for block in self.blocks:
@@ -363,7 +387,6 @@ class ARTransformer(nn.Module):
             for step_idx in range(steps):
                 t_val = step_idx / steps
                 t = torch.full((B, 1, 1), t_val, device=device)
-
                 v_pred = self.denoise_mlp(x_t, x_last, tags_expanded, t)
                 if t_val < 0.999:
                     v = (v_pred - x_t) / (1.0 - t_val)
@@ -371,17 +394,16 @@ class ARTransformer(nn.Module):
                 else:
                     x_t = v_pred
 
-            # Binary/Ternary quantization for the next step input
             next_latent = torch.where(x_t > 0.5, 1.0, torch.where(x_t < -0.5, -1.0, 0.0))
-
             generated_latents.append(next_latent)
 
             next_emb = self.patch_proj(next_latent)
             current_seq_emb = torch.cat([current_seq_emb, next_emb], dim=1)
 
             if current_seq_emb.size(1) > self.max_seq_len:
-                current_seq_emb = torch.cat([current_seq_emb[:, :1], current_seq_emb[:, -(self.max_seq_len - 1):]],
-                                            dim=1)
+                current_seq_emb = torch.cat(
+                    [current_seq_emb[:, :1], current_seq_emb[:, -(self.max_seq_len - 1):]],
+                    dim=1
+                )
 
         return torch.cat(generated_latents, dim=1)
-

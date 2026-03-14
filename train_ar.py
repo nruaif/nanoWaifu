@@ -135,8 +135,12 @@ def sample_and_log(model, vae, class_map, prompts, device, config, step):
     latent_discrete = config['model']['latent_discrete']
 
     model_inner = model.module if hasattr(model, 'module') else model
+
     patch_latents = model_inner.generate(
-        class_indices, max_patches=grid_size ** 2, device=device
+        class_indices,
+        grid_H=grid_size,
+        grid_W=grid_size,
+        device=device,
     )
 
     patch_latents = patch_latents.view(-1, grid_size, grid_size, latent_discrete)
@@ -215,8 +219,8 @@ def train(config_path):
             latest_ckpt = max(checkpoints, key=lambda x: int(re.search(r'_step_(\d+)\.pth', x).group(1)))
             print(f"🔄 Resuming from checkpoint: {latest_ckpt}")
             checkpoint = torch.load(latest_ckpt, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             global_step = checkpoint['global_step'] - 1
             if rank == 0:
                 print(f"✅ Successfully loaded weights and resumed at step {global_step}")
@@ -266,8 +270,15 @@ def train(config_path):
             causal_padding_mask_mod,
             B=B, H=None, Q_LEN=L_x, KV_LEN=L_x, device=device, _compile=True
         )
+        grid_HW = torch.tensor(resolutions, device=device)
 
-        pred_x = model(latents_batched, class_indices, positions, offsets=offsets, block_mask=block_mask, x_t=x_t, t=t)
+        pred_x = model(
+            latents_batched, class_indices, positions,
+            grid_HW=grid_HW,  # <-- pass it in
+            offsets=offsets,
+            block_mask=block_mask,
+            x_t=x_t, t=t
+        )
 
         loss = F.mse_loss(pred_x[masks_batched], latents_batched[masks_batched])
 
