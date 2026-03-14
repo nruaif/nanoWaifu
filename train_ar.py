@@ -283,9 +283,11 @@ def train(config_path):
             grid_HW=grid_HW,
             offsets=offsets,
             block_mask=block_mask,
-            x_t=x_t, t=t
+            x_t=x_t[:, :latents_batched.size(1)],  # pass only L positions
+            t=t,
         )
-        pred_patches = pred_x[:, :L]
+        L = latents_batched.size(1)
+        pred_patches = pred_x[:, :L]  # (B, L, latent_dim)
         loss = F.mse_loss(pred_patches[masks_batched], latents_batched[masks_batched])
         #loss = F.mse_loss(pred_x[masks_batched], latents_batched[masks_batched])
 

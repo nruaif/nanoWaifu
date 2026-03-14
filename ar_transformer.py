@@ -313,15 +313,15 @@ class ARTransformer(nn.Module):
         # x[:, 0] = Cond output  -> discard
         # x[:, 1:] = Size, SOS, P1..PL-1, EOS outputs -> predict P1..PL + EOS
         x_for_pred = x[:, 1:]  # (B, L+2, dim)  Size/SOS/patches/EOS hidden states
-
+        seq_len = x_for_pred.size(1)
         if x_t is None:
-            x_t = torch.randn(B, x_for_pred.size(1), self.latent_dim, device=device)
+            x_t = torch.randn(B, seq_len, self.latent_dim, device=device)
         if t is None:
-            t = torch.ones(B, x_for_pred.size(1), 1, device=device)
+            t = torch.ones(B, seq_len, 1, device=device)
 
-        tags_expanded = global_tags.unsqueeze(1).expand(-1, x_for_pred.size(1), -1)
+        tags_expanded = global_tags.unsqueeze(1).expand(-1, seq_len, -1)
         pred_x = self.denoise_mlp(x_t, x_for_pred, tags_expanded, t)
-        return pred_x  # (B, L+2, latent_dim)
+        return pred_x  # (B, L+3, latent_dim)
 
     @torch.no_grad()
     def generate(
