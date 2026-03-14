@@ -196,9 +196,30 @@ def transform_sample(sample):
     }
 
 
-def wds_collate_fn(x):
-    # Just return the list of samples, don't try to stack them because of bucketing
-    return x
+def bucket_batch(data, batch_size):
+    """
+    Groups samples into buckets by resolution and yields stacked batches.
+    """
+    buckets = {}
+    for sample in data:
+        # sample is {image, prompt, full_prompt, coords}
+        if sample is None: continue
+        img = sample["image"]
+        h, w = img.shape[1:]
+        key = (h, w)
+        
+        if key not in buckets:
+            buckets[key] = []
+        
+        buckets[key].append(sample)
+        
+        if len(buckets[key]) == batch_size:
+            batch = buckets[key]
+            images = torch.stack([s["image"] for s in batch])
+            prompts = [s["prompt"] for s in batch]
+            coords = torch.stack([s["coords"] for s in batch])
+            yield images, prompts, coords
+            buckets[key] = []
 
 class WDSLoader:
     def __init__(self, url, csv_path=None, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
@@ -356,15 +377,14 @@ class WDSLoader:
             .shuffle(1000)
             .map(self.preprocess, handler=warn_and_continue)
             .select(lambda x: x is not None)
-            .to_tuple("image", "prompt", "coords", handler=warn_and_continue)
+            .compose(lambda data: bucket_batch(data, self.batch_size))
         )
 
         loader = wds.WebLoader(
             dataset,
-            batch_size=self.batch_size,
+            batch_size=None, # Already batched by bucket_batch
             num_workers=self.num_workers,
             pin_memory=True,
-            collate_fn=wds_collate_fn
         )
 
         return loader

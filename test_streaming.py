@@ -29,14 +29,14 @@ def test_streaming():
         data_iter = iter(dataloader)
         for i in range(num_batches):
             batch_start = time.time()
-            batch_list = next(data_iter)
-            # batch_list is list of tuples (image, prompt, coords)
+            batch = next(data_iter)
+            # batch is (images, prompts, coords)
+            images, prompts, coords = batch
             
             elapsed = time.time() - batch_start
             print(f"Batch {i+1}/{num_batches} loaded in {elapsed:.2f}s")
-            print(f"  Batch size: {len(batch_list)}")
-            print(f"  First image shape: {batch_list[0][0].shape}")
-            print(f"  First prompt snippet: {batch_list[0][1][:100]}...")
+            print(f"  Images shape: {images.shape}")
+            print(f"  First prompt snippet: {prompts[0][:100]}...")
             
     except Exception as e:
         print(f"Error during streaming: {e}")
