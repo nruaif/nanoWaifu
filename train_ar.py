@@ -228,7 +228,7 @@ def train(config_path):
     data_iter = iter(dataloader)
     if rank == 0:
         pbar = tqdm(total=max_steps, initial=global_step, desc="Training")
-    model.compile()
+    #model.compile()
     while global_step < max_steps:
         try:
             batch = next(data_iter)
@@ -264,7 +264,7 @@ def train(config_path):
         block_mask.masked_fill_(invalid.unsqueeze(1), -float('inf'))
         block_mask = create_block_mask(
             causal_padding_mask_mod,
-            B=B, H=None, Q_LEN=L_x, KV_LEN=L_x, device=device
+            B=B, H=None, Q_LEN=L_x, KV_LEN=L_x, device=device, _compile=True
         )
 
         pred_x = model(latents_batched, class_indices, positions, offsets=offsets, block_mask=block_mask, x_t=x_t, t=t)
