@@ -297,8 +297,8 @@ class WDSLoader:
                 h = int(math.sqrt(target_area / ar))
                 w = int(h * ar)
                 # Round to nearest multiple of 16 for FCDM/Patching compatibility
-                h = (h // 16) * 16
-                w = (w // 16) * 16
+                h = (h // 32) * 32
+                w = (w // 32) * 32
                 buckets.append((h, w))
             
             bucket_ars = [bw / bh for bh, bw in buckets]

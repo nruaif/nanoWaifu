@@ -1,18 +1,18 @@
 training:
-  batch_size: 16
+  batch_size: 128
   learning_rate: 1.0e-4
   num_epochs: 100
   max_train_steps: 1000000
   gradient_checkpointing: true
   log_every_steps: 10
 
-  save_image_every_steps: 5000
+  save_image_every_steps: 1000
   image_size: 256
   num_workers: 4 # Set to 0 for Windows compatibility, increase on Linux
   class_dropout_prob: 0.1
   cfg_scale: 1.4
   output_dir: "outputs"
-  wandb_project: "nanoWaifu-T2I"
+  wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs/"
   max_checkpoints: 3
 
@@ -23,5 +23,5 @@ model:
   patch_size: 8 # PixelUnshuffle factor
 
 data:
-  webdataset_url: 'https://huggingface.co/datasets/Shio-Koube/150k-anime/resolve/main/train/00{001..006}.tar'
+  webdataset_url: '/root/data/00{001..019}.tar'
   use_advanced_captions: true  # Enable advanced caption processing with tag dropping
