@@ -284,7 +284,7 @@ def train(config_path):
             loss_rep = 1 - (f_s_proj * f_t).sum(dim=1).mean()
             
             # Standard Diffusion loss (MSE)
-            loss_mse = F.mse_loss(student_out, images)
+            loss_mse = F.mse_loss(student_out, images) + F.l1_loss(teacher_out, images)
             
             # Total loss
             loss = loss_mse + loss_rep
