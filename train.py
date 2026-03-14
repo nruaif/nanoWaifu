@@ -118,7 +118,8 @@ def train(config_path):
         num_blocks=config['model'].get('fcdm_depth', 2),
         num_classes=num_classes,
         patch_size=config['model'].get('patch_size', 16)
-    ).to(device)
+    ).to(device, memory_format=torch.channels_last)
+
 
     # Optimizer setup (Muon for 2D params, AdamW for others)
     params_2d = []
@@ -198,7 +199,7 @@ def train(config_path):
 
         # Batch is now (images, prompts, coords) where images is (B, C, H, W)
         images, prompts, _ = batch
-        images = images.to(device)
+        images = images.to(device, memory_format=torch.channels_last)
         
         # Classifier-free guidance dropout handled in TagProcessor
         dropout_prob = config['training'].get('class_dropout_prob', 0.1)
