@@ -240,21 +240,16 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
                 steps=50, cfg_scale=1.4, noise=None):
     """
     Sample using Euler integration with true CFG for FCDM.
-    Handles list of noise tensors for varying sizes.
+    Matches the training convention: t=1 is noise, t=0 is clean.
     """
-    # 1. Initialize Image Gaussian Noise
+    # 1. Initialize Image Gaussian Noise (t=1)
     if noise is not None:
         if isinstance(noise, list):
-            x_list = [n.clone().to(device) for n in noise[:batch_size]]
+            x = torch.stack([n.to(device) for n in noise[:batch_size]])
         else:
             x = noise.clone().to(device)
-            # If single tensor, we assume fixed size for all in batch
-            x_list = [x[i] if i < x.shape[0] else x[0] for i in range(batch_size)]
     else:
-        # Default to image_size x image_size if no noise provided
-        x_list = [torch.randn(3, image_size, image_size, device=device) for _ in range(batch_size)]
-
-    dt = 1.0 / steps
+        x = torch.randn(batch_size, 3, image_size, image_size, device=device)
 
     # 2. Process prompts for CFG
     y_indices, y_offsets = tag_processor.process_prompts(prompts, device)
@@ -263,47 +258,33 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
     null_indices = torch.full((batch_size,), fill_value=tag_processor.num_classes, dtype=torch.long, device=device)
     null_offsets = torch.arange(batch_size, dtype=torch.long, device=device)
 
-    def get_v_single(x_curr, t_curr, idx):
-        t_scaled = torch.full((1,), t_curr, device=device)
+    # 3. Sampling Loop (t from 1.0 down to 0.0)
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    
+    for i in range(steps):
+        t_curr = ts[i]
+        t_next = ts[i+1]
+        
+        # Expand t for batch
+        t_vec = torch.full((batch_size,), t_curr, device=device)
         
         # Conditioned forward
-        start_off = y_offsets[idx].item()
-        end_off = y_offsets[idx+1].item() if idx+1 < len(y_offsets) else len(y_indices)
-        y_ind = y_indices[start_off:end_off]
-        y_off = torch.zeros(1, dtype=torch.long, device=device)
-        
-        x1_cond = model(x_curr.unsqueeze(0), t_scaled, y_ind, y_off).squeeze(0)
+        x1_cond = model(x, t_vec, y_indices, y_offsets)
         
         # Unconditioned forward
-        y_ind_null = null_indices[idx:idx+1]
-        y_off_null = torch.zeros(1, dtype=torch.long, device=device)
-        x1_uncond = model(x_curr.unsqueeze(0), t_scaled, y_ind_null, y_off_null).squeeze(0)
+        x1_uncond = model(x, t_vec, null_indices, null_offsets)
         
-        x1_cfg = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
-        v = (x1_cfg - x_curr) / (1.0 - t_curr + 1e-7)
-        return v
+        # CFG
+        x0_pred = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
+        
+        # Step: x_next = (t_next/t_curr) * x_curr + (1 - t_next/t_curr) * x0_pred
+        # This is the exact solution for the probability flow ODE of Rectified Flow
+        # if x_t = (1-t)x0 + t*x1.
+        if t_curr > 0:
+            x = (t_next / t_curr) * x + (1 - t_next / t_curr) * x0_pred
+        else:
+            x = x0_pred
 
-    # 3. Euler Loop
-    try:
-        from tqdm.auto import tqdm
-        pbar = tqdm(range(steps), desc='Euler Sampling', leave=False)
-    except ImportError:
-        pbar = range(steps)
-
-    for i in pbar:
-        t = i / steps
-        new_x_list = []
-        for j, x_curr in enumerate(x_list):
-            v = get_v_single(x_curr, t, j)
-            new_x_list.append(x_curr + v * dt)
-        x_list = new_x_list
-
-    # Final images
-    images = [(x / 2 + 0.5).clamp(0, 1) for x in x_list]
-    # If all same size, stack them
-    try:
-        images = torch.stack(images)
-    except:
-        # Keep as list if different sizes (caller needs to handle)
-        pass
+    # Final images: map [-1, 1] to [0, 1]
+    images = (x / 2 + 0.5).clamp(0, 1)
     return images
