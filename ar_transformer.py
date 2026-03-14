@@ -2,8 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
-from torch.nn.attention.flex_attention import create_block_mask
+from typing import Tuple
 
 # Check for FlexAttention (PyTorch 2.5+)
 try:
@@ -13,14 +12,9 @@ except ImportError:
     HAS_FLEX = False
 
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
-
+# ---------------------------------------------------------------------------
+# RoPE helpers
+# ---------------------------------------------------------------------------
 
 class GGRoPE2d(nn.Module):
     def __init__(
@@ -47,8 +41,11 @@ class GGRoPE2d(nn.Module):
 
         self.register_buffer("freqs_hF2", omega_F.unsqueeze(-1) * directions_hF2)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, positions_BL2: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, positions_BL2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        q, k:            (B, h, L, d)
+        positions_BL2:   (B, L, 2)
+        """
         theta = torch.einsum('hfz, blz -> bhlf', self.freqs_hF2, positions_BL2)
         cos = torch.cos(theta)
         sin = torch.sin(theta)
@@ -61,6 +58,10 @@ class GGRoPE2d(nn.Module):
 
         return rotate_apply(q), rotate_apply(k)
 
+
+# ---------------------------------------------------------------------------
+# Attention + MLP blocks
+# ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.0):
@@ -124,6 +125,10 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Denoising MLP
+# ---------------------------------------------------------------------------
+
 class DenoisingMLPBlock(nn.Module):
     def __init__(self, hidden_dim, cond_dim):
         super().__init__()
@@ -142,8 +147,7 @@ class DenoisingMLPBlock(nn.Module):
 
     def forward(self, x, c):
         shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)
-        x_norm = self.norm(x)
-        x_norm = x_norm * (1 + scale) + shift
+        x_norm = self.norm(x) * (1 + scale) + shift
         return x + gate * self.mlp(x_norm)
 
 
@@ -155,6 +159,7 @@ class DenoisingMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim)
         )
+        # context=dim, tags=dim, t_emb=dim  ->  hidden_dim
         self.cond_proj = nn.Linear(dim * 3, hidden_dim)
         self.x_proj = nn.Linear(latent_dim, hidden_dim)
         self.blocks = nn.ModuleList([
@@ -164,56 +169,98 @@ class DenoisingMLP(nn.Module):
         self.final_proj = nn.Linear(hidden_dim, latent_dim)
 
     def timestep_embedding(self, t, dim, max_period=10000):
+        # t: (B, L, 1)
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t * freqs[None, None, :]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        return embedding
+            -math.log(max_period) * torch.arange(half, dtype=torch.float32) / half
+        ).to(t.device)
+        args = t * freqs[None, None, :]          # (B, L, half)
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, L, dim)
 
     def forward(self, x_t, context, tags, t):
-        t_freq = self.timestep_embedding(t, 256)
-        t_emb = self.time_embed(t_freq)
-        c = self.cond_proj(torch.cat([t_emb, context, tags], dim=-1))
+        """
+        x_t:     (B, L, latent_dim)
+        context: (B, L, dim)        transformer hidden states
+        tags:    (B, L, dim)        global tag embedding expanded
+        t:       (B, L, 1)          diffusion timestep in [0, 1]
+        """
+        t_emb = self.time_embed(self.timestep_embedding(t, 256))  # (B, L, dim)
+        c = self.cond_proj(torch.cat([t_emb, context, tags], dim=-1))  # (B, L, hidden_dim)
         x = self.x_proj(x_t)
         for block in self.blocks:
             x = block(x, c)
-        x = self.final_norm(x)
-        return self.final_proj(x)
+        return self.final_proj(self.final_norm(x))
+
+
+# ---------------------------------------------------------------------------
+# Size token embedding
+# ---------------------------------------------------------------------------
 
 class SizeEmbedding(nn.Module):
-    """Fourier-embeds (H, W) patch-grid dimensions into model dim."""
+    """
+    Fourier-embeds the patch-grid dimensions (H, W) and projects to model dim.
+    Used as a dedicated Size token in the sequence.
+    """
     def __init__(self, dim: int, fourier_dim: int = 128, max_period: float = 10000.0):
         super().__init__()
         self.fourier_dim = fourier_dim
         self.max_period = max_period
+        # _fourier(x) -> (B, fourier_dim);  cat([h, w]) -> (B, fourier_dim*2)
         self.mlp = nn.Sequential(
             nn.Linear(fourier_dim * 2, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
+        # zero-init so it starts as a no-op and learns gradually
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def _fourier(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B,) -> (B, fourier_dim)"""
+        """x: (B,) float -> (B, fourier_dim)"""
         half = self.fourier_dim // 2
         freqs = torch.exp(
             -math.log(self.max_period)
             * torch.arange(half, device=x.device, dtype=torch.float32)
             / half
         )
-        args = x[:, None] * freqs[None]
-        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        args = x[:, None] * freqs[None]                               # (B, half)
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, fourier_dim)
 
     def forward(self, H: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-        h_emb = self._fourier(H.float())
-        w_emb = self._fourier(W.float())
-        return self.mlp(torch.cat([h_emb, w_emb], dim=-1))
+        """H, W: (B,) int tensors  ->  (B, dim)"""
+        return self.mlp(torch.cat([self._fourier(H.float()), self._fourier(W.float())], dim=-1))
 
+
+# ---------------------------------------------------------------------------
+# AR Transformer
+# ---------------------------------------------------------------------------
+
+# Sequence layout
+# ┌─────────────────────────────────────────────────────────────┐
+# │ Training input:   [Cond, Size, SOS, P1,  P2,  … PL-1, EOS] │
+# │ Training target:  [P1,   P2,  P3,  P4,  P5,  … PL,   ---] │
+# │                                                             │
+# │ Special token positions (all at [0,0]):                     │
+# │   idx 0 = Cond                                              │
+# │   idx 1 = Size                                              │
+# │   idx 2 = SOS                                               │
+# │   idx 3..L+2 = patches P1..PL                               │
+# │   idx L+3 = EOS                                             │
+# └─────────────────────────────────────────────────────────────┘
+#
+# forward() returns pred_x of shape (B, L, latent_dim):
+#   pred_x[:, 0]   <- predicted from Size  hidden state  (target P1)
+#   pred_x[:, 1]   <- predicted from SOS   hidden state  (target P2)
+#   pred_x[:, i]   <- predicted from Pi-1  hidden state  (target Pi+1)
+#   pred_x[:, L-1] <- predicted from PL-1  hidden state  (target PL)
+#
+# The EOS hidden state is computed but not returned — no continuous target.
 
 class ARTransformer(nn.Module):
+    # Number of non-patch tokens prepended/appended to the sequence
+    N_PREFIX = 3   # Cond, Size, SOS
+    N_SUFFIX = 1   # EOS
+
     def __init__(
             self,
             num_classes,
@@ -227,16 +274,17 @@ class ARTransformer(nn.Module):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.latent_dim = latent_dim
+        self.dim = dim
 
         self.class_emb = nn.EmbeddingBag(num_classes, dim, mode='mean')
         self.patch_proj = nn.Linear(latent_dim, dim)
 
-        # Special tokens
-        self.sos_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.eos_token = nn.Parameter(torch.randn(1, 1, dim))  # NEW
+        # Special tokens (learned parameters)
+        self.sos_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.eos_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
-        # Size token projection
-        self.size_emb = SizeEmbedding(dim)                     # NEW
+        # Size token: fourier embed of (H, W) patch grid
+        self.size_emb = SizeEmbedding(dim)
 
         self.rope = GGRoPE2d(num_heads, dim // num_heads)
 
@@ -272,141 +320,153 @@ class ARTransformer(nn.Module):
 
     def forward(
         self,
-        patch_latents,   # (B, L, latent_dim)
-        class_indices,
-        positions,       # (B, L+4, 2) — Cond, Size, SOS, P1..PL, EOS
-        grid_HW,         # (B, 2) int tensor — patch grid (H, W)
-        offsets=None,
+        patch_latents,  # (B, L, latent_dim)  — float, values in {-1,0,1}
+        class_indices,  # (total_tags,)        — for EmbeddingBag
+        positions,      # (B, L+4, 2)          — from get_2d_positions()
+        grid_HW,        # (B, 2)               — patch grid height & width per sample
+        offsets=None,   # (B,)                 — EmbeddingBag offsets
         block_mask=None,
-        x_t=None,
-        t=None,
+        x_t=None,       # (B, L, latent_dim)   — noised latents; sampled if None
+        t=None,         # (B, L, 1)            — diffusion time in [0,1]; ones if None
     ):
         B, L, _ = patch_latents.shape
         device = patch_latents.device
 
-        patch_embeddings = self.patch_proj(patch_latents)  # (B, L, dim)
-        global_tags = self.class_emb(class_indices, offsets)
-
+        # --- Embeddings ---
+        patch_emb   = self.patch_proj(patch_latents)               # (B, L,   dim)
+        global_tags = self.class_emb(class_indices, offsets)        # (B,      dim)
         if B == 1 and global_tags.size(0) > 1:
             global_tags = global_tags[0:1]
 
-        # Special tokens
-        size_embed = self.size_emb(grid_HW[:, 0], grid_HW[:, 1])  # (B, dim)
-        cond_token = global_tags.unsqueeze(1)                       # (B, 1, dim)
-        size_token = size_embed.unsqueeze(1)                        # (B, 1, dim)
-        sos = self.sos_token.expand(B, -1, -1)                      # (B, 1, dim)
-        eos = self.eos_token.expand(B, -1, -1)                      # (B, 1, dim)
+        cond_tok = global_tags.unsqueeze(1)                         # (B, 1,   dim)
+        size_tok = self.size_emb(grid_HW[:, 0], grid_HW[:, 1]).unsqueeze(1)  # (B, 1, dim)
+        sos_tok  = self.sos_token.expand(B, -1, -1)                 # (B, 1,   dim)
+        eos_tok  = self.eos_token.expand(B, -1, -1)                 # (B, 1,   dim)
 
-        # Input:  [Cond, Size, SOS, P1, ..., PL-1, EOS]
-        # Target: [P1,   P2,  P3,  ..., PL,  EOS-pred  ] (shifted by 1)
-        # We feed EOS at the end so the model learns to predict it after last patch
-        x = torch.cat([cond_token, size_token, sos, patch_embeddings[:, :-1], eos], dim=1)
+        # Input sequence:  [Cond, Size, SOS, P1, P2, … PL-1, EOS]   length = L+3
+        # Predicts target: [P1,   P2,  P3,  P4, P5, … PL,   EOS*]
+        # (*EOS target not used — we slice it off before the denoising MLP)
+        x = torch.cat([cond_tok, size_tok, sos_tok, patch_emb[:, :-1], eos_tok], dim=1)
+        # x shape: (B, L+3, dim)
 
-        pos_seq = positions[:, :x.size(1)]
+        pos_seq = positions[:, :x.size(1)]                          # (B, L+3, 2)
 
         for block in self.blocks:
             x = block(x, self.rope, pos_seq, block_mask)
 
-        x = self.norm_f(x)
+        x = self.norm_f(x)                                          # (B, L+3, dim)
 
-        # Drop Cond output, keep Size through EOS outputs for prediction
-        # x[:, 0] = Cond output  -> discard
-        # x[:, 1:] = Size, SOS, P1..PL-1, EOS outputs -> predict P1..PL + EOS
-        x_for_pred = x[:, 1:]  # (B, L+2, dim)  Size/SOS/patches/EOS hidden states
-        seq_len = x_for_pred.size(1)
+        # Drop Cond output (idx 0), keep Size/SOS/patch outputs (idx 1..L),
+        # drop EOS output (idx L+1 and L+2) — no continuous latent target for it.
+        # This gives exactly L hidden states aligned with L patch targets.
+        #
+        #   x[:, 0]   = Cond  -> discarded
+        #   x[:, 1]   = Size  -> predicts P1   (x_for_pred[:, 0])
+        #   x[:, 2]   = SOS   -> predicts P2   (x_for_pred[:, 1])
+        #   x[:, 3]   = P1    -> predicts P3   (x_for_pred[:, 2])
+        #   ...
+        #   x[:, L]   = PL-1  -> predicts PL   (x_for_pred[:, L-1])
+        #   x[:, L+1] = EOS   -> discarded
+        #   x[:, L+2] = (pad) -> discarded
+        x_for_pred = x[:, 1:L+1]                                    # (B, L, dim)
+
+        # Denoising MLP
         if x_t is None:
-            x_t = torch.randn(B, seq_len, self.latent_dim, device=device)
+            x_t = torch.randn(B, L, self.latent_dim, device=device)
         if t is None:
-            t = torch.ones(B, seq_len, 1, device=device)
+            t = torch.ones(B, L, 1, device=device)
 
-        tags_expanded = global_tags.unsqueeze(1).expand(-1, seq_len, -1)
-        pred_x = self.denoise_mlp(x_t, x_for_pred, tags_expanded, t)
-        return pred_x  # (B, L+3, latent_dim)
+        tags_exp = global_tags.unsqueeze(1).expand(-1, L, -1)       # (B, L, dim)
+        pred_x   = self.denoise_mlp(x_t, x_for_pred, tags_exp, t)   # (B, L, latent_dim)
+        return pred_x
+
+    # -----------------------------------------------------------------------
+    # Autoregressive generation
+    # -----------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(
             self,
-            class_indices,
-            grid_H: int,
-            grid_W: int,
-            device='cuda',
+            class_indices,  # (N,) or (B, N)
+            grid_H: int,    # patch grid height
+            grid_W: int,    # patch grid width
+            steps: int = 50,
+            device: str = 'cuda',
     ):
-        B = 1 if class_indices.dim() == 1 else class_indices.size(0)
-
         if class_indices.dim() == 1:
+            B = 1
             offsets = torch.tensor([0], device=device)
         else:
             B, N = class_indices.shape
             offsets = torch.arange(0, B * N, N, device=device)
             class_indices = class_indices.flatten()
 
-        global_tags = self.class_emb(class_indices, offsets)
+        global_tags = self.class_emb(class_indices, offsets)        # (B, dim)
 
-        grid_HW = torch.tensor([[grid_H, grid_W]], device=device).expand(B, -1)
-        size_embed = self.size_emb(grid_HW[:, 0].float(), grid_HW[:, 1].float())
+        # Build starting sequence: [Cond, Size, SOS]
+        cond_tok = global_tags.unsqueeze(1)                          # (B, 1, dim)
+        size_tok = self.size_emb(
+            torch.full((B,), grid_H, device=device, dtype=torch.float32),
+            torch.full((B,), grid_W, device=device, dtype=torch.float32),
+        ).unsqueeze(1)                                               # (B, 1, dim)
+        sos_tok  = self.sos_token.expand(B, -1, -1)                  # (B, 1, dim)
 
-        cond  = global_tags.unsqueeze(1)       # (B, 1, dim)
-        size  = size_embed.unsqueeze(1)        # (B, 1, dim)
-        sos   = self.sos_token.expand(B, -1, -1)
+        current_seq = torch.cat([cond_tok, size_tok, sos_tok], dim=1)  # (B, 3, dim)
 
-        # Sequence starts as [Cond, Size, SOS]
-        current_seq_emb = torch.cat([cond, size, sos], dim=1)
-
-        # Coordinate scheme matching get_2d_positions() in training
+        # Coordinate grid — matches get_2d_positions() in train.py exactly
         xlim = math.sqrt(grid_W / grid_H)
         ylim = math.sqrt(grid_H / grid_W)
         xs = torch.linspace(-xlim, xlim, grid_W, device=device)
         ys = torch.linspace(-ylim, ylim, grid_H, device=device)
 
-        # Position indices: 0=Cond, 1=Size, 2=SOS, 3..=patches, last=EOS
-        def get_pos(idx, total_patches):
-            if idx in (0, 1, 2):
+        def get_pos(idx: int) -> list:
+            # 0=Cond, 1=Size, 2=SOS  -> [0,0]
+            # 3..3+H*W-1             -> patch coords
+            if idx < self.N_PREFIX:
                 return [0.0, 0.0]
-            patch_idx = idx - 3
-            if patch_idx >= total_patches:  # EOS position
-                return [0.0, 0.0]
+            patch_idx = idx - self.N_PREFIX
             r, c = patch_idx // grid_W, patch_idx % grid_W
             return [xs[c].item(), ys[r].item()]
 
-        generated_latents = []
+        generated = []
         max_patches = grid_H * grid_W
+        tags_exp = global_tags.unsqueeze(1)                          # (B, 1, dim)
 
         for i in range(max_patches):
-            seq_len = current_seq_emb.size(1)
-            positions = torch.tensor(
-                [get_pos(j, max_patches) for j in range(seq_len)],
-                device=device
-            ).unsqueeze(0).expand(B, -1, -1)
+            seq_len = current_seq.size(1)
+            pos = torch.tensor(
+                [get_pos(j) for j in range(seq_len)], device=device
+            ).unsqueeze(0).expand(B, -1, -1)                        # (B, seq_len, 2)
 
-            x = current_seq_emb
+            # Run transformer, take last hidden state
+            x = current_seq
             for block in self.blocks:
-                x = block(x, self.rope, positions)
+                x = block(x, self.rope, pos)
+            x_last = self.norm_f(x[:, -1:])                         # (B, 1, dim)
 
-            x_last = self.norm_f(x[:, -1:])
+            # Flow matching denoising: noise -> latent
             x_t = torch.randn(B, 1, self.latent_dim, device=device)
-            tags_expanded = global_tags.unsqueeze(1)
-
-            steps = 50
             for step_idx in range(steps):
                 t_val = step_idx / steps
                 t = torch.full((B, 1, 1), t_val, device=device)
-                v_pred = self.denoise_mlp(x_t, x_last, tags_expanded, t)
-                if t_val < 0.999:
-                    v = (v_pred - x_t) / (1.0 - t_val)
-                    x_t = x_t + v * (1.0 / steps)
+                v_pred = self.denoise_mlp(x_t, x_last, tags_exp, t)
+                if t_val < (1.0 - 1.0 / steps):
+                    x_t = x_t + (v_pred - x_t) / (1.0 - t_val) * (1.0 / steps)
                 else:
                     x_t = v_pred
 
+            # Ternary quantization {-1, 0, 1}
             next_latent = torch.where(x_t > 0.5, 1.0, torch.where(x_t < -0.5, -1.0, 0.0))
-            generated_latents.append(next_latent)
+            generated.append(next_latent)
 
-            next_emb = self.patch_proj(next_latent)
-            current_seq_emb = torch.cat([current_seq_emb, next_emb], dim=1)
+            # Append embedding to sequence
+            next_emb = self.patch_proj(next_latent)                  # (B, 1, dim)
+            current_seq = torch.cat([current_seq, next_emb], dim=1)
 
-            if current_seq_emb.size(1) > self.max_seq_len:
-                current_seq_emb = torch.cat(
-                    [current_seq_emb[:, :2], current_seq_emb[:, -(self.max_seq_len - 2):]],
-                    dim=1
-                )
+            # Truncate if needed, always keep Cond+Size+SOS prefix intact
+            if current_seq.size(1) > self.max_seq_len:
+                prefix = current_seq[:, :self.N_PREFIX]
+                rest   = current_seq[:, -(self.max_seq_len - self.N_PREFIX):]
+                current_seq = torch.cat([prefix, rest], dim=1)
 
-        return torch.cat(generated_latents, dim=1)
+        return torch.cat(generated, dim=1)                           # (B, H*W, latent_dim)
