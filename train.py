@@ -134,12 +134,9 @@ def train(config_path):
     for p in model_teacher.parameters():
         p.requires_grad = False
     
-    # Projector for Lrep (Layer 2 student [C] to Layer 6 teacher [2C])
-    # Layer 2 is end of enc1 (C channels), Layer 6 is end of enc2 (2C channels)
-    projector = nn.Sequential(
-        nn.Conv2d(model.c, model.c * 2, kernel_size=1),
-        nn.AvgPool2d(2)
-    ).to(device)
+    # Projector for Lrep (Mid block student [4C] to Mid block teacher [4C])
+    # Mid block is stage 3, channel count is model.c * 4
+    projector = nn.Conv2d(model.c * 4, model.c * 4, kernel_size=1).to(device)
 
     # Optimizer setup (Muon for 2D params, AdamW for others)
     params_2d = []
@@ -203,6 +200,11 @@ def train(config_path):
     max_train_steps = config['training'].get('max_train_steps', 1000000)
     ema_decay = config['training'].get('ema_decay', 0.999)
     patch_size = config['model'].get('patch_size', 16)
+    
+    # Calculate index of the last mid block
+    # Stage 1: l blocks, Stage 2: 2l blocks, Stage 3: 4l blocks
+    m_raw = model.module if hasattr(model, 'module') else model
+    mid_idx = m_raw.l + (m_raw.l * 2) + (m_raw.l * 4)
 
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
@@ -260,21 +262,19 @@ def train(config_path):
         x_tau_min = (1 - tau_min_reshaped) * images + tau_min_reshaped * noise
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # Student forward with feature extraction from Layer 2
-            # Layer 2 is the 2nd block (end of enc1 if l=2)
-            student_out, student_feats = model(x_tau, t, y_indices, y_offsets, feat_layers=[2])
+            # Student forward with feature extraction from last Mid block
+            student_out, student_feats = model(x_tau, t, y_indices, y_offsets, feat_layers=[mid_idx])
             
-            # Teacher forward with feature extraction from Layer 6
-            # Layer 6 is the 6th block (end of enc2 if l=2)
+            # Teacher forward with feature extraction from last Mid block
             with torch.no_grad():
-                teacher_out, teacher_feats = model_teacher(x_tau_min, tau_min, y_indices, y_offsets, feat_layers=[6])
+                teacher_out, teacher_feats = model_teacher(x_tau_min, tau_min, y_indices, y_offsets, feat_layers=[mid_idx])
             
             # Extract features
-            f_s = student_feats[2] # (B, C, 32, 32)
-            f_t = teacher_feats[6] # (B, 2C, 16, 16)
+            f_s = student_feats[mid_idx] # (B, 4C, 8, 8)
+            f_t = teacher_feats[mid_idx] # (B, 4C, 8, 8)
             
             # Project student feature to match teacher
-            f_s_proj = projector(f_s) # (B, 2C, 16, 16)
+            f_s_proj = projector(f_s) 
             
             # Normalize for cosine similarity
             f_s_proj = F.normalize(f_s_proj, dim=1)
