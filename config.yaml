@@ -17,7 +17,8 @@ training:
   max_checkpoints: 3
 
 model:
-  fcdm_dim: 384
+  use_v2_model: true
+  fcdm_dim: 256
   fcdm_depth: 2
   in_channels: 3 # RGB
   patch_size: 8 # PixelUnshuffle factor

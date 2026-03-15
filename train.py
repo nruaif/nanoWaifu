@@ -90,6 +90,16 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
+    # Import model based on config
+    if config['model'].get('use_v2_model', False):
+        from model_v2 import FCDMV2 as ModelClass
+        from model_v2 import sample_flow as sample_fn
+        print("Using V2 Model (Split-Channel)")
+    else:
+        from model import FCDM as ModelClass
+        from model import sample_flow as sample_fn
+        print("Using V1 Model")
+
     print(f"Using device: {device}, Rank: {rank}, World Size: {world_size}")
 
     if rank == 0:
@@ -112,7 +122,7 @@ def train(config_path):
 
     image_size = config['training']['image_size']
 
-    model = FCDM(
+    model = ModelClass(
         in_channels=3,
         base_channels=config['model'].get('fcdm_dim', 128),
         num_blocks=config['model'].get('fcdm_depth', 2),
@@ -269,7 +279,7 @@ def train(config_path):
                     use_prompts = fixed_prompts if fixed_prompts is not None else prompts[:16]
                     use_noise = fixed_noise if fixed_noise is not None else None
                     
-                    samples = sample_flow(
+                    samples = sample_fn(
                         model.module if hasattr(model, 'module') else model, 
                         tag_processor, image_size, len(use_prompts),
                         use_prompts, device,
