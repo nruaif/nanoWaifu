@@ -220,8 +220,8 @@ class FCDMV2(nn.Module):
         self.dec1 = CSPStage(self.c, cond_dim, self.l)
 
         # Output Head: Simple "Unconv" (PixelShuffle)
-        self.norm_out = nn.LayerNorm(self.c)
-        self.conv_out = nn.Conv2d(self.c, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
+        self.norm_out = nn.LayerNorm(self.c * 2)
+        self.conv_out = nn.Conv2d(self.c * 2, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
         self.shuffle = nn.PixelShuffle(patch_size)
 
     def forward(self, x, t, y_indices, y_offsets=None, feat_layers=None):
@@ -232,6 +232,7 @@ class FCDMV2(nn.Module):
         # Pixel Unshuffle and project
         x = self.unshuffle(x)
         x = self.conv_in(x)
+        skip_in = x # Final skip connection
         
         feats = {}
         # Encoder
@@ -275,6 +276,7 @@ class FCDMV2(nn.Module):
         else: x = self.dec1(x, c)
             
         # Output Head
+        x = torch.cat([x, skip_in], dim=1) # Concat global skip connection
         x = x.permute(0, 2, 3, 1)
         x = self.norm_out(x)
         x = x.permute(0, 3, 1, 2)
