@@ -174,45 +174,52 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
+    accum_steps = config['training'].get('grad_accum_steps', 1)
 
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-
-        images, prompts, _ = batch
-        images = images.to(device, memory_format=torch.channels_last)
-        y_indices, y_offsets = tag_processor.process_prompts(
-            prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
-        )
-
-        if rank == 0 and fixed_prompts is None:
-            # Capture initial validation samples
-            fixed_prompts = prompts[:16]
-            fixed_noise = torch.randn_like(images[:16])
-
-        # Flow Matching / Rectified Flow Training
-        t = torch.rand((images.shape[0],), device=device)
-        t_reshaped = t.view(-1, 1, 1, 1)
-        noise = torch.randn_like(images)
-        xt = (1 - t_reshaped) * images + t_reshaped * noise
-
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model(xt, t, y_indices, y_offsets)
-            loss = F.mse_loss(pred, images)
-
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
-        loss.backward()
+        
+        loss_accum = 0.0
+        for _ in range(accum_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            images, prompts, _ = batch
+            images = images.to(device, memory_format=torch.channels_last)
+            y_indices, y_offsets = tag_processor.process_prompts(
+                prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
+            )
+
+            if rank == 0 and fixed_prompts is None:
+                # Capture initial validation samples
+                fixed_prompts = prompts[:16]
+                fixed_noise = torch.randn_like(images[:16])
+
+            # Flow Matching / Rectified Flow Training
+            t = torch.rand((images.shape[0],), device=device)
+            t_reshaped = t.view(-1, 1, 1, 1)
+            noise = torch.randn_like(images)
+            xt = (1 - t_reshaped) * images + t_reshaped * noise
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred = model(xt, t, y_indices, y_offsets)
+                # Scale loss by accumulation steps
+                loss = F.mse_loss(pred, images) / accum_steps
+
+            loss.backward()
+            loss_accum += loss.item()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer_muon.step()
         optimizer_adamw.step()
 
         global_step += 1
-        running_loss += loss.item()
+        running_loss += loss_accum
 
         if rank == 0:
             pbar.update(1)

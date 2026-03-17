@@ -70,11 +70,13 @@ class ViTBlock(nn.Module):
     def __init__(self, dim, cond_dim, r=4, head_dim=64):
         super().__init__()
         # Ensure head_dim is always 64 for GPU efficiency.
-        num_heads = dim // head_dim
-        if num_heads == 0: num_heads = 1
+        self.num_heads = dim // head_dim
+        if self.num_heads == 0: self.num_heads = 1
+        self.head_dim = head_dim
         
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
         
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.mlp = nn.Sequential(
@@ -102,7 +104,15 @@ class ViTBlock(nn.Module):
         shortcut = x_flat
         x_norm = self.norm1(x_flat)
         x_norm = x_norm * (1 + scale1) + shift1
-        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        
+        # Flash Attention using scaled_dot_product_attention
+        qkv = self.qkv(x_norm).reshape(B, H * W, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        x_attn = F.scaled_dot_product_attention(q, k, v)
+        x_attn = x_attn.transpose(1, 2).reshape(B, H * W, C)
+        x_attn = self.proj(x_attn)
+        
         x_flat = shortcut + x_attn * gate1
 
         # MLP Branch
