@@ -13,17 +13,20 @@ import wandb
 import glob
 import builtins
 import random
-from model import FCDM, TagProcessor, sample_flow
 from dataset import WDSLoader
 from torch.optim import AdamW
 import torch.nn.functional as F
 import bitsandbytes as bnb
 
-
-# ---------------------------------------------------------------------------
-# Helper: extract & normalize features
-# ---------------------------------------------------------------------------
-
+# Dynamic model import
+def get_model_and_sampler(config):
+    if config['model'].get('use_v2_model', False):
+        from model_v2 import FCDMV2 as ModelClass, TagProcessor, sample_flow as sample_fn
+        print(">>> Training V2 Model (CSP + Hybrid ViT + ReLU^2 + Gated Skip)")
+    else:
+        from model import FCDM as ModelClass, TagProcessor, sample_flow as sample_fn
+        print(">>> Training V1 Model (Baseline FCDM)")
+    return ModelClass, TagProcessor, sample_fn
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -37,11 +40,9 @@ def setup_ddp():
     else:
         return False, 0, 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
-
 
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0: return
@@ -56,10 +57,9 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
             except OSError as e:
                 print(f"Error removing {ckpt}: {e}")
 
-
 def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_prompts=None, fixed_noise=None):
     if rank != 0: return
-    print(f"\nSaving Checkpoint at step {step}...")
+    print(f"\n[Step {step}] Saving Checkpoint...")
     model_to_save = model.module if hasattr(model, 'module') else model
     ckpt_path = os.path.join(output_dir, f'ckpt_step_{step}.pth')
 
@@ -77,8 +77,7 @@ def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_pro
 
     torch.save(checkpoint, ckpt_path)
     cleanup_checkpoints(output_dir, config.get('max_checkpoints', 3), rank)
-    print(f"Checkpoint saved to {ckpt_path}")
-
+    print(f"Checkpoint saved: {ckpt_path}")
 
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
@@ -90,22 +89,9 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Import model based on config
-    if config['model'].get('use_v2_model', False):
-        from model_v2 import FCDMV2 as ModelClass
-        from model_v2 import sample_flow as sample_fn
-        print("Using V2 Model (Split-Channel)")
-    else:
-        from model import FCDM as ModelClass
-        from model import sample_flow as sample_fn
-        print("Using V1 Model")
-
-    print(f"Using device: {device}, Rank: {rank}, World Size: {world_size}")
-
-    if rank == 0:
-        wandb.init(project=config.get('wandb_project', 'nanoWaifu-T2I'), config=config)
-
-    # Tag Processor
+    # Instantiate model and helpers
+    ModelClass, TagProcessor, sample_fn = get_model_and_sampler(config)
+    
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
 
@@ -123,15 +109,16 @@ def train(config_path):
     image_size = config['training']['image_size']
 
     model = ModelClass(
-        in_channels=3,
+        in_channels=config['model'].get('in_channels', 3),
         base_channels=config['model'].get('fcdm_dim', 128),
         num_blocks=config['model'].get('fcdm_depth', 2),
         num_classes=num_classes,
         patch_size=config['model'].get('patch_size', 16),
-        use_t_cond=True
+        use_t_cond=True,
+        use_checkpoint=config['training'].get('gradient_checkpointing', False)
     ).to(device, memory_format=torch.channels_last)
 
-    # Optimizer setup (Muon for 2D params, AdamW for others)
+    # Optimizer setup (Split 2D params for Muon, 1D for AdamW)
     params_2d = []
     params_1d = []
     for name, param in model.named_parameters():
@@ -142,24 +129,16 @@ def train(config_path):
             else:
                 params_1d.append(param)
 
-    # Fallback to AdamW if Muon is not available or appropriate
-    try:
-        optimizer_muon = torch.optim.Muon(
-            params_2d, lr=config['training']['learning_rate'],
-            momentum=0.95, nesterov=True, adjust_lr_fn="match_rms_adamw"
-        )
-    except (AttributeError, NameError):
-        print("Muon optimizer not found, using AdamW for all parameters.")
-        optimizer_muon = bnb.optim.AdamW8bit(params_2d, lr=config['training']['learning_rate'])
+
+    optimizer_muon = bnb.optim.AdamW8bit(params_2d, lr=config['training']['learning_rate'])
 
     optimizer_adamw = bnb.optim.AdamW8bit(
         params_1d, lr=config['training']['learning_rate'],
         weight_decay=0.1, betas=(0.9, 0.95),
     )
-
     optimizers = [optimizer_muon, optimizer_adamw]
 
-    # --- RESUME LOGIC ---
+    # Resume Logic
     global_step = 0
     resume_path = config.get('resume_from', "outputs/")
     fixed_prompts = None
@@ -174,33 +153,29 @@ def train(config_path):
                 resume_path = None
 
         if resume_path and os.path.exists(resume_path):
-            print(f"Resuming from checkpoint: {resume_path}")
+            print(f"Resuming from: {resume_path}")
             checkpoint = torch.load(resume_path, map_location=device)
             model_to_load = model.module if hasattr(model, 'module') else model
             model_to_load.load_state_dict(checkpoint["model_state_dict"], strict=False)
             global_step = checkpoint["global_step"]
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
-            print(f"Successfully resumed at step {global_step}")
+            if "fixed_prompts" in checkpoint:
+                fixed_prompts = checkpoint["fixed_prompts"]
 
     if is_ddp:
-        dist.barrier()
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    os.makedirs(config['training']['output_dir'], exist_ok=True)
-    cfg_scale = config['training'].get('cfg_scale', 4.0)
-    max_train_steps = config['training'].get('max_train_steps', 1000000)
-    patch_size = config['model'].get('patch_size', 16)
-
     if rank == 0:
-        pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
-        running_metrics = {}
-    else:
-        pbar = None
+        wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
+        pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)), 
+                    desc="Training", dynamic_ncols=True)
+        os.makedirs(config['training']['output_dir'], exist_ok=True)
 
     data_iter = iter(dataloader)
+    running_loss = 0.0
 
-    while global_step < max_train_steps:
+    while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         try:
             batch = next(data_iter)
@@ -208,100 +183,70 @@ def train(config_path):
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        # Batch is now (images, prompts, coords) where images is (B, C, H, W)
         images, prompts, _ = batch
         images = images.to(device, memory_format=torch.channels_last)
-        
-        # Classifier-free guidance dropout handled in TagProcessor
-        dropout_prob = config['training'].get('class_dropout_prob', 0.1)
-        y_indices, y_offsets = tag_processor.process_prompts(prompts, device, dropout_prob=dropout_prob)
+        y_indices, y_offsets = tag_processor.process_prompts(
+            prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
+        )
 
         if rank == 0 and fixed_prompts is None:
-            general_candidates = [p for p in prompts if "general" in p]
-            if len(general_candidates) >= 16:
-                fixed_prompts = general_candidates[:16]
-                fixed_noise = torch.randn_like(images[:16])
-                print(f"\n[Step {global_step}] Locked 16 'general' prompts for fixed validation.")
+            # Capture initial validation samples
+            fixed_prompts = prompts[:16]
+            fixed_noise = torch.randn_like(images[:16])
 
-        # Standard Timestep Scheduling
+        # Flow Matching / Rectified Flow Training
         t = torch.rand((images.shape[0],), device=device)
         t_reshaped = t.view(-1, 1, 1, 1)
-        
         noise = torch.randn_like(images)
-        # Uniform noise level
         xt = (1 - t_reshaped) * images + t_reshaped * noise
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # Model predicts clean image x1 directly
-            x1_pred = model(xt, t, y_indices, y_offsets)
-            
-            # Loss is L1 + L2
-            loss_l1 = F.l1_loss(x1_pred, images)
-            loss_l2 = F.mse_loss(x1_pred, images)
-            loss = loss_l1 + loss_l2
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred = model(xt, t, y_indices, y_offsets)
+            loss = F.mse_loss(pred, images)
 
         optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer_muon.step()
         optimizer_adamw.step()
 
         global_step += 1
+        running_loss += loss.item()
 
         if rank == 0:
             pbar.update(1)
-            logs = {
-                "loss": loss.item(),
-                "loss_l1": loss_l1.item(),
-                "loss_l2": loss_l2.item(),
-                "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-            }
-            
-            for k, v in logs.items():
-                running_metrics[k] = running_metrics.get(k, 0.0) + float(v)
-            
-            pbar.set_postfix(**logs)
             if global_step % config['training']['log_every_steps'] == 0:
-                avg_logs = {f"train/{k}": v / config['training']['log_every_steps'] for k, v in running_metrics.items()}
-                wandb.log(avg_logs, step=global_step)
-                running_metrics = {}
+                avg_loss = running_loss / config['training']['log_every_steps']
+                wandb.log({"train/loss": avg_loss}, step=global_step)
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                running_loss = 0.0
 
-        if global_step % config['training']['save_image_every_steps'] == 0:
-            if is_ddp: dist.barrier()
-            if rank == 0:
+            if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizers, rank, config['training']['output_dir'],
                                 global_step, config, fixed_prompts, fixed_noise)
-
-                print("\nSampling...")
+                
+                print(f"\n[Step {global_step}] Generating validation samples...")
                 model.eval()
                 with torch.no_grad():
-                    use_prompts = fixed_prompts if fixed_prompts is not None else prompts[:16]
-                    use_noise = fixed_noise if fixed_noise is not None else None
-                    
                     samples = sample_fn(
                         model.module if hasattr(model, 'module') else model, 
-                        tag_processor, image_size, len(use_prompts),
-                        use_prompts, device,
-                        cfg_scale=cfg_scale,
-                        noise=use_noise
+                        tag_processor, image_size, 16, fixed_prompts, device,
+                        cfg_scale=config['training'].get('cfg_scale', 1.4),
+                        noise=fixed_noise
                     )
                     grid = make_grid(samples, nrow=4)
-                    wandb.log({"samples": wandb.Image(grid, caption=f"Step {global_step}: {use_prompts[0]}...")},
-                              step=global_step)
+                    wandb.log({"val/samples": wandb.Image(grid, caption=f"Step {global_step}")}, step=global_step)
                 model.train()
-            if is_ddp: dist.barrier()
 
     if rank == 0:
         save_checkpoint(model, optimizers, rank, config['training']['output_dir'],
                         global_step, config, fixed_prompts, fixed_noise)
-        pbar.close()
         wandb.finish()
     cleanup_ddp()
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
     train(args.config)

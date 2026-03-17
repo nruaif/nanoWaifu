@@ -67,15 +67,11 @@ class FCDMBlock(nn.Module):
 
 class ViTBlock(nn.Module):
     """Vision Transformer block with AdaLN and ReLU^2."""
-    def __init__(self, dim, cond_dim, r=4):
+    def __init__(self, dim, cond_dim, r=4, head_dim=64):
         super().__init__()
-        # Ensure dim is divisible by num_heads. 
-        num_heads = 8
-        if dim % num_heads != 0:
-            for h in [8, 4, 2, 1]:
-                if dim % h == 0:
-                    num_heads = h
-                    break
+        # Ensure head_dim is always 64 for GPU efficiency.
+        num_heads = dim // head_dim
+        if num_heads == 0: num_heads = 1
         
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
@@ -107,8 +103,6 @@ class ViTBlock(nn.Module):
         x_norm = self.norm1(x_flat)
         x_norm = x_norm * (1 + scale1) + shift1
         x_attn, _ = self.attn(x_norm, x_norm, x_norm)
-        # ReLU^2 not usually in attention, but let's check: request said "All activativation use ReLU ^2"
-        # Usually attn uses softmax. We'll stick to standard attn but ReLU^2 in MLP.
         x_flat = shortcut + x_attn * gate1
 
         # MLP Branch
@@ -127,9 +121,10 @@ class ViTBlock(nn.Module):
 class CSPStage(nn.Module):
     """Cross Stage Partial Stage.
     Switches to a ViT block every 3 blocks."""
-    def __init__(self, dim, cond_dim, num_blocks):
+    def __init__(self, dim, cond_dim, num_blocks, use_checkpoint=False):
         super().__init__()
         self.split_dim = dim // 2
+        self.use_checkpoint = use_checkpoint
         
         blocks = []
         for i in range(1, num_blocks + 1):
@@ -142,22 +137,39 @@ class CSPStage(nn.Module):
         # Fusion layer to mix the partial branches
         self.conv_fuse = nn.Conv2d(dim, dim, kernel_size=1)
 
+    def _forward_blocks(self, x2, c):
+        for block in self.blocks:
+            x2 = block(x2, c)
+        return x2
+
     def forward(self, x, c, feat_layers=None, start_idx=0):
         # Split channels: x1 is identity, x2 goes through blocks
         x1, x2 = x.chunk(2, dim=1)
         
-        feats = {}
-        for i, block in enumerate(self.blocks):
-            x2 = block(x2, c)
-            if feat_layers and (start_idx + i + 1) in feat_layers:
-                # Return fused intermediate features if requested
-                feats[start_idx + i + 1] = self.conv_fuse(torch.cat([x1, x2], dim=1))
+        if self.use_checkpoint and x2.requires_grad:
+            x2 = torch.utils.checkpoint.checkpoint(self._forward_blocks, x2, c, use_reentrant=False)
+        else:
+            x2 = self._forward_blocks(x2, c)
+
+        # Intermediate feature extraction is harder with checkpointing if they are inside the checkpointed block.
+        # For simplicity, if feat_layers is requested, we might skip checkpointing or handle it carefully.
+        # Here, we'll just re-run or ignore feat_layers if checkpointing is on for the whole stage.
+        # But wait, feat_layers in original code was inside the loop.
         
+        feats = {}
+        if feat_layers:
+            # If features are needed, we perform a non-checkpointed pass for now to keep it simple,
+            # or we could implement a more granular checkpointing.
+            # Let's stick to the requested change and keep it functional.
+            x2_feat = x.chunk(2, dim=1)[1]
+            for i, block in enumerate(self.blocks):
+                x2_feat = block(x2_feat, c)
+                if (start_idx + i + 1) in feat_layers:
+                    feats[start_idx + i + 1] = self.conv_fuse(torch.cat([x1, x2_feat], dim=1))
+
         # Concatenate and fuse
         out = self.conv_fuse(torch.cat([x1, x2], dim=1))
-        if feat_layers:
-            return out, feats
-        return out
+        return out, feats
 
 class TimestepEmbedder(nn.Module):
     """Sinusoidal timestep embedding"""
@@ -180,7 +192,7 @@ class TimestepEmbedder(nn.Module):
 
 class FCDMV2(nn.Module):
     """Fully Convolutional Diffusion Model U-Net V2 with CSP, Hybrid ViT, ReLU^2 and PixelShuffle Head."""
-    def __init__(self, in_channels=3, base_channels=128, num_blocks=2, num_classes=12476, patch_size=16, use_t_cond=True):
+    def __init__(self, in_channels=3, base_channels=128, num_blocks=2, num_classes=12476, patch_size=16, use_t_cond=True, use_checkpoint=False):
         super().__init__()
         self.c = base_channels
         self.l = num_blocks
@@ -188,6 +200,7 @@ class FCDMV2(nn.Module):
         self.patch_size = patch_size
         self.num_classes = num_classes
         self.use_t_cond = use_t_cond
+        self.use_checkpoint = use_checkpoint
         
         if self.use_t_cond:
             self.t_embedder = TimestepEmbedder(self.c * 4)
@@ -199,29 +212,34 @@ class FCDMV2(nn.Module):
         self.conv_in = nn.Conv2d(in_channels * (patch_size ** 2), self.c, kernel_size=7, padding=3)
 
         # Stage 1 (Encoder)
-        self.enc1 = CSPStage(self.c, cond_dim, self.l)
+        self.enc1 = CSPStage(self.c, cond_dim, self.l, use_checkpoint=use_checkpoint)
         self.down1 = nn.Conv2d(self.c, self.c * 2, kernel_size=2, stride=2)
 
         # Stage 2 (Encoder)
-        self.enc2 = CSPStage(self.c * 2, cond_dim, self.l * 2)
+        self.enc2 = CSPStage(self.c * 2, cond_dim, self.l * 2, use_checkpoint=use_checkpoint)
         self.down2 = nn.Conv2d(self.c * 2, self.c * 4, kernel_size=2, stride=2)
 
         # Stage 3 (Bottleneck)
-        self.mid = CSPStage(self.c * 4, cond_dim, self.l * 4)
+        self.mid = CSPStage(self.c * 4, cond_dim, self.l * 4, use_checkpoint=use_checkpoint)
 
         # Stage 2 (Decoder)
         self.up2 = nn.ConvTranspose2d(self.c * 4, self.c * 2, kernel_size=2, stride=2)
         self.skip_proj2 = nn.Conv2d(self.c * 4, self.c * 2, kernel_size=1)
-        self.dec2 = CSPStage(self.c * 2, cond_dim, self.l * 2)
+        self.dec2 = CSPStage(self.c * 2, cond_dim, self.l * 2, use_checkpoint=use_checkpoint)
 
         # Stage 1 (Decoder)
         self.up1 = nn.ConvTranspose2d(self.c * 2, self.c, kernel_size=2, stride=2)
         self.skip_proj1 = nn.Conv2d(self.c * 2, self.c, kernel_size=1)
-        self.dec1 = CSPStage(self.c, cond_dim, self.l)
+        self.dec1 = CSPStage(self.c, cond_dim, self.l, use_checkpoint=use_checkpoint)
+
+        # Global Skip Connection Projections
+        self.skip_proj_final = nn.Conv2d(self.c, self.c, kernel_size=1)
+        self.curr_proj_final = nn.Conv2d(self.c, self.c, kernel_size=1)
 
         # Output Head: Simple "Unconv" (PixelShuffle)
-        self.norm_out = nn.LayerNorm(self.c * 2)
-        self.conv_out = nn.Conv2d(self.c * 2, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
+        # Use concat (2 * self.c) for better stability than multiplication
+        self.norm_out = nn.LayerNorm(2 * self.c)
+        self.conv_out = nn.Conv2d(2 * self.c, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
         self.shuffle = nn.PixelShuffle(patch_size)
 
     def forward(self, x, t, y_indices, y_offsets=None, feat_layers=None):
@@ -236,47 +254,38 @@ class FCDMV2(nn.Module):
         
         feats = {}
         # Encoder
-        if feat_layers:
-            x, f = self.enc1(x, c, feat_layers, start_idx=0)
-            feats.update(f)
-        else: x = self.enc1(x, c)
+        x, f = self.enc1(x, c, feat_layers, start_idx=0)
+        if feat_layers: feats.update(f)
         
         skip1 = x
         x = self.down1(x)
         
-        if feat_layers:
-            x, f = self.enc2(x, c, feat_layers, start_idx=self.l)
-            feats.update(f)
-        else: x = self.enc2(x, c)
+        x, f = self.enc2(x, c, feat_layers, start_idx=self.l)
+        if feat_layers: feats.update(f)
         
         skip2 = x
         x = self.down2(x)
         
         # Mid
-        if feat_layers:
-            x, f = self.mid(x, c, feat_layers, start_idx=self.l + self.l * 2)
-            feats.update(f)
-        else: x = self.mid(x, c)
+        x, f = self.mid(x, c, feat_layers, start_idx=self.l + self.l * 2)
+        if feat_layers: feats.update(f)
             
         # Decoder
         x = self.up2(x)
         x = torch.cat([x, skip2], dim=1)
         x = self.skip_proj2(x)
-        if feat_layers:
-            x, f = self.dec2(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4)
-            feats.update(f)
-        else: x = self.dec2(x, c)
+        x, f = self.dec2(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4)
+        if feat_layers: feats.update(f)
             
         x = self.up1(x)
         x = torch.cat([x, skip1], dim=1)
         x = self.skip_proj1(x)
-        if feat_layers:
-            x, f = self.dec1(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4 + self.l * 2)
-            feats.update(f)
-        else: x = self.dec1(x, c)
+        x, f = self.dec1(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4 + self.l * 2)
+        if feat_layers: feats.update(f)
             
-        # Output Head
-        x = torch.cat([x, skip_in], dim=1) # Concat global skip connection
+        # Output Head: Concatenated skip connection for stability
+        x = torch.cat([self.curr_proj_final(x), self.skip_proj_final(skip_in)], dim=1)
+        
         x = x.permute(0, 2, 3, 1)
         x = self.norm_out(x)
         x = x.permute(0, 3, 1, 2)
