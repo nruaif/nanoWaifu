@@ -123,7 +123,6 @@ def train(config_path):
         use_t_cond=True,
         use_checkpoint=config['training'].get('gradient_checkpointing', False)
     ).to(device, memory_format=torch.channels_last)
-    model.compile()
     optimizer = bnb.optim.AdamW8bit(
         model.parameters(), 
         lr=config['training']['learning_rate'],
@@ -158,6 +157,10 @@ def train(config_path):
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    if config['training'].get('compile', False):
+        print(">>> Compiling Model...")
+        model = torch.compile(model)
 
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
