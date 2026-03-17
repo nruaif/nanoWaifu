@@ -57,7 +57,7 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
             except OSError as e:
                 print(f"Error removing {ckpt}: {e}")
 
-def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_prompts=None, fixed_noise=None):
+def save_checkpoint(model, optimizer, rank, output_dir, step, config, fixed_prompts=None, fixed_noise=None):
     if rank != 0: return
     print(f"\n[Step {step}] Saving Checkpoint...")
     model_to_save = model.module if hasattr(model, 'module') else model
@@ -65,8 +65,6 @@ def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_pro
 
     checkpoint = {
         "model_state_dict": model_to_save.state_dict(),
-        "optimizer_muon_state_dict": optimizers[0].state_dict(),
-        "optimizer_adamw_state_dict": optimizers[1].state_dict(),
         "global_step": step,
         "config": config,
         "rng_state": torch.get_rng_state(),
@@ -81,6 +79,14 @@ def save_checkpoint(model, optimizers, rank, output_dir, step, config, fixed_pro
 
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
+
+    # Performance Tuning
+    torch.autograd.set_detect_anomaly(False)
+    torch.autograd.profiler.profile(enabled=False)
+    torch.autograd.profiler.emit_nvtx(enabled=False)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
@@ -117,26 +123,13 @@ def train(config_path):
         use_t_cond=True,
         use_checkpoint=config['training'].get('gradient_checkpointing', False)
     ).to(device, memory_format=torch.channels_last)
-
-    # Optimizer setup (Split 2D params for Muon, 1D for AdamW)
-    params_2d = []
-    params_1d = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            meaningful_dims = sum(1 for s in param.shape if s > 1)
-            if meaningful_dims == 2:
-                params_2d.append(param)
-            else:
-                params_1d.append(param)
-
-
-    optimizer_muon = bnb.optim.AdamW8bit(params_2d, lr=config['training']['learning_rate'])
-
-    optimizer_adamw = bnb.optim.AdamW8bit(
-        params_1d, lr=config['training']['learning_rate'],
-        weight_decay=0.1, betas=(0.9, 0.95),
+    model.compile()
+    optimizer = bnb.optim.AdamW8bit(
+        model.parameters(), 
+        lr=config['training']['learning_rate'],
+        weight_decay=0.1, 
+        betas=(0.9, 0.95)
     )
-    optimizers = [optimizer_muon, optimizer_adamw]
 
     # Resume Logic
     global_step = 0
@@ -178,8 +171,7 @@ def train(config_path):
 
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
-        optimizer_muon.zero_grad()
-        optimizer_adamw.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         loss_accum = 0.0
         for _ in range(accum_steps):
@@ -215,8 +207,7 @@ def train(config_path):
             loss_accum += loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer_muon.step()
-        optimizer_adamw.step()
+        optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
@@ -230,7 +221,7 @@ def train(config_path):
                 running_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
-                save_checkpoint(model, optimizers, rank, config['training']['output_dir'],
+                save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
                                 global_step, config, fixed_prompts, fixed_noise)
                 
                 print(f"\n[Step {global_step}] Generating validation samples...")
@@ -247,7 +238,7 @@ def train(config_path):
                 model.train()
 
     if rank == 0:
-        save_checkpoint(model, optimizers, rank, config['training']['output_dir'],
+        save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
                         global_step, config, fixed_prompts, fixed_noise)
         wandb.finish()
     cleanup_ddp()
