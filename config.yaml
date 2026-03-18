@@ -21,9 +21,10 @@ training:
 
 model:
   use_v2_model: true
+  use_vae: true # Use Flux2TinyAutoEncoder
   fcdm_dim: 512
   fcdm_depth: 3
-  in_channels: 3 # RGB
+  in_channels: 3 # RGB (overwritten to 32 if use_vae is true)
   patch_size: 8 # PixelUnshuffle factor
 
 data:
