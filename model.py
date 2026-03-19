@@ -50,6 +50,8 @@ class FCDMBlock(nn.Module):
 
         # AdaLN Shift and Scale [cite: 67]
         shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=1)
+        # Apply Tanh Clamping for stability
+        shift, scale, gate = shift.tanh(), scale.tanh(), gate.tanh()
         shift, scale, gate = shift[..., None, None], scale[..., None, None], gate[..., None, None]
 
         x = x * (1 + scale) + shift

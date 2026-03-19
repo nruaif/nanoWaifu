@@ -4,9 +4,9 @@ import torch.nn.functional as F
 import math
 import random
 
-def relu2(x):
+def gelu_act(x):
     """ReLU^2 activation function."""
-    return torch.square(F.relu(x))
+    return F.gelu(x, approximate='tanh')
 
 class GRN(nn.Module):
     """Global Response Normalization [cite: 64, 101]"""
@@ -52,13 +52,15 @@ class FCDMBlock(nn.Module):
 
         # AdaLN Shift and Scale
         shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=1)
+        # Apply Tanh Clamping for stability
+        shift, scale, gate = shift.tanh(), scale.tanh(), gate.tanh()
         shift, scale, gate = shift[..., None, None], scale[..., None, None], gate[..., None, None]
 
-        x = x * (1 + scale) + shift
+        x = x * scale + shift
         
         # Inverted bottleneck
         x = self.pwconv1(x)
-        x = relu2(x) # ReLU^2
+        x = gelu_act(x) # ReLU^2
         x = self.grn(x)
         x = self.pwconv2(x)
         
@@ -98,12 +100,13 @@ class ViTBlock(nn.Module):
         
         # AdaLN modulation
         mods = self.adaLN_modulation(c).chunk(6, dim=1)
+        mods = [m.tanh() for m in mods]
         shift1, scale1, gate1, shift2, scale2, gate2 = [m[:, None, :] for m in mods]
 
         # Attention Branch
         shortcut = x_flat
         x_norm = self.norm1(x_flat)
-        x_norm = x_norm * (1 + scale1) + shift1
+        x_norm = x_norm * scale1 + shift1
         
         # Flash Attention using scaled_dot_product_attention
         qkv = self.qkv(x_norm).reshape(B, H * W, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -118,10 +121,10 @@ class ViTBlock(nn.Module):
         # MLP Branch
         shortcut = x_flat
         x_norm = self.norm2(x_flat)
-        x_norm = x_norm * (1 + scale2) + shift2
+        x_norm = x_norm * scale2 + shift2
         
         x_mlp = self.mlp[0](x_norm)
-        x_mlp = relu2(x_mlp)
+        x_mlp = gelu_act(x_mlp)
         x_mlp = self.mlp[1](x_mlp)
         
         x_flat = shortcut + x_mlp * gate2
