@@ -33,6 +33,22 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+def find_latest_checkpoint(output_dir, prefix="epg_stage2_step_"):
+    import re
+    if not os.path.exists(output_dir):
+        return None
+    files = os.listdir(output_dir)
+    ckpts = [f for f in files if f.startswith(prefix) and f.endswith(".pth")]
+    if not ckpts:
+        return None
+    
+    def get_step(f):
+        match = re.search(r"step_(\d+)\.pth", f)
+        return int(match.group(1)) if match else -1
+        
+    ckpts.sort(key=get_step)
+    return os.path.join(output_dir, ckpts[-1])
+
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
     if rank != 0: builtins.print = lambda *args, **kwargs: None
@@ -60,22 +76,35 @@ def train(config_path):
     
     tag_processor = TagProcessor("tags.txt")
 
-    # Load pre-trained encoder
-    stage1_ckpt = config.get('stage1_ckpt')
-    if stage1_ckpt and os.path.exists(stage1_ckpt):
-        print(f"Loading Stage 1 pre-trained encoder from {stage1_ckpt}")
-        ckpt = torch.load(stage1_ckpt, map_location=device)
-        encoder.load_state_dict(ckpt['encoder_state_dict'])
+    # Load pre-trained encoder (only if not resuming)
+    latest_ckpt = find_latest_checkpoint(config['training']['output_dir'])
+    
+    if latest_ckpt:
+        print(f"Resuming Stage 2 from {latest_ckpt}")
+        ckpt = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        global_step = ckpt['global_step']
+    else:
+        stage1_ckpt = config.get('stage1_ckpt')
+        if stage1_ckpt and os.path.exists(stage1_ckpt):
+            print(f"Loading Stage 1 pre-trained encoder from {stage1_ckpt}")
+            ckpt = torch.load(stage1_ckpt, map_location=device)
+            encoder.load_state_dict(ckpt['encoder_state_dict'])
+        global_step = 0
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['training']['learning_rate'], weight_decay=config['training'].get('weight_decay', 0.01))
 
-    global_step, max_steps = 0, config['training'].get('max_train_steps', 1000000)
+    if latest_ckpt and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+
+    max_steps = config['training'].get('max_train_steps', 1000000)
     if rank == 0:
-        wandb.init(project="EPG-Stage2-PFM-x0", config=config)
-        pbar = tqdm(range(max_steps), desc="EPG Stage 2")
+        wandb.init(project="EPG-Stage2-PFM-x0", config=config, resume="allow", id=config["training"].get("wandb_id"))
+        pbar = tqdm(total=max_steps, desc="EPG Stage 2")
+        pbar.update(global_step)
 
     data_iter = iter(dataloader)
     while global_step < max_steps:
@@ -118,7 +147,14 @@ def train(config_path):
                 model_to_sample = model.module if hasattr(model, 'module') else model
                 samples = model_to_sample.sample_flow(image_size=config['training']['image_size'], batch_size=16, device=device, y_indices=y_indices[:16], y_offsets=y_offsets[:16])
                 wandb.log({"samples": wandb.Image(make_grid(samples, nrow=4))}, step=global_step)
-                torch.save(model.state_dict(), os.path.join(config['training']['output_dir'], f"epg_stage2_step_{global_step}.pth"))
+                
+                raw_model = model.module if hasattr(model, 'module') else model
+                torch.save({
+                    'model_state_dict': raw_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'global_step': global_step,
+                    'config': config
+                }, os.path.join(config['training']['output_dir'], f"epg_stage2_step_{global_step}.pth"))
 
     cleanup_ddp()
 
