@@ -4,6 +4,53 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+        super().__init__()
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_buffer('weight', None)
+
+    def forward(self, x):
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = x * norm
+        if self.elementwise_affine:
+            x = x * self.weight
+        return x
+
+class QKNormAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        
+        # QK Norm
+        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=False)
+        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=False)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Apply QK Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
 class TagProcessor:
     def __init__(self, tags_file):
         with open(tags_file, "r", encoding="utf-8") as f:
@@ -14,26 +61,16 @@ class TagProcessor:
     def process_prompts(self, prompts, device, dropout_prob=0.0):
         all_indices = []
         all_offsets = [0]
-        
         for prompt in prompts:
-            if isinstance(prompt, str):
-                tags = prompt.split()
-            else:
-                tags = []
-                
+            tags = prompt.split() if isinstance(prompt, str) else []
             indices = []
             if np.random.random() >= dropout_prob:
                 for tag in tags:
                     if tag in self.tag_to_id:
                         indices.append(self.tag_to_id[tag])
-            
-            # If empty or dropped, add a special null token (last index)
-            if not indices:
-                indices = [self.num_tags]
-                
+            if not indices: indices = [self.num_tags]
             all_indices.extend(indices)
             all_offsets.append(all_offsets[-1] + len(indices))
-            
         return torch.tensor(all_indices, device=device), torch.tensor(all_offsets[:-1], device=device)
 
 class TimestepEmbedder(nn.Module):
@@ -65,49 +102,32 @@ class GLU(nn.Module):
         return x * self.act(gate)
 
 class ViTBlock(nn.Module):
-    """Transformer Block with 3x3 DW Conv and GLU MLP"""
     def __init__(self, dim, num_heads, r=4, num_special_tokens=7):
         super().__init__()
         self.num_special_tokens = num_special_tokens
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm1 = RMSNorm(dim, elementwise_affine=False)
+        self.attn = QKNormAttention(dim, num_heads)
         
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        
-        # 3x3 DW Conv for positional info (applied to image tokens only)
+        self.norm2 = RMSNorm(dim, elementwise_affine=False)
         self.dw_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
-        
-        # GLU MLP
-        self.mlp = nn.Sequential(
-            GLU(dim, dim * r),
-            nn.Linear(dim * r, dim)
-        )
+        self.mlp = nn.Sequential(GLU(dim, dim * r), nn.Linear(dim * r, dim))
 
     def forward(self, x, h, w):
-        # x: (B, N, D)
         shortcut = x
         x = self.norm1(x)
-        attn_out, _ = self.attn(x, x, x)
-        x = shortcut + attn_out
+        x = shortcut + self.attn(x)
         
         shortcut = x
         x = self.norm2(x)
         
-        # Split special tokens and image patches
         special = x[:, :self.num_special_tokens, :]
-        patches = x[:, self.num_special_tokens:, :] # (B, HW, D)
-        
-        # 3x3 DW Conv on patches
+        patches = x[:, self.num_special_tokens:, :]
         B, HW, D = patches.shape
-        # Use provided H and W for correct reshaping
         patches = patches.transpose(1, 2).reshape(B, D, h, w)
         patches = self.dw_conv(patches)
         patches = patches.reshape(B, D, HW).transpose(1, 2)
         
-        # Re-concat
         x = torch.cat([special, patches], dim=1)
-        
-        # MLP
         x = shortcut + self.mlp(x)
         return x
 
@@ -116,75 +136,54 @@ class EPGEncoder(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
         self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         
-        # Special Tokens: CLS (1), Time (1), Cond (1), Registers (4) = 7
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.reg_tokens = nn.Parameter(torch.zeros(1, 4, embed_dim))
-        
         self.time_token_proj = nn.Linear(embed_dim, embed_dim)
-        
-        # Integrated Tag Processing
         self.y_embedder = nn.EmbeddingBag(num_classes + 1, embed_dim, mode='mean')
         self.y_proj = nn.Linear(embed_dim, embed_dim)
         
-        self.blocks = nn.ModuleList([
-            ViTBlock(embed_dim, num_heads, num_special_tokens=7)
-            for _ in range(depth)
-        ])
-        
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.blocks = nn.ModuleList([ViTBlock(embed_dim, num_heads, num_special_tokens=7) for _ in range(depth)])
+        self.norm = RMSNorm(embed_dim, elementwise_affine=False)
         self.t_embedder = TimestepEmbedder(embed_dim)
         
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.reg_tokens, std=0.02)
 
     def get_y_feat(self, y_indices, y_offsets):
-        """Returns projected tag features for SigLIP stage 1"""
         y_emb = self.y_embedder(y_indices, y_offsets)
         return self.y_proj(y_emb)
 
     def forward(self, x, t, y_indices=None, y_offsets=None):
         B, C, H_img, W_img = x.shape
         h, w = H_img // self.patch_size, W_img // self.patch_size
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
         
-        # Patchify
-        x = self.patch_embed(x) # (B, D, h, w)
-        x = x.flatten(2).transpose(1, 2) # (B, HW, D)
-        
-        # Time token
         t_emb = self.t_embedder(t)
         t_token = self.time_token_proj(t_emb).unsqueeze(1)
         
-        # Cond token
         if y_indices is not None:
-            y_feat = self.get_y_feat(y_indices, y_offsets)
-            y_token = y_feat.unsqueeze(1)
+            y_token = self.get_y_feat(y_indices, y_offsets).unsqueeze(1)
         else:
             y_token = torch.zeros((B, 1, self.embed_dim), device=x.device)
         
         cls_tokens = self.cls_token.expand(B, -1, -1)
         reg_tokens = self.reg_tokens.expand(B, -1, -1)
-        
-        # Combine: [CLS, Time, Cond, Reg1-4, Patches]
         x = torch.cat((cls_tokens, t_token, y_token, reg_tokens, x), dim=1)
         
-        for block in self.blocks:
-            x = block(x, h, w)
-            
-        x = self.norm(x)
-        return x
+        for block in self.blocks: x = block(x, h, w)
+        return self.norm(x)
 
 class EPGProjector(nn.Module):
     def __init__(self, embed_dim=768, proj_dim=256):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
-            nn.BatchNorm1d(embed_dim),
+            RMSNorm(embed_dim, elementwise_affine=False),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
-            nn.BatchNorm1d(embed_dim),
+            RMSNorm(embed_dim, elementwise_affine=False),
             nn.ReLU(),
             nn.Linear(embed_dim, proj_dim)
         )
@@ -197,23 +196,15 @@ class EPGDecoder(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
-        
-        self.blocks = nn.ModuleList([
-            ViTBlock(embed_dim, num_heads, num_special_tokens=7)
-            for _ in range(depth)
-        ])
-        
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.blocks = nn.ModuleList([ViTBlock(embed_dim, num_heads, num_special_tokens=7) for _ in range(depth)])
+        self.norm = RMSNorm(embed_dim, elementwise_affine=False)
         self.pred_head = nn.Linear(embed_dim, out_channels * patch_size * patch_size)
 
     def forward(self, x, h, w, encoder_features=None):
         for i, block in enumerate(self.blocks):
-            if encoder_features is not None:
-                x = x + encoder_features[i]
+            if encoder_features is not None: x = x + encoder_features[i]
             x = block(x, h, w)
-            
-        x = self.norm(x)
-        return x
+        return self.norm(x)
 
 class EPGModel(nn.Module):
     def __init__(self, encoder, decoder=None, projector=None):
@@ -226,75 +217,37 @@ class EPGModel(nn.Module):
         if stage == 1:
             features = self.encoder(x, t, y_indices, y_offsets)
             cls_token_feat = features[:, 0]
-            if self.projector:
-                return self.projector(cls_token_feat), cls_token_feat
+            if self.projector: return self.projector(cls_token_feat), cls_token_feat
             return cls_token_feat
         else:
-            # Stage 2 Fine-tuning
             B, C, H_img, W_img = x.shape
             h, w = H_img // self.encoder.patch_size, W_img // self.encoder.patch_size
-            
             enc_feats = []
             x_in = self.encoder.patch_embed(x).flatten(2).transpose(1, 2)
-            
-            t_emb = self.encoder.t_embedder(t)
-            t_token = self.encoder.time_token_proj(t_emb).unsqueeze(1)
-            
-            if y_indices is not None:
-                y_feat = self.encoder.get_y_feat(y_indices, y_offsets)
-                y_token = y_feat.unsqueeze(1)
-            else:
-                y_token = torch.zeros((B, 1, self.encoder.embed_dim), device=x.device)
-            
-            cls_tokens = self.encoder.cls_token.expand(B, -1, -1)
-            reg_tokens = self.encoder.reg_tokens.expand(B, -1, -1)
-            x_in = torch.cat((cls_tokens, t_token, y_token, reg_tokens, x_in), dim=1)
-            
+            t_token = self.encoder.time_token_proj(self.encoder.t_embedder(t)).unsqueeze(1)
+            y_token = self.encoder.get_y_feat(y_indices, y_offsets).unsqueeze(1) if y_indices is not None else torch.zeros((B, 1, self.encoder.embed_dim), device=x.device)
+            x_in = torch.cat((self.encoder.cls_token.expand(B, -1, -1), t_token, y_token, self.encoder.reg_tokens.expand(B, -1, -1), x_in), dim=1)
             for block in self.encoder.blocks:
                 x_in = block(x_in, h, w)
                 enc_feats.append(x_in)
-            
-            x_enc = self.encoder.norm(x_in)
-            
-            # Decoder
-            x_dec = x_enc
+            x_dec = self.encoder.norm(x_in)
             for i, block in enumerate(self.decoder.blocks):
                 x_dec = x_dec + enc_feats[-(i+1)]
                 x_dec = block(x_dec, h, w)
-            
             x_dec = self.decoder.norm(x_dec)
-            
-            # Reconstruction (Remove 7 special tokens)
-            img_tokens = x_dec[:, 7:] 
-            out = self.decoder.pred_head(img_tokens) 
-            
-            # Unpatchify
-            B, N, _ = out.shape
-            # Use actual h and w computed from image shape
+            out = self.decoder.pred_head(x_dec[:, 7:])
             out = out.reshape(B, h, w, self.decoder.patch_size, self.decoder.patch_size, -1)
-            out = out.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, h * self.decoder.patch_size, w * self.decoder.patch_size)
-            return out
+            return out.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, h * self.decoder.patch_size, w * self.decoder.patch_size)
 
     @torch.no_grad()
     def sample_flow(self, image_size, batch_size, device, y_indices=None, y_offsets=None, steps=50):
         self.eval()
         x = torch.randn(batch_size, 3, image_size, image_size, device=device)
         ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-        
         for i in range(steps):
-            t_curr = ts[i]
-            t_next = ts[i+1]
-            t_vec = torch.full((batch_size,), t_curr, device=device)
-            t_scaled = 1000 * 0.25 * torch.log(t_vec.clamp(min=1e-8))
-            
-            sigma_data = 0.5
-            precond = 1.0 / torch.sqrt(t_curr**2 + sigma_data**2)
-            x_in = x * precond
-            
+            t_curr, t_next = ts[i], ts[i+1]
+            t_scaled = 1000 * 0.25 * torch.log(torch.full((batch_size,), t_curr, device=device).clamp(min=1e-8))
+            x_in = x * (1.0 / torch.sqrt(t_curr**2 + 0.5**2))
             x0_pred = self.forward(x_in, t_scaled, y_indices=y_indices, y_offsets=y_offsets, stage=2)
-            
-            if t_curr > 0:
-                x = (t_next / t_curr) * x + (1 - t_next / t_curr) * x0_pred
-            else:
-                x = x0_pred
+            x = (t_next / t_curr) * x + (1 - t_next / t_curr) * x0_pred if t_curr > 0 else x0_pred
         return x.clamp(0, 1)
