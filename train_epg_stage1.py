@@ -160,6 +160,7 @@ def train(config_path):
     with open(config_path, 'r') as f: config = yaml.safe_load(f)
     os.makedirs(config['training']['output_dir'], exist_ok=True)
     dataloader = WDSLoader(url=config['data']['webdataset_url'], csv_path=config['data'].get('csv_path'), image_size=config['training']['image_size'], batch_size=config['training']['batch_size'], num_workers=config['training']['num_workers']).make_loader()
+    from model_epg import TagProcessor
     trainer = EPGStage1Trainer(config, device, rank)
     tag_processor = TagProcessor("tags.txt")
     max_steps, global_step = config['training'].get('max_train_steps', 600000), 0

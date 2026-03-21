@@ -2,6 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
+
+class TagProcessor:
+    def __init__(self, tags_file):
+        with open(tags_file, "r", encoding="utf-8") as f:
+            self.tags = [line.strip() for line in f if line.strip()]
+        self.tag_to_id = {tag: i for i, tag in enumerate(self.tags)}
+        self.num_tags = len(self.tags)
+
+    def process_prompts(self, prompts, device, dropout_prob=0.0):
+        all_indices = []
+        all_offsets = [0]
+        
+        for prompt in prompts:
+            if isinstance(prompt, str):
+                tags = prompt.split()
+            else:
+                tags = []
+                
+            indices = []
+            if np.random.random() >= dropout_prob:
+                for tag in tags:
+                    if tag in self.tag_to_id:
+                        indices.append(self.tag_to_id[tag])
+            
+            # If empty or dropped, add a special null token (last index)
+            if not indices:
+                indices = [self.num_tags]
+                
+            all_indices.extend(indices)
+            all_offsets.append(all_offsets[-1] + len(indices))
+            
+        return torch.tensor(all_indices, device=device), torch.tensor(all_offsets[:-1], device=device)
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_dim):
@@ -50,7 +83,7 @@ class ViTBlock(nn.Module):
             nn.Linear(dim * r, dim)
         )
 
-    def forward(self, x):
+    def forward(self, x, h, w):
         # x: (B, N, D)
         shortcut = x
         x = self.norm1(x)
@@ -66,8 +99,8 @@ class ViTBlock(nn.Module):
         
         # 3x3 DW Conv on patches
         B, HW, D = patches.shape
-        H = W = int(math.sqrt(HW))
-        patches = patches.transpose(1, 2).reshape(B, D, H, W)
+        # Use provided H and W for correct reshaping
+        patches = patches.transpose(1, 2).reshape(B, D, h, w)
         patches = self.dw_conv(patches)
         patches = patches.reshape(B, D, HW).transpose(1, 2)
         
@@ -113,11 +146,12 @@ class EPGEncoder(nn.Module):
         return self.y_proj(y_emb)
 
     def forward(self, x, t, y_indices=None, y_offsets=None):
-        B = x.shape[0]
+        B, C, H_img, W_img = x.shape
+        h, w = H_img // self.patch_size, W_img // self.patch_size
         
         # Patchify
-        x = self.patch_embed(x) # (B, D, H/P, W/P)
-        x = x.flatten(2).transpose(1, 2) # (B, N, D)
+        x = self.patch_embed(x) # (B, D, h, w)
+        x = x.flatten(2).transpose(1, 2) # (B, HW, D)
         
         # Time token
         t_emb = self.t_embedder(t)
@@ -137,7 +171,7 @@ class EPGEncoder(nn.Module):
         x = torch.cat((cls_tokens, t_token, y_token, reg_tokens, x), dim=1)
         
         for block in self.blocks:
-            x = block(x)
+            x = block(x, h, w)
             
         x = self.norm(x)
         return x
@@ -146,6 +180,9 @@ class EPGProjector(nn.Module):
     def __init__(self, embed_dim=768, proj_dim=256):
         super().__init__()
         self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
             nn.BatchNorm1d(embed_dim),
             nn.ReLU(),
@@ -169,11 +206,11 @@ class EPGDecoder(nn.Module):
         self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
         self.pred_head = nn.Linear(embed_dim, out_channels * patch_size * patch_size)
 
-    def forward(self, x, encoder_features=None):
+    def forward(self, x, h, w, encoder_features=None):
         for i, block in enumerate(self.blocks):
             if encoder_features is not None:
                 x = x + encoder_features[i]
-            x = block(x)
+            x = block(x, h, w)
             
         x = self.norm(x)
         return x
@@ -194,10 +231,10 @@ class EPGModel(nn.Module):
             return cls_token_feat
         else:
             # Stage 2 Fine-tuning
-            enc_feats = []
+            B, C, H_img, W_img = x.shape
+            h, w = H_img // self.encoder.patch_size, W_img // self.encoder.patch_size
             
-            # Simplified forward path to capture intermediate features
-            B = x.shape[0]
+            enc_feats = []
             x_in = self.encoder.patch_embed(x).flatten(2).transpose(1, 2)
             
             t_emb = self.encoder.t_embedder(t)
@@ -214,7 +251,7 @@ class EPGModel(nn.Module):
             x_in = torch.cat((cls_tokens, t_token, y_token, reg_tokens, x_in), dim=1)
             
             for block in self.encoder.blocks:
-                x_in = block(x_in)
+                x_in = block(x_in, h, w)
                 enc_feats.append(x_in)
             
             x_enc = self.encoder.norm(x_in)
@@ -223,7 +260,7 @@ class EPGModel(nn.Module):
             x_dec = x_enc
             for i, block in enumerate(self.decoder.blocks):
                 x_dec = x_dec + enc_feats[-(i+1)]
-                x_dec = block(x_dec)
+                x_dec = block(x_dec, h, w)
             
             x_dec = self.decoder.norm(x_dec)
             
@@ -233,10 +270,9 @@ class EPGModel(nn.Module):
             
             # Unpatchify
             B, N, _ = out.shape
-            H = W = int(math.sqrt(N))
-            P = self.decoder.patch_size
-            out = out.reshape(B, H, W, P, P, -1)
-            out = out.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, H * P, W * P)
+            # Use actual h and w computed from image shape
+            out = out.reshape(B, h, w, self.decoder.patch_size, self.decoder.patch_size, -1)
+            out = out.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, h * self.decoder.patch_size, w * self.decoder.patch_size)
             return out
 
     @torch.no_grad()

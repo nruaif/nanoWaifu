@@ -41,14 +41,8 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
 
 
-    dataloader = WDSLoader(
-        url=config['data']['webdataset_url'],
-        csv_path=config['data'].get('csv_path'),
-        image_size=config['training']['image_size'],
-        batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers']
-    ).make_loader()
-
+    dataloader = WDSLoader(url=config['data']['webdataset_url'], csv_path=config['data'].get('csv_path'), image_size=config['training']['image_size'], batch_size=config['training']['batch_size'], num_workers=config['training']['num_workers']).make_loader()
+    from model_epg import TagProcessor
     # Models
     embed_dim = config['model'].get('embed_dim', 768)
     depth = config['model'].get('depth', 12)
@@ -59,7 +53,6 @@ def train(config_path):
     decoder = EPGDecoder(embed_dim=embed_dim, depth=depth, num_heads=num_heads).to(device)
     model = EPGModel(encoder, decoder).to(device)
     
-    from model_v2 import TagProcessor
     tag_processor = TagProcessor("tags.txt")
 
     # Load pre-trained encoder
