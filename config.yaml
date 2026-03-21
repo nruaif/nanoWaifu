@@ -8,10 +8,11 @@ model:
 
 training:
   image_size: 256
-  batch_size: 64 # Per-GPU batch size
+  batch_size: 32 # Per-GPU batch size
   learning_rate: 6.0e-3 # Stage 1 LR (scaled to batch size in paper)
   weight_decay: 0.05
   max_train_steps: 600000
+  compile: true
   ema_beta: 0.99
   log_every_steps: 100
   save_ckpt_every_steps: 5000

@@ -5,15 +5,25 @@ from siglip import SigLIPLoss
 import matplotlib.pyplot as plt
 import os
 import math
+import numpy as np
 
 def log_confusion_matrix_local(sim_matrix, path, batch_size):
-    """Saves the mean cosine similarity between view groups (3x3 reduced matrix) locally."""
+    """Saves the mean Positive vs Negative similarity matrix locally."""
     k = sim_matrix.shape[0] // batch_size
     reshaped = sim_matrix.view(k, batch_size, k, batch_size)
-    mean_sim = reshaped.mean(dim=(1, 3)).detach().cpu().numpy()
     
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(mean_sim, cmap='viridis', vmin=-1, vmax=1)
+    pos_sim = np.zeros((k, k))
+    neg_sim = np.zeros((k, k))
+    
+    for i in range(k):
+        for j in range(k):
+            block = reshaped[i, :, j, :]
+            pos_sim[i, j] = block.diagonal().mean().item()
+            mask = ~torch.eye(batch_size, dtype=torch.bool, device=block.device)
+            neg_sim[i, j] = block[mask].mean().item()
+    
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(pos_sim, cmap='viridis', vmin=-1, vmax=1)
     plt.colorbar(im)
     
     views = ["Aug", "Noise", "Label"]
@@ -22,12 +32,14 @@ def log_confusion_matrix_local(sim_matrix, path, batch_size):
     
     for i in range(k):
         for j in range(k):
-            ax.text(j, i, f"{mean_sim[i, j]:.2f}", ha="center", va="center", color="w")
+            color = "w" if pos_sim[i, j] < 0.5 else "k"
+            ax.text(j, i, f"Pos: {pos_sim[i, j]:.2f}\nNeg: {neg_sim[i, j]:.2f}", 
+                    ha="center", va="center", color=color, fontsize=9, fontweight='bold')
             
-    ax.set_title("Mean Group Cosine Similarity (Test)")
+    ax.set_title("Group Alignment Contrast: Pos vs Neg (Test)")
     plt.savefig(path)
     plt.close(fig)
-    print(f"Reduced similarity matrix saved to {path}")
+    print(f"Contrast similarity matrix saved to {path}")
 
 def test_stage1_logic(image_size=64, batch_size=4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,16 +56,15 @@ def test_stage1_logic(image_size=64, batch_size=4):
     y_indices = torch.randint(0, num_classes, (batch_size * 3,), device=device)
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
     
-    # Forward passes (3 views)
+    # Forward passes
     y_feat = projector(encoder.get_y_feat(y_indices, y_offsets))
     q_im = projector(encoder(x, t_scaled, y_indices, y_offsets)[:, 0])
     q_noise = projector(encoder(x + 0.5 * torch.randn_like(x), t_scaled, y_indices, y_offsets)[:, 0])
     
     loss, _, sim_matrix = siglip([q_im, q_noise, y_feat], [q_im, q_noise, y_feat])
-    print(f"Loss: {loss.item():.4f}, Similarity Matrix Shape: {sim_matrix.shape}")
     
     os.makedirs("test_outputs", exist_ok=True)
-    log_confusion_matrix_local(sim_matrix, f"test_outputs/mean_sim_cosine_{image_size}.png", batch_size)
+    log_confusion_matrix_local(sim_matrix, f"test_outputs/alignment_contrast_{image_size}.png", batch_size)
 
 if __name__ == "__main__":
     test_stage1_logic(image_size=64)

@@ -72,27 +72,36 @@ def update_ema(target_model, source_model, beta):
             target_param.data.copy_(beta * target_param.data + (1 - beta) * source_param.data)
 
 def log_confusion_matrix(sim_matrix, step, batch_size):
-    """Logs the mean similarity between view groups (3x3 reduced matrix)."""
+    """Logs Positive vs Negative similarity between view groups to detect collapse."""
     k = sim_matrix.shape[0] // batch_size
     reshaped = sim_matrix.view(k, batch_size, k, batch_size)
-    mean_sim = reshaped.mean(dim=(1, 3)).detach().cpu().numpy()
     
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(mean_sim, cmap='viridis', vmin=-1, vmax=1)
-    plt.colorbar(im)
-    
-    views = ["Aug", "Noise", "Label"]
-    ax.set_xticks(range(k))
-    ax.set_xticklabels(views)
-    ax.set_yticks(range(k))
-    ax.set_yticklabels(views)
+    pos_sim = np.zeros((k, k))
+    neg_sim = np.zeros((k, k))
     
     for i in range(k):
         for j in range(k):
-            ax.text(j, i, f"{mean_sim[i, j]:.2f}", ha="center", va="center", color="w")
+            block = reshaped[i, :, j, :] # (B, B)
+            pos_sim[i, j] = block.diagonal().mean().item()
+            mask = ~torch.eye(batch_size, dtype=torch.bool, device=block.device)
+            neg_sim[i, j] = block[mask].mean().item()
+    
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(pos_sim, cmap='viridis', vmin=-1, vmax=1)
+    plt.colorbar(im)
+    
+    views = ["Aug", "Noise", "Label"]
+    ax.set_xticks(range(k)); ax.set_xticklabels(views)
+    ax.set_yticks(range(k)); ax.set_yticklabels(views)
+    
+    for i in range(k):
+        for j in range(k):
+            color = "w" if pos_sim[i, j] < 0.5 else "k"
+            ax.text(j, i, f"Pos: {pos_sim[i, j]:.2f}\nNeg: {neg_sim[i, j]:.2f}", 
+                    ha="center", va="center", color=color, fontsize=9, fontweight='bold')
             
-    ax.set_title(f"Mean Group Cosine Similarity (Step {step})")
-    wandb.log({"val/mean_similarity": wandb.Image(fig)}, step=step)
+    ax.set_title(f"Group Alignment: Positive vs Negative (Step {step})")
+    wandb.log({"val/alignment_contrast": wandb.Image(fig)}, step=step)
     plt.close(fig)
 
 class EPGStage1Trainer:
@@ -115,7 +124,12 @@ class EPGStage1Trainer:
             for param in m.parameters(): param.requires_grad = False
         
         self.optimizer = torch.optim.AdamW(list(self.encoder.parameters()) + list(self.projector.parameters()), lr=config['training']['learning_rate'], weight_decay=config['training'].get('weight_decay', 0.05))
+        
+        # Compile only the loss module
         self.siglip = SigLIPLoss().to(device)
+        if config['training'].get('compile', False):
+            self.siglip = torch.compile(self.siglip)
+            
         self.aug = transforms.Compose([
             transforms.RandomResizedCrop(config['training']['image_size'], scale=(0.2, 1.0)),
             transforms.RandomHorizontalFlip(),
