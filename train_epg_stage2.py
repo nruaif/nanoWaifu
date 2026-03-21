@@ -87,6 +87,7 @@ def train(config_path):
         images, prompts, _ = batch
         images = images.to(device)
         y_indices, y_offsets, _ = tag_processor.process_prompts(prompts, device)
+        avg_tags = len(y_indices) / images.shape[0]
         
         # Diffusion / Flow Matching Training (x0 prediction)
         t = torch.rand((images.shape[0],), device=device)
@@ -111,8 +112,8 @@ def train(config_path):
         if rank == 0:
             pbar.update(1)
             if global_step % config['training'].get('log_every_steps', 100) == 0:
-                wandb.log({"loss": loss.item()}, step=global_step)
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                wandb.log({"loss": loss.item(), "avg_tags": avg_tags}, step=global_step)
+                pbar.set_postfix({"loss": f"{loss.item():.4f}", "tags": f"{avg_tags:.1f}"})
             if global_step % config['training'].get('save_image_every_steps', 5000) == 0:
                 model_to_sample = model.module if hasattr(model, 'module') else model
                 samples = model_to_sample.sample_flow(image_size=config['training']['image_size'], batch_size=16, device=device, y_indices=y_indices[:16], y_offsets=y_offsets[:16])

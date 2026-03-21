@@ -14,6 +14,7 @@ training:
   max_train_steps: 600000
   compile: true
   grad_clip: 1.0
+  gradient_checkpointing: true
   ema_beta: 0.99
   log_every_steps: 1
   save_ckpt_every_steps: 1000
@@ -27,3 +28,4 @@ data:
   webdataset_url: "train/{00001..00006}.tar"
 
 stage1_ckpt: "outputs/epg_stage1_step_600000.pth"
+

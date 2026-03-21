@@ -18,7 +18,7 @@ from torchvision import transforms
 from siglip import SupConLoss
 import matplotlib.pyplot as plt
 import random
-
+torch.autograd.set_detect_anomaly(True)
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -161,11 +161,15 @@ def train(config_path):
         except StopIteration: batch = next(iter(dataloader))
         images, prompts, _ = batch
         y_indices, y_offsets, y_labels = tag_processor.process_prompts(prompts.to(device) if hasattr(prompts, 'to') else prompts, device)
+        avg_tags = len(y_indices) / images.shape[0]
         metrics, sim_matrix = trainer.train_step(images.to(device), y_indices, y_offsets, y_labels, global_step, max_steps)
+        metrics["avg_tags"] = avg_tags
         global_step += 1
         if rank == 0:
             pbar.update(1)
-            if global_step % config['training'].get('log_every_steps', 100) == 0: wandb.log(metrics, step=global_step); pbar.set_postfix({"loss": f"{metrics['loss']:.4f}"})
+            if global_step % config['training'].get('log_every_steps', 100) == 0: 
+                wandb.log(metrics, step=global_step)
+                pbar.set_postfix({"loss": f"{metrics['loss']:.4f}", "tags": f"{avg_tags:.1f}"})
             if global_step % config['training'].get('save_ckpt_every_steps', 5000) == 0:
                 log_confusion_matrix(sim_matrix, global_step, images.shape[0])
                 torch.save({"encoder_state_dict": trainer.encoder.state_dict(), "projector_state_dict": trainer.projector.state_dict(), "global_step": global_step}, os.path.join(config['training']['output_dir'], f"epg_stage1_step_{global_step}.pth"))
