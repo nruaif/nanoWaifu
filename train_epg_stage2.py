@@ -51,6 +51,11 @@ def train(config_path):
     
     encoder = EPGEncoder(embed_dim=embed_dim, depth=depth, num_heads=num_heads, num_classes=num_classes).to(device)
     decoder = EPGDecoder(embed_dim=embed_dim, depth=depth, num_heads=num_heads).to(device)
+    
+    if config['training'].get('gradient_checkpointing', False):
+        encoder.gradient_checkpointing = True
+        decoder.gradient_checkpointing = True
+        
     model = EPGModel(encoder, decoder).to(device)
     
     tag_processor = TagProcessor("tags.txt")

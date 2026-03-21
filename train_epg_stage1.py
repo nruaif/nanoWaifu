@@ -85,6 +85,8 @@ class EPGStage1Trainer:
         self.num_classes = config['model'].get('num_classes', 12476)
         
         self.encoder = EPGEncoder(embed_dim=self.embed_dim, depth=config['model'].get('depth', 12), num_heads=config['model'].get('num_heads', 12), num_classes=self.num_classes).to(device)
+        if config['training'].get('gradient_checkpointing', False):
+            self.encoder.gradient_checkpointing = True
         self.projector = EPGProjector(embed_dim=self.embed_dim, proj_dim=self.proj_dim).to(device)
         
         self.encoder_ema = copy.deepcopy(self.encoder).to(device)

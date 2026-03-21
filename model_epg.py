@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import math
 import numpy as np
 import os
@@ -181,6 +182,8 @@ class EPGEncoder(nn.Module):
         self.norm = RMSNorm(embed_dim, elementwise_affine=False)
         self.t_embedder = TimestepEmbedder(embed_dim)
         
+        self.gradient_checkpointing = False
+        
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.reg_tokens, std=0.02)
 
@@ -205,7 +208,11 @@ class EPGEncoder(nn.Module):
         reg_tokens = self.reg_tokens.expand(B, -1, -1)
         x = torch.cat((cls_tokens, t_token, y_token, reg_tokens, x), dim=1)
         
-        for block in self.blocks: x = block(x, h, w)
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(block, x, h, w, use_reentrant=False)
+            else:
+                x = block(x, h, w)
         return self.norm(x)
 
 class EPGProjector(nn.Module):
@@ -232,11 +239,16 @@ class EPGDecoder(nn.Module):
         self.blocks = nn.ModuleList([ViTBlock(embed_dim, num_heads, num_special_tokens=7) for _ in range(depth)])
         self.norm = RMSNorm(embed_dim, elementwise_affine=False)
         self.pred_head = nn.Linear(embed_dim, out_channels * patch_size * patch_size)
+        
+        self.gradient_checkpointing = False
 
     def forward(self, x, h, w, encoder_features=None):
         for i, block in enumerate(self.blocks):
             if encoder_features is not None: x = x + encoder_features[i]
-            x = block(x, h, w)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(block, x, h, w, use_reentrant=False)
+            else:
+                x = block(x, h, w)
         return self.norm(x)
 
 class EPGModel(nn.Module):
