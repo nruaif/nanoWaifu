@@ -155,13 +155,17 @@ def train(config_path):
             checkpoint = torch.load(resume_path, map_location=device)
             model_to_load = model.module if hasattr(model, 'module') else model
 
-            # Filter mismatching channels if transitioning to VAE or vice versa
+            # Filter mismatching shapes (e.g., when transitioning to VAE or changing dimensions)
             state_dict = checkpoint["model_state_dict"]
             model_state = model_to_load.state_dict()
-            for k in ["conv_in.weight", "conv_in.bias", "conv_out.weight", "conv_out.bias"]:
-                if k in state_dict and state_dict[k].shape != model_state[k].shape:
-                    print(f">>> Channel Mismatch: Removing {k} from state_dict and re-initializing.")
-                    del state_dict[k]
+            keys_to_delete = []
+            for k in state_dict.keys():
+                if k in model_state and state_dict[k].shape != model_state[k].shape:
+                    print(f">>> Shape Mismatch: Removing {k} from state_dict due to shape mismatch. Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
+                    keys_to_delete.append(k)
+            
+            for k in keys_to_delete:
+                del state_dict[k]
 
             model_to_load.load_state_dict(state_dict, strict=False)
             global_step = checkpoint["global_step"]

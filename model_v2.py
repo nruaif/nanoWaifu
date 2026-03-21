@@ -4,8 +4,30 @@ import torch.nn.functional as F
 import math
 import random
 
+
+class ProjectedAdaLN(nn.Module):
+    def __init__(self, dim, cond_dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.proj = nn.Linear(cond_dim, 2 * dim)
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, c):
+        scale_shift = self.proj(c)
+        scale, shift = scale_shift.chunk(2, dim=1)
+        scale, shift = scale.tanh(), shift.tanh()
+
+        # Dynamically reshape for broadcasting depending on if x is 3D or 4D
+        for _ in range(x.dim() - 2):
+            scale = scale.unsqueeze(1)
+            shift = shift.unsqueeze(1)
+
+        x_norm = F.layer_norm(x, (x.shape[-1],), eps=self.eps)
+        return x_norm * (1 + scale) + shift
+
 def gelu_act(x):
-    """ReLU^2 activation function."""
     return F.gelu(x, approximate='tanh')
 
 class GRN(nn.Module):
@@ -20,53 +42,47 @@ class GRN(nn.Module):
         nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
         return self.gamma * (x * nx) + self.beta + x
 
+
 class FCDMBlock(nn.Module):
-    """Standard ConvNeXt-like block for FCDM with AdaLN and ReLU^2."""
     def __init__(self, dim, cond_dim, r=3):
         super().__init__()
-        # 7x7 Depthwise convolution
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        
-        # 1x1 Pointwise convolutions with expansion ratio r
+
+        # Replace standard LayerNorm with your new Projected module
+        self.norm = ProjectedAdaLN(dim, cond_dim)
+
         self.pwconv1 = nn.Conv2d(dim, dim * r, kernel_size=1)
         self.grn = GRN(dim * r)
         self.pwconv2 = nn.Conv2d(dim * r, dim, kernel_size=1)
 
-        # MLP for AdaLN modulation (shift, scale, gate/alpha)
-        self.adaLN_modulation = nn.Sequential(
+        # We still need the gate/alpha for the residual connection.
+        # This is now just 1 * dim instead of 3 * dim
+        self.adaLN_gate = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(cond_dim, 3 * dim)
+            nn.Linear(cond_dim, dim)
         )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_gate[-1].weight)
+        nn.init.zeros_(self.adaLN_gate[-1].bias)
 
     def forward(self, x, c):
         shortcut = x
         x = self.dwconv(x)
-        
-        # LayerNorm expects channel last
+
+        # Apply the projected norm
         x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
+        x = self.norm(x, c)  # Pass the combined condition 'c' here
         x = x.permute(0, 3, 1, 2)
 
-        # AdaLN Shift and Scale
-        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=1)
-        # Apply Tanh Clamping for stability
-        shift, scale, gate = shift.tanh(), scale.tanh(), gate.tanh()
-        shift, scale, gate = shift[..., None, None], scale[..., None, None], gate[..., None, None]
-
-        x = x * scale + shift
-        
         # Inverted bottleneck
         x = self.pwconv1(x)
-        x = gelu_act(x) # ReLU^2
+        x = gelu_act(x)
         x = self.grn(x)
         x = self.pwconv2(x)
-        
-        # Gate/Alpha scaling and skip connection
-        return shortcut + x * gate
 
+        # Get the gate parameter (alpha)
+        gate = self.adaLN_gate(c).tanh()[..., None, None]
+
+        return shortcut + x * gate
 class ViTBlock(nn.Module):
     """Vision Transformer block with AdaLN and ReLU^2."""
     def __init__(self, dim, cond_dim, r=4, head_dim=64):
