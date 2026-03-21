@@ -268,19 +268,23 @@ class EPGStage1Trainer:
             t0 = torch.zeros(B, device=self.device)
 
             # ---- Noise schedule (EDM-style) ----------------------------------
-            N = 1280
-            n      = torch.randint(1, N, (B,), device=self.device)
-            tn     = n.float() / N
-            tn_1   = (n - 1).float() / N
-            tn_scaled   = 1000 * 0.25 * torch.log(tn.clamp(min=1e-8))
-            tn_1_scaled = 1000 * 0.25 * torch.log(tn_1.clamp(min=1e-8))
+            N = 1000
+            n = torch.randint(1, N, (B,), device=self.device)
+            tn = n.float() / N
+            tn_1 = (n - 1).float() / N
 
-            epsilon    = torch.randn_like(x)
-            sigma_data = 0.5
-            xtn   = (x + tn.view(-1, 1, 1, 1)   * epsilon) * \
-                    (1.0 / torch.sqrt(tn  **2 + sigma_data**2)).view(-1, 1, 1, 1)
-            xtn_1 = (x + tn_1.view(-1, 1, 1, 1) * epsilon) * \
-                    (1.0 / torch.sqrt(tn_1**2 + sigma_data**2)).view(-1, 1, 1, 1)
+            tn_scaled = tn * 1000.0
+            tn_1_scaled = tn_1 * 1000.0
+
+            epsilon = torch.randn_like(x)
+
+            # Reshape for broadcasting
+            t_view = tn.view(-1, 1, 1, 1)
+            t_1_view = tn_1.view(-1, 1, 1, 1)
+
+            # Optimal Transport Flow Matching linear interpolation
+            xtn = (1.0 - t_view) * x + t_view * epsilon
+            xtn_1 = (1.0 - t_1_view) * x + t_1_view * epsilon
 
             # ---- Online forward passes --------------------------------------
             feat_im1 = self.encoder(y1,  t0,         y_indices, y_offsets)
