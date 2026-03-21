@@ -37,8 +37,9 @@ def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
     if rank != 0: builtins.print = lambda *args, **kwargs: None
 
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    with open(config_path, 'r') as f: config = yaml.safe_load(f)
+    os.makedirs(config['training']['output_dir'], exist_ok=True)
+
 
     dataloader = WDSLoader(
         url=config['data']['webdataset_url'],

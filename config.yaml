@@ -1,31 +1,29 @@
-training:
-  batch_size: 16 # Reduced physical batch size
-  grad_accum_steps: 8 # Effective batch size = 16 * 8 = 128
-  learning_rate: 1.0e-4
-  num_epochs: 100
-  max_train_steps: 1000000
-  gradient_checkpointing: true
-  compile: true # Use torch.compile for faster training
-  log_every_steps: 10
-
-  save_image_every_steps: 2000
-  image_size: 256
-  num_workers: 4 # Set to 0 for Windows compatibility, increase on Linux
-  class_dropout_prob: 0.1
-  cfg_scale: 1.4
-  output_dir: "outputs"
-  wandb_project: "nanoWaifu-C2I"
-  resume_from: "outputs/"
-  max_checkpoints: 3
-
 model:
-  use_v2_model: true
-  use_vae: true # Use Flux2TinyAutoEncoder
-  fcdm_dim: 512
-  fcdm_depth: 3
-  in_channels: 3 # RGB (overwritten to 32 if use_vae is true)
-  patch_size: 8 # PixelUnshuffle factor
+  embed_dim: 1024
+  depth: 12
+  num_heads: 12
+  num_classes: 12476
+  patch_size: 16
+  proj_dim: 256 # SigLIP projection dimension
+
+training:
+  image_size: 256
+  batch_size: 16 # Per-GPU batch size
+  learning_rate: 6.0e-4 # Stage 1 LR (scaled to batch size in paper)
+  weight_decay: 0.05
+  max_train_steps: 600000
+  ema_beta: 0.99
+  log_every_steps: 100
+  save_ckpt_every_steps: 5000
+  save_image_every_steps: 5000 # For Stage 2 validation
+  class_dropout_prob: 0.1 # For Stage 2 CFG
+  num_workers: 4
+  output_dir: "outputs"
+  wandb_project: "EPG-nanoWaifu"
 
 data:
-  webdataset_url: '/root/data/train/00{001..019}.tar'
-  use_advanced_captions: true  # Enable advanced caption processing with tag dropping
+  # Shards downloaded by setup.py
+  webdataset_url: "train/{00001..00006}.tar"
+
+# Stage 2 specific: Path to Stage 1 checkpoint
+stage1_ckpt: "outputs/epg_stage1_step_600000.pth"
