@@ -17,6 +17,38 @@ from model_epg import EPGEncoder, EPGProjector, EPGModel
 from torchvision import transforms
 from siglip import SigLIPLoss
 import matplotlib.pyplot as plt
+import random
+
+class TagProcessor:
+    def __init__(self, tags_file):
+        with open(tags_file, 'r', encoding='utf-8') as f:
+            self.tags = [line.strip() for line in f if line.strip()]
+        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
+        self.num_classes = len(self.tags)
+
+    def process_prompts(self, prompts, device, dropout_prob=0.0):
+        indices = []
+        offsets = [0]
+        for p in prompts:
+            if random.random() < dropout_prob:
+                indices.append(self.num_classes)
+            else:
+                tags = p.split()
+                count = 0
+                for t in tags:
+                    if t in self.tag_to_idx:
+                        indices.append(self.tag_to_idx[t])
+                        count += 1
+                if count == 0:
+                    indices.append(self.num_classes)
+            offsets.append(len(indices))
+
+        indices = torch.tensor(indices, dtype=torch.long, device=device)
+        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
+        return indices, offsets
+
+
+
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -129,7 +161,6 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
     dataloader = WDSLoader(url=config['data']['webdataset_url'], csv_path=config['data'].get('csv_path'), image_size=config['training']['image_size'], batch_size=config['training']['batch_size'], num_workers=config['training']['num_workers']).make_loader()
     trainer = EPGStage1Trainer(config, device, rank)
-    from model_v2 import TagProcessor
     tag_processor = TagProcessor("tags.txt")
     max_steps, global_step = config['training'].get('max_train_steps', 600000), 0
     if rank == 0: wandb.init(project="EPG-Stage1-Unified-SigLIP", config=config); pbar = tqdm(range(max_steps), desc="EPG Stage 1")
