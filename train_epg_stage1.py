@@ -13,7 +13,7 @@ import wandb
 import builtins
 import copy
 from dataset import WDSLoader
-from model_epg import EPGEncoder, EPGProjector, EPGModel
+from model_epg import EPGEncoder, EPGProjector, EPGModel, TagProcessor
 from torchvision import transforms
 from siglip import SupConLoss
 import matplotlib.pyplot as plt

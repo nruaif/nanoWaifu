@@ -63,7 +63,8 @@ class TagProcessor:
         # Character labels for Supervised Contrastive Learning (SupCon)
         if os.path.exists(characters_file):
             import pandas as pd
-            df = pd.read_csv(characters_file)
+            # Using latin-1 encoding to match dataset.py and avoid UnicodeDecodeErrors
+            df = pd.read_csv(characters_file, encoding='latin-1')
             self.character_set = set(df['character'].astype(str).tolist())
             self.char_to_id = {str(c): i for i, c in enumerate(df['character'].tolist())}
         else:
