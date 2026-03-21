@@ -18,6 +18,7 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import bitsandbytes as bnb
 
+
 # Dynamic model import
 def get_model_and_sampler(config):
     if config['model'].get('use_v2_model', False):
@@ -27,6 +28,7 @@ def get_model_and_sampler(config):
         from model import FCDM as ModelClass, TagProcessor, sample_flow as sample_fn
         print(">>> Training V1 Model (Baseline FCDM)")
     return ModelClass, TagProcessor, sample_fn
+
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -40,9 +42,11 @@ def setup_ddp():
     else:
         return False, 0, 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
+
 
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0: return
@@ -56,6 +60,7 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
                 print(f"Removed old checkpoint: {ckpt}")
             except OSError as e:
                 print(f"Error removing {ckpt}: {e}")
+
 
 def save_checkpoint(model, optimizer, rank, output_dir, step, config, fixed_prompts=None, fixed_noise=None):
     if rank != 0: return
@@ -77,6 +82,7 @@ def save_checkpoint(model, optimizer, rank, output_dir, step, config, fixed_prom
     cleanup_checkpoints(output_dir, config.get('max_checkpoints', 3), rank)
     print(f"Checkpoint saved: {ckpt_path}")
 
+
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
 
@@ -90,6 +96,7 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
+
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -97,7 +104,7 @@ def train(config_path):
 
     # Instantiate model and helpers
     ModelClass, TagProcessor, sample_fn = get_model_and_sampler(config)
-    
+
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
 
@@ -161,9 +168,10 @@ def train(config_path):
             keys_to_delete = []
             for k in state_dict.keys():
                 if k in model_state and state_dict[k].shape != model_state[k].shape:
-                    print(f">>> Shape Mismatch: Removing {k} from state_dict due to shape mismatch. Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
+                    print(
+                        f">>> Shape Mismatch: Removing {k} from state_dict due to shape mismatch. Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
                     keys_to_delete.append(k)
-            
+
             for k in keys_to_delete:
                 del state_dict[k]
 
@@ -182,15 +190,15 @@ def train(config_path):
         model = torch.compile(model)
 
     optimizer = bnb.optim.AdamW8bit(
-        model.parameters(), 
+        model.parameters(),
         lr=config['training']['learning_rate'],
-        weight_decay=0.1, 
+        weight_decay=0.1,
         betas=(0.9, 0.95)
     )
 
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
-        pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)), 
+        pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
 
@@ -218,7 +226,7 @@ def train(config_path):
 
             # VAE Encoding if enabled
             if use_vae:
-                with torch.inference_mode():
+                with torch.no_grad():
                     # Flux Tiny VAE takes images in [-1, 1]
                     v_images = images * 2.0 - 1.0
                     v_images = v_images.to(dtype=torch.bfloat16)
@@ -271,7 +279,7 @@ def train(config_path):
                 model.eval()
                 with torch.no_grad():
                     samples = sample_fn(
-                        model.module if hasattr(model, 'module') else model, 
+                        model.module if hasattr(model, 'module') else model,
                         tag_processor, inputs.shape[-1], 16, fixed_prompts, device,
                         cfg_scale=config['training'].get('cfg_scale', 1.4),
                         noise=fixed_noise
@@ -282,7 +290,7 @@ def train(config_path):
                         latents = F.pixel_unshuffle(samples, 2).to(dtype=torch.bfloat16)
                         # Inverse Scale 0.62, Shift 0
                         latents = latents / 0.62
-                        with torch.inference_mode():
+                        with torch.no_grad():
                             recon = tiny_vae.decode(latents, return_dict=False)
                             samples = recon.clamp(-1, 1) / 2.0 + 0.5
                             samples = samples.to(dtype=torch.float32)
@@ -296,6 +304,7 @@ def train(config_path):
                         global_step, config, fixed_prompts, fixed_noise)
         wandb.finish()
     cleanup_ddp()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

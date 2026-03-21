@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import random
-
-
 class ProjectedAdaLN(nn.Module):
     def __init__(self, dim, cond_dim, eps=1e-6):
         super().__init__()
