@@ -81,7 +81,7 @@ def train(config_path):
             
         images, prompts, _ = batch
         images = images.to(device)
-        y_indices, y_offsets = tag_processor.process_prompts(prompts, device)
+        y_indices, y_offsets, _ = tag_processor.process_prompts(prompts, device)
         
         # Diffusion / Flow Matching Training (x0 prediction)
         t = torch.rand((images.shape[0],), device=device)

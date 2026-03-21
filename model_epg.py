@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
+import os
+import random
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6, elementwise_affine=False):
@@ -52,26 +54,56 @@ class QKNormAttention(nn.Module):
         return x
 
 class TagProcessor:
-    def __init__(self, tags_file):
-        with open(tags_file, "r", encoding="utf-8") as f:
+    def __init__(self, tags_file, characters_file="characters.csv"):
+        with open(tags_file, 'r', encoding='utf-8') as f:
             self.tags = [line.strip() for line in f if line.strip()]
-        self.tag_to_id = {tag: i for i, tag in enumerate(self.tags)}
-        self.num_tags = len(self.tags)
+        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
+        self.num_classes = len(self.tags)
+        
+        # Character labels for Supervised Contrastive Learning (SupCon)
+        if os.path.exists(characters_file):
+            import pandas as pd
+            df = pd.read_csv(characters_file)
+            self.character_set = set(df['character'].astype(str).tolist())
+            self.char_to_id = {str(c): i for i, c in enumerate(df['character'].tolist())}
+        else:
+            self.character_set = set()
+            self.char_to_id = {}
 
     def process_prompts(self, prompts, device, dropout_prob=0.0):
-        all_indices = []
-        all_offsets = [0]
-        for prompt in prompts:
-            tags = prompt.split() if isinstance(prompt, str) else []
-            indices = []
-            if np.random.random() >= dropout_prob:
-                for tag in tags:
-                    if tag in self.tag_to_id:
-                        indices.append(self.tag_to_id[tag])
-            if not indices: indices = [self.num_tags]
-            all_indices.extend(indices)
-            all_offsets.append(all_offsets[-1] + len(indices))
-        return torch.tensor(all_indices, device=device), torch.tensor(all_offsets[:-1], device=device)
+        indices = []
+        offsets = [0]
+        labels = []
+        for p in prompts:
+            tags = p.split() if isinstance(p, str) else []
+            
+            # Extract tags for embedding
+            if random.random() < dropout_prob:
+                indices.append(self.num_classes)
+            else:
+                count = 0
+                for t in tags:
+                    if t in self.tag_to_idx:
+                        indices.append(self.tag_to_idx[t])
+                        count += 1
+                if count == 0:
+                    indices.append(self.num_classes)
+            offsets.append(len(indices))
+            
+            # Extract label for SupCon (supervised part)
+            found_char = False
+            for t in tags:
+                if t in self.character_set:
+                    labels.append(self.char_to_id[t])
+                    found_char = True
+                    break
+            if not found_char:
+                labels.append(-1)
+
+        indices = torch.tensor(indices, dtype=torch.long, device=device)
+        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
+        labels = torch.tensor(labels, dtype=torch.long, device=device)
+        return indices, offsets, labels
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_dim):
