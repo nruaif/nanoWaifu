@@ -1,31 +1,32 @@
 training:
-  batch_size: 64 # Reduced physical batch size
-  grad_accum_steps: 1 # Effective batch size = 16 * 8 = 128
+  batch_size: 64
+  grad_accum_steps: 1
   learning_rate: 1.0e-4
   num_epochs: 100
   max_train_steps: 1000000
   gradient_checkpointing: true
-  compile: false # Use torch.compile for faster training
+  compile: false
   log_every_steps: 1
 
   save_image_every_steps: 2000
   image_size: 256
-  num_workers: 8 # Set to 0 for Windows compatibility, increase on Linux
+  num_workers: 8
   class_dropout_prob: 0.1
   cfg_scale: 1.4
-  output_dir: "outputs"
+  output_dir: "outputs_dit"
   wandb_project: "nanoWaifu-C2I"
-  resume_from: "outputs2/"
+  resume_from: "outputs_dit/"
   max_checkpoints: 3
 
 model:
-  use_v2_model: true
-  use_vae: true # Use Flux2TinyAutoEncoder
-  fcdm_dim: 512
-  fcdm_depth: 3
-  in_channels: 3 # RGB (overwritten to 32 if use_vae is true)
-  patch_size: 1 # PixelUnshuffle factor
+  type: "dit"      # Use SkipDiT
+  use_vae: true    # Recommended for 256x256
+  fcdm_dim: 768    # Hidden dimension (Transformer)
+  fcdm_depth: 12   # Number of layers
+  num_heads: 12    # Number of attention heads
+  in_channels: 3   # RGB (overwritten to 32 by VAE)
+  patch_size: 1    # Factor for initial projection
 
 data:
   webdataset_url: 'train/00{001..006}.tar'
-  use_advanced_captions: true  # Enable advanced caption processing with tag dropping
+  use_advanced_captions: true

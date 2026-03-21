@@ -140,15 +140,31 @@ def train(config_path):
         in_channels = 32
         print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    model = ModelClass(
-        in_channels=in_channels,
-        base_channels=config['model'].get('fcdm_dim', 128),
-        num_blocks=config['model'].get('fcdm_depth', 2),
-        num_classes=num_classes,
-        patch_size=config['model'].get('patch_size', 16),
-        use_t_cond=True,
-        use_checkpoint=config['training'].get('gradient_checkpointing', False)
-    ).to(device, memory_format=torch.channels_last)
+    # Instantiate model
+    if model_type == 'dit':
+        # Calculate latent size for RoPE (Image 256 -> VAE 16 -> Shuffle 32)
+        # We assume 1/8 total downsampling relative to input if using VAE + Shuffle
+        latent_size = (image_size // 16) * 2 if use_vae else image_size // config['model'].get('patch_size', 16)
+        
+        model = ModelClass(
+            in_channels=in_channels,
+            dim=config['model'].get('fcdm_dim', 768),
+            depth=config['model'].get('fcdm_depth', 12),
+            num_heads=config['model'].get('num_heads', 12),
+            num_classes=num_classes,
+            latent_size=latent_size,
+            use_checkpoint=config['training'].get('gradient_checkpointing', False)
+        ).to(device, memory_format=torch.channels_last)
+    else:
+        model = ModelClass(
+            in_channels=in_channels,
+            base_channels=config['model'].get('fcdm_dim', 128),
+            num_blocks=config['model'].get('fcdm_depth', 2),
+            num_classes=num_classes,
+            patch_size=config['model'].get('patch_size', 16),
+            use_t_cond=True,
+            use_checkpoint=config['training'].get('gradient_checkpointing', False)
+        ).to(device, memory_format=torch.channels_last)
 
     # Resume Logic
     global_step = 0
