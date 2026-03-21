@@ -135,7 +135,7 @@ class EPGStage1Trainer:
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
             transforms.RandomGrayscale(p=0.2),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
     def train_step(self, x, y_indices, y_offsets, step, max_steps):
