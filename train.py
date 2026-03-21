@@ -21,7 +21,14 @@ import bitsandbytes as bnb
 
 # Dynamic model import
 def get_model_and_sampler(config):
-    if config['model'].get('use_v2_model', False):
+    model_type = config['model'].get('type', 'v2')
+    
+    if model_type == 'dit':
+        from model_dit import DiTSkip as ModelClass, sample_flow as sample_fn
+        # We'll use the TagProcessor from model_v2 as it's compatible
+        from model_v2 import TagProcessor
+        print(">>> Training DiT-Skip Model (RMSNorm + QKNorm + Token Skip)")
+    elif config['model'].get('use_v2_model', False) or model_type == 'v2':
         from model_v2 import FCDMV2 as ModelClass, TagProcessor, sample_flow as sample_fn
         print(">>> Training V2 Model (CSP + Hybrid ViT + ReLU^2 + Gated Skip)")
     else:
