@@ -15,8 +15,8 @@ training:
   compile: true
   ema_beta: 0.99
   log_every_steps: 100
-  save_ckpt_every_steps: 5000
-  save_image_every_steps: 5000 # For Stage 2 validation
+  save_ckpt_every_steps: 1000
+  save_image_every_steps: 1000 # For Stage 2 validation
   class_dropout_prob: 0.1 # For Stage 2 CFG
   num_workers: 4
   output_dir: "outputs"
