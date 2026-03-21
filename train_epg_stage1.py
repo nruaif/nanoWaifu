@@ -15,25 +15,38 @@ import copy
 from dataset import WDSLoader
 from model_epg import EPGEncoder, EPGProjector, EPGModel
 from torchvision import transforms
-from siglip import SigLIPLoss
+from siglip import SupConLoss
 import matplotlib.pyplot as plt
 import random
 
 class TagProcessor:
-    def __init__(self, tags_file):
+    def __init__(self, tags_file, characters_file="characters.csv"):
         with open(tags_file, 'r', encoding='utf-8') as f:
             self.tags = [line.strip() for line in f if line.strip()]
         self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
         self.num_classes = len(self.tags)
+        
+        # Character labels for SupCon
+        if os.path.exists(characters_file):
+            import pandas as pd
+            df = pd.read_csv(characters_file)
+            self.character_set = set(df['character'].tolist())
+            self.char_to_id = {str(c): i for i, c in enumerate(df['character'].tolist())}
+        else:
+            self.character_set = set()
+            self.char_to_id = {}
 
     def process_prompts(self, prompts, device, dropout_prob=0.0):
         indices = []
         offsets = [0]
+        labels = []
         for p in prompts:
+            tags = p.split() if isinstance(p, str) else []
+            
+            # Extract tags for embedding
             if random.random() < dropout_prob:
                 indices.append(self.num_classes)
             else:
-                tags = p.split()
                 count = 0
                 for t in tags:
                     if t in self.tag_to_idx:
@@ -42,10 +55,21 @@ class TagProcessor:
                 if count == 0:
                     indices.append(self.num_classes)
             offsets.append(len(indices))
+            
+            # Extract label for SupCon (supervised part)
+            found_char = False
+            for t in tags:
+                if t in self.character_set:
+                    labels.append(self.char_to_id[t])
+                    found_char = True
+                    break
+            if not found_char:
+                labels.append(-1)
 
         indices = torch.tensor(indices, dtype=torch.long, device=device)
         offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
-        return indices, offsets
+        labels = torch.tensor(labels, dtype=torch.long, device=device)
+        return indices, offsets, labels
 
 
 
@@ -126,9 +150,9 @@ class EPGStage1Trainer:
         self.optimizer = torch.optim.AdamW(list(self.encoder.parameters()) + list(self.projector.parameters()), lr=config['training']['learning_rate'], weight_decay=config['training'].get('weight_decay', 0.05))
         
         # Compile only the loss module
-        self.siglip = SigLIPLoss().to(device)
+        self.supcon = SupConLoss().to(device)
         if config['training'].get('compile', False):
-            self.siglip = torch.compile(self.siglip)
+            self.supcon = torch.compile(self.supcon)
             
         self.aug = transforms.Compose([
             transforms.RandomResizedCrop(config['training']['image_size'], scale=(0.2, 1.0)),
@@ -138,7 +162,7 @@ class EPGStage1Trainer:
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
-    def train_step(self, x, y_indices, y_offsets, step, max_steps):
+    def train_step(self, x, y_indices, y_offsets, y_labels, step, max_steps):
         self.encoder.train(); self.projector.train(); self.optimizer.zero_grad()
         B = x.shape[0]
         y_feat_online = self.projector(self.encoder.get_y_feat(y_indices, y_offsets))
@@ -162,7 +186,7 @@ class EPGStage1Trainer:
             feat_im2 = self.encoder_ema(y2, t0, y_indices, y_offsets); q_im2 = self.projector_ema(feat_im2[:, 0])
             feat_n_1 = self.encoder_ema(xtn_1, tn_1_scaled, y_indices, y_offsets); qn_1 = self.projector_ema(feat_n_1[:, 0])
 
-        loss, _, sim_matrix = self.siglip([q_im1, qn, y_feat_online], [q_im2, qn_1, y_feat_target])
+        loss, _, sim_matrix = self.supcon([q_im1, qn, y_feat_online], [q_im2, qn_1, y_feat_target], labels=y_labels)
         loss.backward()
         
         if self.config['training'].get('grad_clip', 0.0) > 0:
@@ -180,18 +204,17 @@ def train(config_path):
     with open(config_path, 'r') as f: config = yaml.safe_load(f)
     os.makedirs(config['training']['output_dir'], exist_ok=True)
     dataloader = WDSLoader(url=config['data']['webdataset_url'], csv_path=config['data'].get('csv_path'), image_size=config['training']['image_size'], batch_size=config['training']['batch_size'], num_workers=config['training']['num_workers']).make_loader()
-    from model_epg import TagProcessor
     trainer = EPGStage1Trainer(config, device, rank)
     tag_processor = TagProcessor("tags.txt")
     max_steps, global_step = config['training'].get('max_train_steps', 600000), 0
-    if rank == 0: wandb.init(project="EPG-Stage1-Unified-SigLIP", config=config); pbar = tqdm(range(max_steps), desc="EPG Stage 1")
+    if rank == 0: wandb.init(project="EPG-Stage1-SupCon", config=config); pbar = tqdm(range(max_steps), desc="EPG Stage 1")
     data_iter = iter(dataloader)
     while global_step < max_steps:
         try: batch = next(data_iter)
         except StopIteration: batch = next(iter(dataloader))
         images, prompts, _ = batch
-        y_indices, y_offsets = tag_processor.process_prompts(prompts.to(device) if hasattr(prompts, 'to') else prompts, device)
-        metrics, sim_matrix = trainer.train_step(images.to(device), y_indices, y_offsets, global_step, max_steps)
+        y_indices, y_offsets, y_labels = tag_processor.process_prompts(prompts.to(device) if hasattr(prompts, 'to') else prompts, device)
+        metrics, sim_matrix = trainer.train_step(images.to(device), y_indices, y_offsets, y_labels, global_step, max_steps)
         global_step += 1
         if rank == 0:
             pbar.update(1)

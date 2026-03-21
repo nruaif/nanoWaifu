@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from model_epg import EPGEncoder, EPGProjector
-from siglip import SigLIPLoss
+from siglip import SupConLoss
 import matplotlib.pyplot as plt
 import os
 import math
@@ -48,7 +48,7 @@ def test_stage1_logic(image_size=64, batch_size=4):
     embed_dim, proj_dim, patch_size, num_classes = 128, 64, 8, 50
     encoder = EPGEncoder(patch_size=patch_size, embed_dim=embed_dim, depth=2, num_heads=4, num_classes=num_classes).to(device)
     projector = EPGProjector(embed_dim=embed_dim, proj_dim=proj_dim).to(device)
-    siglip = SigLIPLoss().to(device)
+    supcon = SupConLoss().to(device)
     
     x = torch.randn(batch_size, 3, image_size, image_size, device=device)
     t = torch.rand(batch_size, device=device)
@@ -61,7 +61,7 @@ def test_stage1_logic(image_size=64, batch_size=4):
     q_im = projector(encoder(x, t_scaled, y_indices, y_offsets)[:, 0])
     q_noise = projector(encoder(x + 0.5 * torch.randn_like(x), t_scaled, y_indices, y_offsets)[:, 0])
     
-    loss, _, sim_matrix = siglip([q_im, q_noise, y_feat], [q_im, q_noise, y_feat])
+    loss, _, sim_matrix = supcon([q_im, q_noise, y_feat], [q_im, q_noise, y_feat])
     
     os.makedirs("test_outputs", exist_ok=True)
     log_confusion_matrix_local(sim_matrix, f"test_outputs/alignment_contrast_{image_size}.png", batch_size)

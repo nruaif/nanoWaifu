@@ -31,7 +31,7 @@ def main():
     run_command(download_cmd)
 
     print("\n--- Setup Complete ---")
-    print("Implementation: EPG with Unified SigLIP (Stage 1) and Flow Matching (Stage 2)")
+    print("Implementation: EPG with Supervised Contrastive Learning (SupCon) (Stage 1) and Flow Matching (Stage 2)")
     print("Architecture: ViT with Registers, GLU, and Spatial DW Conv")
     print(f"Data available at: {os.path.abspath('train/')}")
     print("Shards: 00001.tar through 00006.tar")
