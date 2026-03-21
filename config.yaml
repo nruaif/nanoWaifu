@@ -13,6 +13,7 @@ training:
   weight_decay: 0.05
   max_train_steps: 600000
   compile: true
+  grad_clip: 1.0
   ema_beta: 0.99
   log_every_steps: 100
   save_ckpt_every_steps: 1000

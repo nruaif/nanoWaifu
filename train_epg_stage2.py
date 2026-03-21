@@ -96,6 +96,10 @@ def train(config_path):
         loss = F.mse_loss(pred_x0, images)
         
         loss.backward()
+        
+        if config['training'].get('grad_clip', 0.0) > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), config['training']['grad_clip'])
+            
         optimizer.step()
         
         global_step += 1

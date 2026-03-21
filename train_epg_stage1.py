@@ -163,7 +163,13 @@ class EPGStage1Trainer:
             feat_n_1 = self.encoder_ema(xtn_1, tn_1_scaled, y_indices, y_offsets); qn_1 = self.projector_ema(feat_n_1[:, 0])
 
         loss, _, sim_matrix = self.siglip([q_im1, qn, y_feat_online], [q_im2, qn_1, y_feat_target])
-        loss.backward(); self.optimizer.step()
+        loss.backward()
+        
+        if self.config['training'].get('grad_clip', 0.0) > 0:
+            nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.projector.parameters()), 
+                                    self.config['training']['grad_clip'])
+            
+        self.optimizer.step()
         update_ema(self.encoder_ema, self.encoder, self.ema_beta)
         update_ema(self.projector_ema, self.projector, self.ema_beta)
         return {"loss": loss.item()}, sim_matrix
