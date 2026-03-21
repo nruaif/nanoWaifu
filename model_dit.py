@@ -7,7 +7,6 @@ from torch.utils.checkpoint import checkpoint
 class GGRoPE2d(nn.Module):
     def __init__(
         self,
-        image_size: tuple[int, int],
         n_heads: int,
         head_dim: int,
         min_freq: float,
@@ -36,33 +35,31 @@ class GGRoPE2d(nn.Module):
         )
         directions_hF2 = torch.stack((torch.cos(phi_hF), torch.sin(phi_hF)), dim=-1)
         freqs_hF2 = omega_F.unsqueeze(-1) * directions_hF2
+        
+        # Store as buffer to stay on correct device
+        self.register_buffer("freqs_hF2", freqs_hF2)
 
-        H, W = image_size
-        xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
-        x_HW = torch.linspace(-xlim, xlim, W).reshape(1, W).expand(H, W)
-        y_HW = torch.linspace(-ylim, ylim, H).reshape(H, 1).expand(H, W)
-        positions_HW112 = torch.stack((x_HW, y_HW), dim=-1).reshape(H, W, 1, 1, 2)
-
-        theta_HWhF = (freqs_hF2 * positions_HW112).sum(dim=-1)
-        # Register flattened buffers for easy indexing (S, h, F)
-        self.register_buffer("cos_Sf", torch.cos(theta_HWhF).reshape(-1, n_heads, n_freqs))
-        self.register_buffer("sin_Sf", torch.sin(theta_HWhF).reshape(-1, n_heads, n_freqs))
-
-    def forward(self, x: torch.Tensor, indices: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int, W: int, indices: torch.Tensor = None) -> torch.Tensor:
         # x shape: (B, h, N, d)
         B, h, N, d = x.shape
         F_dim = d // 2
         
-        cos = self.cos_Sf # (S_orig, h, F)
-        sin = self.sin_Sf
+        # Dynamically generate grid for current H, W
+        xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
+        x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
+        y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
+        
+        y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
+        positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
+        
+        # theta shape: (S_orig, h, F)
+        theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
         
         if indices is not None:
-            cos = cos[indices] # (N_kept, h, F)
-            sin = sin[indices]
+            theta = theta[indices]
             
-        # Reshape for broadcasting: (1, h, N, F)
-        cos = cos.permute(1, 0, 2).unsqueeze(0)
-        sin = sin.permute(1, 0, 2).unsqueeze(0)
+        cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0) # (1, h, N, F)
+        sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0) # (1, h, N, F)
         
         x_fp32 = x.float()
         x1, x2 = x_fp32.chunk(2, dim=-1)
@@ -97,7 +94,7 @@ class QKNormAttention(nn.Module):
             self.q_norm = nn.LayerNorm(self.head_dim, elementwise_affine=True)
             self.k_norm = nn.LayerNorm(self.head_dim, elementwise_affine=True)
 
-    def forward(self, x, mask=None, rope=None, indices=None):
+    def forward(self, x, H, W, rope=None, indices=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -106,23 +103,19 @@ class QKNormAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # Apply RoPE to spatial tokens only (indices 6 onwards)
         if rope is not None:
             q_prefix = q[:, :, :6, :]
             q_spatial = q[:, :, 6:, :]
             k_prefix = k[:, :, :6, :]
             k_spatial = k[:, :, 6:, :]
             
-            q_spatial = rope(q_spatial, indices=indices)
-            k_spatial = rope(k_spatial, indices=indices)
+            q_spatial = rope(q_spatial, H, W, indices=indices)
+            k_spatial = rope(k_spatial, H, W, indices=indices)
             
             q = torch.cat([q_prefix, q_spatial], dim=2)
             k = torch.cat([k_prefix, k_spatial], dim=2)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
@@ -139,49 +132,34 @@ class DiTBlock(nn.Module):
             nn.Linear(dim * 4, dim, bias=False)
         )
 
-    def forward(self, x, rope=None, indices=None):
-        x = x + self.attn(self.norm1(x), rope=rope, indices=indices)
+    def forward(self, x, H, W, rope=None, indices=None):
+        x = x + self.attn(self.norm1(x), H, W, rope=rope, indices=indices)
         x = x + self.mlp(self.norm2(x))
         return x
 
 class DiTSkip(nn.Module):
-    def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12, num_classes=12476, num_registers=4, latent_size=32, use_checkpoint=False):
+    def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12, num_classes=12476, num_registers=4, use_checkpoint=False, **kwargs):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.use_checkpoint = use_checkpoint
         
-        # Patch Embed
         self.patch_embed = nn.Linear(in_channels, dim)
-        
-        # Condition Embeds
         self.t_embedder = nn.Sequential(
-            nn.Linear(1, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim)
+            nn.Linear(1, dim), nn.SiLU(), nn.Linear(dim, dim)
         )
         self.y_embedder = nn.EmbeddingBag(num_classes + 1, dim, mode='mean')
-        
-        # Register Tokens
         self.registers = nn.Parameter(torch.randn(1, num_registers, dim))
         
-        # RoPE
         self.rope = GGRoPE2d(
-            image_size=(latent_size, latent_size),
             n_heads=num_heads,
             head_dim=dim // num_heads,
             min_freq=1.0,
             max_freq=100.0
         )
         
-        # Blocks
-        self.blocks = nn.ModuleList([
-            DiTBlock(dim, num_heads) for _ in range(depth)
-        ])
-        
-        # Fusion Layer
+        self.blocks = nn.ModuleList([DiTBlock(dim, num_heads) for _ in range(depth)])
         self.fuse = nn.Linear(dim * 2, dim, bias=False)
-        # Learnable padding token for the 75% dropped spots
         self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
         
         self.final_norm = RMSNorm(dim, elementwise_affine=False)
@@ -192,12 +170,9 @@ class DiTSkip(nn.Module):
         x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
         x = self.patch_embed(x)
         
-        # Condition tokens
         t_token = self.t_embedder(t.unsqueeze(-1)).unsqueeze(1)
         y_token = self.y_embedder(y_indices, y_offsets).unsqueeze(1)
         reg_tokens = self.registers.expand(B, -1, -1)
-        
-        # Prefix = Time(1) + Cond(1) + Registers(4) = 6 tokens
         x = torch.cat([t_token, y_token, reg_tokens, x], dim=1)
         
         full_res_skip = None
@@ -209,48 +184,32 @@ class DiTSkip(nn.Module):
                 prefix = x[:, :6, :]
                 spatial = x[:, 6:, :]
                 S = spatial.shape[1]
-                
-                # Random Sample Drop (75% drop, 25% keep)
                 num_keep = max(1, S // 4)
                 keep_indices = torch.randperm(S, device=x.device)[:num_keep]
-                
                 x = torch.cat([prefix, spatial[:, keep_indices, :]], dim=1)
-            
-            # Use current keep_indices for RoPE inside blocks
-            # Before layer 4: keep_indices is None (Full 1024)
-            # Layers 4 to N-2: keep_indices is num_keep (256)
-            # After layer N-2: keep_indices is None (Full 1024) again
             
             if i == (self.depth - 2) and full_res_skip is not None:
                 prefix = x[:, :6, :]
                 dropped_spatial = x[:, 6:, :]
-                
-                # Reconstruct
                 S_orig = full_res_skip.shape[1] - 6
                 full_spatial = self.mask_token.expand(B, S_orig, -1).clone()
                 full_spatial[:, keep_indices, :] = dropped_spatial
-                
                 x = torch.cat([prefix, full_spatial], dim=1)
                 x = self.fuse(torch.cat([x, full_res_skip], dim=-1))
-                # Reset keep_indices to None for final layers
                 keep_indices = None
 
-            # Pass rope and current keep_indices
             if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, self.rope, keep_indices, use_reentrant=False)
+                x = checkpoint(block, x, H, W, self.rope, keep_indices, use_reentrant=False)
             else:
-                x = block(x, rope=self.rope, indices=keep_indices)
+                x = block(x, H, W, rope=self.rope, indices=keep_indices)
 
         x = self.final_norm(x)
         x = self.final_proj(x)
-        
-        # Remove prefix tokens
-        x = x[:, 6:, :]
-        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2)
+        x = x[:, 6:, :].reshape(B, H, W, -1).permute(0, 3, 1, 2)
         return x
 
 @torch.no_grad()
-def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
+def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
                 steps=50, cfg_scale=1.4, noise=None):
     if noise is not None:
         if isinstance(noise, list):
@@ -258,7 +217,8 @@ def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
         else:
             x = noise.clone().to(device)
     else:
-        x = torch.randn(batch_size, model.final_proj.out_features, image_size, image_size, device=device)
+        # For sampling, we use latent_size directly as H and W
+        x = torch.randn(batch_size, model.final_proj.out_features, latent_size, latent_size, device=device)
 
     y_indices, y_offsets = tag_processor.process_prompts(prompts, device)
     null_indices = torch.full((batch_size,), fill_value=tag_processor.num_classes, dtype=torch.long, device=device)
