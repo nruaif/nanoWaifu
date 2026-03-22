@@ -11,3 +11,5 @@ pytorch-optimizer
 diffusers
 transformers
 accelerate
+nvitop
+bitsandbytes

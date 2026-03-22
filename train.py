@@ -18,12 +18,14 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import bitsandbytes as bnb
 
+torch.backends.cuda.enable_flash_sdp(True)
+
 
 # Dynamic model import
 def get_model_and_sampler(config):
     model_type = config['model'].get('type', 'v2')
-    
-    if model_type == 'dit':
+
+    if True:
         from model_dit import DiTSkip as ModelClass, sample_flow as sample_fn
         # We'll use the TagProcessor from model_v2 as it's compatible
         from model_v2 import TagProcessor
@@ -137,15 +139,15 @@ def train(config_path):
             "fal/FLUX.2-Tiny-AutoEncoder",
         ).to(device=device, dtype=torch.bfloat16).eval()
         # VAE output is 128 channels. Reshuffled to 32 channels.
-        in_channels = 32
+        in_channels = 128
         print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
     # Instantiate model
-    if model_type == 'dit':
+    if True:
         # Calculate latent size for RoPE (Image 256 -> VAE 16 -> Shuffle 32)
         # We assume 1/8 total downsampling relative to input if using VAE + Shuffle
         latent_size = (image_size // 16) * 2 if use_vae else image_size // config['model'].get('patch_size', 16)
-        
+
         model = ModelClass(
             in_channels=in_channels,
             dim=config['model'].get('fcdm_dim', 768),
@@ -168,7 +170,7 @@ def train(config_path):
 
     # Resume Logic
     global_step = 0
-    resume_path = config.get('resume_from', "outputs/")
+    resume_path = config.get('resume_from', "outputs_dit/")
     fixed_prompts = None
     fixed_noise = None
 
@@ -199,7 +201,7 @@ def train(config_path):
                 del state_dict[k]
 
             model_to_load.load_state_dict(state_dict, strict=False)
-            global_step = checkpoint["global_step"]
+            global_step = checkpoint["global_step"] - 10
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
             if "fixed_prompts" in checkpoint:
@@ -251,13 +253,13 @@ def train(config_path):
             if use_vae:
                 with torch.no_grad():
                     # Flux Tiny VAE takes images in [-1, 1]
-                    v_images = images * 2.0 - 1.0
+                    v_images = images
                     v_images = v_images.to(dtype=torch.bfloat16)
                     latents = tiny_vae.encode(v_images, return_dict=False)
                     # Scale 0.62, Shift 0
                     latents = latents * 0.62
                     # Reshuffle: 128 -> 32 channels (factor 2)
-                    inputs = F.pixel_shuffle(latents, 2).to(dtype=torch.float32)
+                    inputs = F.pixel_shuffle(latents, 1).to(dtype=torch.float32)
             else:
                 inputs = images
 
@@ -271,11 +273,11 @@ def train(config_path):
             t_reshaped = t.view(-1, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-
+            target = noise - inputs
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = model(xt, t, y_indices, y_offsets)
                 # Scale loss by accumulation steps
-                loss = F.mse_loss(pred, inputs) / accum_steps
+                loss = F.mse_loss(pred, target) / accum_steps
 
             loss.backward()
             loss_accum += loss.item()
@@ -310,7 +312,7 @@ def train(config_path):
 
                     if use_vae:
                         # Reshuffle: 32 -> 128 channels (factor 2)
-                        latents = F.pixel_unshuffle(samples, 2).to(dtype=torch.bfloat16)
+                        latents = F.pixel_unshuffle(samples, 1).to(dtype=torch.bfloat16)
                         # Inverse Scale 0.62, Shift 0
                         latents = latents / 0.62
                         with torch.no_grad():

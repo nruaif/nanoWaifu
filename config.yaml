@@ -6,9 +6,9 @@ training:
   max_train_steps: 1000000
   gradient_checkpointing: true
   compile: false
-  log_every_steps: 1
+  log_every_steps: 10
 
-  save_image_every_steps: 2000
+  save_image_every_steps: 5000
   image_size: 256
   num_workers: 8
   class_dropout_prob: 0.1
@@ -21,12 +21,12 @@ training:
 model:
   type: "dit"      # Use SkipDiT
   use_vae: true    # Recommended for 256x256
-  fcdm_dim: 768    # Hidden dimension (Transformer)
-  fcdm_depth: 12   # Number of layers
-  num_heads: 12    # Number of attention heads
+  fcdm_dim: 1536    # Hidden dimension (Transformer)
+  fcdm_depth: 16   # Number of layers
+  num_heads: 24    # Number of attention heads
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
 
 data:
-  webdataset_url: 'train/00{001..006}.tar'
+  webdataset_url: 'train/00{001..020}.tar'
   use_advanced_captions: true
