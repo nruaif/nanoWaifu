@@ -5,6 +5,71 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 
+class AttentionPoolingEmbedder(nn.Module):
+    def __init__(self, num_classes: int, dim: int, mlp_ratio: int = 4):
+        super().__init__()
+        self.embedding = nn.Embedding(num_classes + 1, dim)
+        self.query = nn.Parameter(torch.randn(dim) * dim ** -0.5)
+        self.norm = RMSNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio, bias=False),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim, bias=False),
+        )
+
+    def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
+        """
+        y_indices: (N,) concatenated indices
+        y_offsets: (B,) start offsets into y_indices
+        """
+        device = y_indices.device
+        embs = self.embedding(y_indices)  # (N, dim)
+        B = y_offsets.shape[0]
+        dim = embs.shape[-1]
+
+        # Compute segment lengths
+        ends = torch.cat([
+            y_offsets[1:],
+            y_indices.new_tensor([y_indices.shape[0]])
+        ])
+        lengths = (ends - y_offsets).clamp(min=0)  # (B,)
+
+        max_len = lengths.max()  # stays tensor (no .item())
+
+        # Create position grid
+        positions = torch.arange(max_len, device=device)  # (max_len,)
+        positions = positions.unsqueeze(0)                # (1, max_len)
+
+        # Compute gather indices
+        idx = y_offsets.unsqueeze(1) + positions          # (B, max_len)
+
+        # Mask valid positions
+        mask = positions < lengths.unsqueeze(1)           # (B, max_len)
+
+        # Prevent OOB access
+        idx = idx.clamp(max=y_indices.shape[0] - 1)
+
+        # Gather embeddings
+        padded = embs[idx]                                # (B, max_len, dim)
+
+        # Zero out padding
+        padded = padded * mask.unsqueeze(-1)
+
+        # --- Attention pooling ---
+        q = self.query                                    # (dim,)
+        scores = (padded * q).sum(-1) * (dim ** -0.5)     # (B, max_len)
+
+        # Mask padding
+        scores = scores.masked_fill(~mask, -1e9)
+
+        weights = torch.softmax(scores, dim=-1)           # (B, max_len)
+
+        # Avoid NaNs for empty rows
+        weights = weights * mask
+
+        out = (weights.unsqueeze(-1) * padded).sum(dim=1) # (B, dim)
+
+        return self.mlp(self.norm(out))
 class GGRoPE2d(nn.Module):
     def __init__(
             self,
@@ -206,7 +271,7 @@ class DiTSkip(nn.Module):
 
         self.patch_embed = nn.Linear(in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
-        self.y_embedder = nn.EmbeddingBag(num_classes + 1, dim, mode='mean', )
+        self.y_embedder = AttentionPoolingEmbedder(num_classes, dim )
         self.registers = nn.Parameter(torch.randn(1, num_registers, dim))
 
         self.rope = GGRoPE2d(
@@ -226,7 +291,7 @@ class DiTSkip(nn.Module):
         self.conv_mix = ConvNeXtBlock(in_channels * 2)
         self.final_out_proj = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
 
-    def forward(self, x_in, t, y_indices, y_offsets=None, drop_tokens=False):
+    def forward(self, x_in, t, y_indices, y_offsets=None, drop_tokens=False, return_features = False):
         B, C, H, W = x_in.shape
         x = x_in.permute(0, 2, 3, 1).reshape(B, H * W, C)
         x = self.patch_embed(x)
@@ -285,7 +350,7 @@ class DiTSkip(nn.Module):
                 x = checkpoint(block, x, H, W, self.rope, keep_indices, use_reentrant=False)
             else:
                 x = block(x, H, W, rope=self.rope, indices=keep_indices)
-
+        feat = x
         x = self.final_norm(x)
         x = self.final_proj(x)
         x = x[:, 6:, :].reshape(B, H, W, -1).permute(0, 3, 1, 2)
@@ -295,7 +360,8 @@ class DiTSkip(nn.Module):
 
         x = self.final_out_proj(x)
 
-        return x
+        if return_features is False: return x
+        else: return x, feat
 
 
 @torch.no_grad()

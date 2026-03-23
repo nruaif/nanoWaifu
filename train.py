@@ -17,8 +17,32 @@ from dataset import WDSLoader
 from torch.optim import AdamW
 import torch.nn.functional as F
 import bitsandbytes as bnb
+from huggingface_hub import upload_file
+import threading
+
+
+def _async_upload(ckpt_path, repo_id, step):
+    try:
+        upload_file(
+            path_or_fileobj=ckpt_path,
+            path_in_repo=os.path.basename(ckpt_path),
+            repo_id=repo_id,
+            commit_message=f"Checkpoint at step {step}"
+        )
+        print(f"[HF] Uploaded: {ckpt_path}")
+    except Exception as e:
+        print(f"[HF] Upload failed for {ckpt_path}: {e}")
+
 
 torch.backends.cuda.enable_flash_sdp(True)
+
+def disp_loss(Z, tau):
+    if Z.shape[0] <= 1:
+        return torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
+    Z_flat = Z.reshape(Z.shape[0], -1)
+    D = torch.pdist(Z_flat, p=2)**2
+    # Add epsilon to prevent log(0)
+    return torch.log(torch.mean(torch.exp(-D / tau)) + 1e-8)
 
 
 # Dynamic model import
@@ -71,9 +95,23 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
                 print(f"Error removing {ckpt}: {e}")
 
 
-def save_checkpoint(model, optimizer, rank, output_dir, step, config, fixed_prompts=None, fixed_noise=None):
-    if rank != 0: return
+def save_checkpoint(
+        model,
+        optimizer,
+        rank,
+        output_dir,
+        step,
+        config,
+        fixed_prompts=None,
+        fixed_noise=None,
+        push_to_hf=True,
+        repo_id="Shio-Koube/ConvNext-Diff"
+):
+    if rank != 0:
+        return
+
     print(f"\n[Step {step}] Saving Checkpoint...")
+
     model_to_save = model.module if hasattr(model, 'module') else model
     ckpt_path = os.path.join(output_dir, f'ckpt_step_{step}.pth')
 
@@ -88,8 +126,20 @@ def save_checkpoint(model, optimizer, rank, output_dir, step, config, fixed_prom
     }
 
     torch.save(checkpoint, ckpt_path)
+
+    # cleanup old checkpoints
     cleanup_checkpoints(output_dir, config.get('max_checkpoints', 3), rank)
+
     print(f"Checkpoint saved: {ckpt_path}")
+
+    # 🔥 Async upload
+    if push_to_hf and repo_id is not None:
+        thread = threading.Thread(
+            target=_async_upload,
+            args=(ckpt_path, repo_id, step),
+            daemon=True
+        )
+        thread.start()
 
 
 def train(config_path):
@@ -277,7 +327,11 @@ def train(config_path):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = model(xt, t, y_indices, y_offsets)
                 # Scale loss by accumulation steps
-                loss = F.mse_loss(pred, target) / accum_steps
+                loss = F.mse_loss(pred, target)
+                x0_pred = xt - t * pred
+                x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
+                contrast_loss = F.mse_loss(x0_pred, x0_neg)
+                loss = (loss + 0.05 * contrast_loss) / accum_steps
 
             loss.backward()
             loss_accum += loss.item()
@@ -292,7 +346,10 @@ def train(config_path):
             pbar.update(1)
             if global_step % config['training']['log_every_steps'] == 0:
                 avg_loss = running_loss / config['training']['log_every_steps']
+                avg_contrast_loss = contrast_loss.item()
                 wandb.log({"train/loss": avg_loss}, step=global_step)
+                wandb.log({"train/contrast_loss": avg_contrast_loss}, step=global_step)
+
                 pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
                 running_loss = 0.0
 
