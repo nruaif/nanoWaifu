@@ -3,8 +3,8 @@ training:
   grad_accum_steps: 1
   learning_rate: 1.0e-4
   num_epochs: 100
-  max_train_steps: 1000000
-  gradient_checkpointing: true
+  max_train_steps: 2000000
+  gradient_checkpointing: false
   compile: false
   log_every_steps: 10
 
@@ -28,5 +28,5 @@ model:
   patch_size: 1    # Factor for initial projection
 
 data:
-  webdataset_url: 'train/00{001..020}.tar'
+  webdataset_url: 'train/train/00{060..121}.tar'
   use_advanced_captions: true

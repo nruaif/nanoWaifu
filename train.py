@@ -318,12 +318,25 @@ def train(config_path):
                 fixed_prompts = prompts[:16]
                 fixed_noise = torch.randn_like(inputs[:16])
 
-            # Flow Matching / Rectified Flow Training
-            t = torch.rand((inputs.shape[0],), device=device)
+            # --- Flow Matching / Rectified Flow Training ---
+            B, C, H, W = inputs.shape
+
+            # 1. Calculate effective dimension (m) and scaling factor (alpha)
+            m = C * H * W
+            n = 32768.0
+            alpha = (m / n) ** 0.5
+
+            # 2. Sample base uniform timestep
+            t_base = torch.rand((B,), device=device)
+
+            # 3. Apply Dimension-Dependent Shift formula
+            t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
+
             t_reshaped = t.view(-1, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
             target = noise - inputs
+            # -----------------------------------------------
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = model(xt, t, y_indices, y_offsets)
                 # Scale loss by accumulation steps
