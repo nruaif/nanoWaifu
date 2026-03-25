@@ -36,11 +36,12 @@ def _async_upload(ckpt_path, repo_id, step):
 
 torch.backends.cuda.enable_flash_sdp(True)
 
+
 def disp_loss(Z, tau):
     if Z.shape[0] <= 1:
         return torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
     Z_flat = Z.reshape(Z.shape[0], -1)
-    D = torch.pdist(Z_flat, p=2)**2
+    D = torch.pdist(Z_flat, p=2) ** 2
     # Add epsilon to prevent log(0)
     return torch.log(torch.mean(torch.exp(-D / tau)) + 1e-8)
 
@@ -182,21 +183,30 @@ def train(config_path):
 
     use_vae = config['model'].get('use_vae', False)
     in_channels = config['model'].get('in_channels', 3)
+
     if use_vae:
-        from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
-        print(">>> Loading FLUX.2-Tiny-AutoEncoder...")
-        tiny_vae = Flux2TinyAutoEncoder.from_pretrained(
-            "fal/FLUX.2-Tiny-AutoEncoder",
-        ).to(device=device, dtype=torch.bfloat16).eval()
-        # VAE output is 128 channels. Reshuffled to 32 channels.
+        from diffusers import AutoencoderKLFlux2
+        print(">>> Loading Standard FLUX.2 VAE...")
+        vae = AutoencoderKLFlux2.from_pretrained(
+            "black-forest-labs/FLUX.2-dev",
+            subfolder="vae",
+            torch_dtype=torch.bfloat16
+        ).to(device=device).eval()
+
+        # Pre-compute normalization stats from the VAE's BatchNorm
+        latents_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device)
+        latents_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(device)
+
+        # 32 native channels * 4 (from unshuffle factor 2) = 128 channels
         in_channels = 128
         print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
     # Instantiate model
     if True:
-        # Calculate latent size for RoPE (Image 256 -> VAE 16 -> Shuffle 32)
-        # We assume 1/8 total downsampling relative to input if using VAE + Shuffle
-        latent_size = (image_size // 16) * 2 if use_vae else image_size // config['model'].get('patch_size', 16)
+        # Calculate latent size for RoPE
+        # VAE downsamples spatial dimensions by 8. Unshuffle by 2 downsamples by another 2.
+        # Total spatial reduction = 16.
+        latent_size = (image_size // 16) if use_vae else image_size // config['model'].get('patch_size', 16)
 
         model = ModelClass(
             in_channels=in_channels,
@@ -302,14 +312,16 @@ def train(config_path):
             # VAE Encoding if enabled
             if use_vae:
                 with torch.no_grad():
-                    # Flux Tiny VAE takes images in [-1, 1]
-                    v_images = images
-                    v_images = v_images.to(dtype=torch.bfloat16)
-                    latents = tiny_vae.encode(v_images, return_dict=False)
-                    # Scale 0.62, Shift 0
-                    latents = latents * 0.62
-                    # Reshuffle: 128 -> 32 channels (factor 2)
-                    inputs = F.pixel_shuffle(latents, 1).to(dtype=torch.float32)
+                    v_images = images.to(dtype=torch.bfloat16)
+
+                    # Encode to 32-channel latent distribution
+                    latents = vae.encode(v_images).latent_dist.mode()
+
+                    # Apply FLUX.2 specific normalization
+                    latents = (latents - latents_mean) / latents_std
+
+                    # Unshuffle: 32 channels -> 128 channels (Height and Width are halved)
+                    inputs = F.pixel_unshuffle(latents, 2).to(dtype=torch.float32)
             else:
                 inputs = images
 
@@ -381,12 +393,19 @@ def train(config_path):
                     )
 
                     if use_vae:
-                        # Reshuffle: 32 -> 128 channels (factor 2)
-                        latents = F.pixel_unshuffle(samples, 1).to(dtype=torch.bfloat16)
-                        # Inverse Scale 0.62, Shift 0
-                        latents = latents / 0.62
+                        samples = samples.to(dtype=torch.bfloat16)
+
+                        # Shuffle: 128 channels -> 32 channels (Height and Width are doubled)
+                        latents = F.pixel_shuffle(samples, 2)
+
+                        # Reverse the FLUX.2 normalization
+                        latents = (latents * latents_std) + latents_mean
+
                         with torch.no_grad():
-                            recon = tiny_vae.decode(latents, return_dict=False)
+                            # Decode back to pixel space
+                            recon = vae.decode(latents).sample
+
+                            # Convert from [-1, 1] to [0, 1] for saving/logging
                             samples = recon.clamp(-1, 1) / 2.0 + 0.5
                             samples = samples.to(dtype=torch.float32)
 
