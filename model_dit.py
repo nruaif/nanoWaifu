@@ -5,71 +5,55 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 
-class AttentionPoolingEmbedder(nn.Module):
-    def __init__(self, num_classes: int, dim: int, mlp_ratio: int = 4):
+class MeanPoolingEmbedder(nn.Module):
+    def __init__(self, num_classes: int, dim: int):
         super().__init__()
-        self.embedding = nn.Embedding(num_classes + 1, dim)
-        self.query = nn.Parameter(torch.randn(dim) * dim ** -0.5)
-        self.norm = RMSNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio, bias=False),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim, bias=False),
-        )
+        # Projects to dim * 4 so we can reshape into 4 distinct tokens
+        self.embed = nn.EmbeddingBag(num_classes + 1, dim * 4, mode='mean')
 
     def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
         """
         y_indices: (N,) concatenated indices
         y_offsets: (B,) start offsets into y_indices
         """
-        device = y_indices.device
-        embs = self.embedding(y_indices)  # (N, dim)
-        B = y_offsets.shape[0]
-        dim = embs.shape[-1]
+        x = self.embed(y_indices, y_offsets)  # (B, dim * 4)
+        return x.view(x.shape[0], 4, -1)  # (B, 4, dim)
 
-        # Compute segment lengths
-        ends = torch.cat([
-            y_offsets[1:],
-            y_indices.new_tensor([y_indices.shape[0]])
-        ])
-        lengths = (ends - y_offsets).clamp(min=0)  # (B,)
 
-        max_len = lengths.max()  # stays tensor (no .item())
+class Pattention(nn.Module):
+    """
+    Token-Parameter Attention (Pattention) Layer optimized for PyTorch.
+    This replaces explicit K_P/V_P tensors with two bias-free Linear layers.
+    """
 
-        # Create position grid
-        positions = torch.arange(max_len, device=device)  # (max_len,)
-        positions = positions.unsqueeze(0)                # (1, max_len)
+    def __init__(self, in_dim: int, out_dim: int, num_pairs: int):
+        super().__init__()
+        self.num_pairs = num_pairs
 
-        # Compute gather indices
-        idx = y_offsets.unsqueeze(1) + positions          # (B, max_len)
+        # Layer 1 acts as K_P: Projects from input dimension to the number of parameter pairs (slots)
+        self.k_proj = nn.Linear(in_dim, num_pairs, bias=False)
 
-        # Mask valid positions
-        mask = positions < lengths.unsqueeze(1)           # (B, max_len)
+        # Layer 2 acts as V_P: Projects from the parameter slots back to the output dimension
+        self.v_proj = nn.Linear(num_pairs, out_dim, bias=False)
 
-        # Prevent OOB access
-        idx = idx.clamp(max=y_indices.shape[0] - 1)
+        # Initialize weights to match the paper's scaling
+        nn.init.normal_(self.k_proj.weight, std=in_dim ** -0.5)
+        nn.init.normal_(self.v_proj.weight, std=out_dim ** -0.5)
 
-        # Gather embeddings
-        padded = embs[idx]                                # (B, max_len, dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Similarity Scores: X @ K_P^T
+        A = self.k_proj(x)  # Shape: (B, N, num_pairs)
 
-        # Zero out padding
-        padded = padded * mask.unsqueeze(-1)
+        # 2. Modified Softmax: L2 norm + GeLU
+        A_norm = F.normalize(A, p=2, dim=-1)
+        S = F.gelu(A_norm * math.sqrt(self.num_pairs))
 
-        # --- Attention pooling ---
-        q = self.query                                    # (dim,)
-        scores = (padded * q).sum(-1) * (dim ** -0.5)     # (B, max_len)
+        # 3. Weighted Sum: S @ V_P
+        O = self.v_proj(S)  # Shape: (B, N, out_dim)
 
-        # Mask padding
-        scores = scores.masked_fill(~mask, -1e9)
+        return O
 
-        weights = torch.softmax(scores, dim=-1)           # (B, max_len)
 
-        # Avoid NaNs for empty rows
-        weights = weights * mask
-
-        out = (weights.unsqueeze(-1) * padded).sum(dim=1) # (B, dim)
-
-        return self.mlp(self.norm(out))
 class GGRoPE2d(nn.Module):
     def __init__(
             self,
@@ -102,15 +86,12 @@ class GGRoPE2d(nn.Module):
         directions_hF2 = torch.stack((torch.cos(phi_hF), torch.sin(phi_hF)), dim=-1)
         freqs_hF2 = omega_F.unsqueeze(-1) * directions_hF2
 
-        # Store as buffer to stay on correct device
         self.register_buffer("freqs_hF2", freqs_hF2)
 
-    def forward(self, x: torch.Tensor, H: int, W: int, indices: torch.Tensor = None) -> torch.Tensor:
-        # x shape: (B, h, N, d)
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, h, N, d = x.shape
         F_dim = d // 2
 
-        # Dynamically generate grid for current H, W
         xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
         x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
         y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
@@ -118,14 +99,10 @@ class GGRoPE2d(nn.Module):
         y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
         positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
 
-        # theta shape: (S_orig, h, F)
         theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
 
-        if indices is not None:
-            theta = theta[indices]
-
-        cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)  # (1, h, N, F)
-        sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)  # (1, h, N, F)
+        cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)
+        sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
 
         x_fp32 = x.float()
         x1, x2 = x_fp32.chunk(2, dim=-1)
@@ -142,82 +119,85 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
 
     def forward(self, x):
-        return F.rms_norm(x, (self.dim,), weight=None, eps=self.eps)
+        return F.rms_norm(x, (self.dim,), weight=self.weight, eps=self.eps)
 
 
-class QKNormAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qk_norm=True):
+class TokenformerAttention(nn.Module):
+    def __init__(self, dim, num_heads=12, attn_kv_pairs=576, qk_norm=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        # Replaced standard linear QKV with Pattention layers
+        self.q_proj = Pattention(dim, dim, attn_kv_pairs)
+        self.k_proj = Pattention(dim, dim, attn_kv_pairs)
+        self.v_proj = Pattention(dim, dim, attn_kv_pairs)
+        self.o_proj = Pattention(dim, dim, attn_kv_pairs)
 
         self.qk_norm = qk_norm
         if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-            self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
+            # Paper explicitly removes parameter weights from Norm to facilitate scaling
+            self.q_norm = RMSNorm(self.head_dim, elementwise_affine=False)
+            self.k_norm = RMSNorm(self.head_dim, elementwise_affine=False)
 
-    def forward(self, x, H, W, rope=None, indices=None):
+    def forward(self, x, H, W, rope=None):
         B, N, C = x.shape
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim) \
-            .permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, heads, N, head_dim)
+        q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
         if rope is not None:
-            q_prefix = q[:, :, :6, :]
-            q_spatial = q[:, :, 6:, :]
-            k_prefix = k[:, :, :6, :]
-            k_spatial = k[:, :, 6:, :]
+            # Dynamically slice to isolate spatial tokens from prefixes (t_token + y_tokens)
+            prefix_len = N - (H * W)
+            q_prefix, q_spatial = q[:, :, :prefix_len, :], q[:, :, prefix_len:, :]
+            k_prefix, k_spatial = k[:, :, :prefix_len, :], k[:, :, prefix_len:, :]
 
-            q_spatial = rope(q_spatial, H, W, indices=indices)
-            k_spatial = rope(k_spatial, H, W, indices=indices)
+            q_spatial = rope(q_spatial, H, W)
+            k_spatial = rope(k_spatial, H, W)
 
             q = torch.cat([q_prefix, q_spatial], dim=2)
             k = torch.cat([k_prefix, k_spatial], dim=2)
 
-        # 🔥 SDPA replaces everything below
-        x = F.scaled_dot_product_attention(
+        x_att = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,  # set >0 if training with dropout
+            dropout_p=0.0,
             is_causal=False
         )
 
-        x = x.transpose(1, 2).reshape(B, N, C)
-        return self.proj(x)
+        x_att = x_att.transpose(1, 2).reshape(B, N, C)
+        return self.o_proj(x_att)
 
 
-class DiTBlock(nn.Module):
-    def __init__(self, dim, num_heads):
+class TokenformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, attn_kv_pairs, ffn_kv_pairs):
         super().__init__()
         self.norm1 = RMSNorm(dim, elementwise_affine=False)
-        self.attn = QKNormAttention(dim, num_heads)
+        self.attn = TokenformerAttention(dim, num_heads, attn_kv_pairs)
         self.norm2 = RMSNorm(dim, elementwise_affine=False)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4, bias=False),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim, bias=False)
-        )
 
-    def forward(self, x, H, W, rope=None, indices=None):
-        x = x + self.attn(self.norm1(x), H, W, rope=rope, indices=indices)
-        x = x + self.mlp(self.norm2(x))
+        # Tokenformer uses a single Pattention layer for the entire FFN block
+        self.ffn = Pattention(dim, dim, ffn_kv_pairs)
+
+    def forward(self, x, H, W, rope=None):
+        x = x + self.attn(self.norm1(x), H, W, rope=rope)
+        x = x + self.ffn(self.norm2(x))
         return x
 
 
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep embedding"""
-
     def __init__(self, hidden_dim):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -228,7 +208,6 @@ class TimestepEmbedder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, t):
-        # Scale t by 1000 to match standard diffusion frequencies
         t = t * 1000.0
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
@@ -239,8 +218,6 @@ class TimestepEmbedder(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    """Simple ConvNeXt-style block for final token mixing."""
-
     def __init__(self, dim):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
@@ -252,17 +229,22 @@ class ConvNeXtBlock(nn.Module):
     def forward(self, x):
         shortcut = x
         x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
+        x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+        x = x.permute(0, 3, 1, 2)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
         return x + shortcut
 
 
-class DiTSkip(nn.Module):
-    def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12, num_classes=12476, num_registers=4,
+class TokenformerDiT(nn.Module):
+    """
+    Tokenformer Architecture (Default: 124M specs)
+    """
+
+    def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
+                 attn_kv_pairs=576, ffn_kv_pairs=2304, num_classes=12476,
                  use_checkpoint=False, **kwargs):
         super().__init__()
         self.dim = dim
@@ -271,8 +253,7 @@ class DiTSkip(nn.Module):
 
         self.patch_embed = nn.Linear(in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
-        self.y_embedder = AttentionPoolingEmbedder(num_classes, dim )
-        self.registers = nn.Parameter(torch.randn(1, num_registers, dim))
+        self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
 
         self.rope = GGRoPE2d(
             n_heads=num_heads,
@@ -281,9 +262,10 @@ class DiTSkip(nn.Module):
             max_freq=100.0
         )
 
-        self.blocks = nn.ModuleList([DiTBlock(dim, num_heads) for _ in range(depth)])
-        self.fuse = nn.Linear(dim * 2, dim, bias=False)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.blocks = nn.ModuleList([
+            TokenformerBlock(dim, num_heads, attn_kv_pairs, ffn_kv_pairs)
+            for _ in range(depth)
+        ])
 
         self.final_norm = RMSNorm(dim, elementwise_affine=False)
         self.final_proj = nn.Linear(dim, in_channels)
@@ -291,83 +273,48 @@ class DiTSkip(nn.Module):
         self.conv_mix = ConvNeXtBlock(in_channels * 2)
         self.final_out_proj = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
 
-    def forward(self, x_in, t, y_indices, y_offsets=None, drop_tokens=False, return_features = False):
+    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False):
         B, C, H, W = x_in.shape
         x = x_in.permute(0, 2, 3, 1).reshape(B, H * W, C)
         x = self.patch_embed(x)
 
+        # Prefix is now precisely 5 tokens: 1 for time, 4 for condition
         t_token = self.t_embedder(t).unsqueeze(1)
-        y_token = self.y_embedder(y_indices, y_offsets).unsqueeze(1)
-        reg_tokens = self.registers.expand(B, -1, -1)
-        x = torch.cat([t_token, y_token, reg_tokens, x], dim=1)
+        y_token = self.y_embedder(y_indices, y_offsets)
 
-        full_res_skip = None
-        keep_indices = None
+        x = torch.cat([t_token, y_token, x], dim=1)
 
-        for i, block in enumerate(self.blocks):
-            if i == 2:
-                full_res_skip = x
-
-                # 🔥 Refactored dropping logic for CFG
-                if drop_tokens:
-                    do_drop = True  # Forced drop for unconditional CFG pass
-                elif self.training:
-                    do_drop = torch.rand(1, device=x.device).item() > 0.1  # Standard training drop
-                else:
-                    do_drop = False  # Default for conditional inference is no drop
-
-                if do_drop:
-                    prefix = x[:, :6, :]
-                    spatial = x[:, 6:, :]
-                    S = spatial.shape[1]
-                    num_keep = max(1, S // 4)
-
-                    keep_indices = torch.randperm(S, device=x.device)[:num_keep]
-                    x = torch.cat([prefix, spatial[:, keep_indices, :]], dim=1)
-                else:
-                    keep_indices = None  # no dropping
-
-            if i == (self.depth - 3) and full_res_skip is not None:
-                prefix = x[:, :6, :]
-
-                if keep_indices is not None:
-                    # 🔥 Reconstruct if we actually dropped
-                    dropped_spatial = x[:, 6:, :]
-                    S_orig = full_res_skip.shape[1] - 6
-
-                    full_spatial = self.mask_token.expand(B, S_orig, -1).clone()
-                    full_spatial[:, keep_indices, :] = dropped_spatial
-                else:
-                    # 🔥 No drop → already full resolution
-                    full_spatial = x[:, 6:, :]
-
-                x = torch.cat([prefix, full_spatial], dim=1)
-                x = self.fuse(torch.cat([x, full_res_skip], dim=-1))
-
-                keep_indices = None  # reset
-
+        # Removed internal DiT Skip Logic. Straight sequential processing.
+        for block in self.blocks:
             if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, H, W, self.rope, keep_indices, use_reentrant=False)
+                x = checkpoint(block, x, H, W, self.rope, use_reentrant=False)
             else:
-                x = block(x, H, W, rope=self.rope, indices=keep_indices)
+                x = block(x, H, W, rope=self.rope)
+
         feat = x
         x = self.final_norm(x)
         x = self.final_proj(x)
-        x = x[:, 6:, :].reshape(B, H, W, -1).permute(0, 3, 1, 2)
 
+        # Remove the 5 prefix tokens
+        x = x[:, 5:, :].reshape(B, H, W, -1).permute(0, 3, 1, 2)
+
+        # Standard UNet-style end skip connection
         x = torch.cat([x, x_in], dim=1)
         x = self.conv_mix(x)
-
         x = self.final_out_proj(x)
 
-        if return_features is False: return x
-        else: return x, feat
+        if not return_features:
+            return x
+        else:
+            return x, feat
 
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                steps=50, cfg_scale=1.4, noise=None):
-    # --- Initial noise ---
+                steps=50, noise=None):
+    """
+    Simplified sample_flow (removed CFG dropping logic as requested).
+    """
     in_channels = model.final_proj.out_features
     model.eval()
     H = W = latent_size
@@ -380,13 +327,9 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
 
-    # --- Conditioning ---
     y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
 
-    # ❌ Null embedding logic removed; CFG now relies purely on token dropping
-
-    # --- Euler integration: t from 1 (noise) → 0 (data) ---
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)  # t[0]=1, t[-1]=0
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
     for i in range(steps):
         t_curr = ts[i]
@@ -395,18 +338,54 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
         t_vec = torch.full((batch_size,), t_curr.item(), device=device)
 
-        # 🔥 Two unbatched passes because sequence lengths diverge inside the blocks
-        # Conditional pass (Full spatial tokens)
-        v_cond = model(x, t_vec, y_indices, y_offsets, drop_tokens=False)
+        # Single conditional pass
+        v_final = model(x, t_vec, y_indices, y_offsets)
 
-        # Unconditional pass (Dropped spatial tokens)
-        v_uncond = model(x, t_vec, y_indices, y_offsets, drop_tokens=True)
-
-        # CFG: interpolate/extrapolate between unconditional and conditional
-        v_final = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        # Euler step
         x = x + dt * v_final
-    model.train()
 
+    model.train()
     return x
+
+
+if __name__ == "__main__":
+    print("Initializing TokenformerDiT on CPU...")
+    device = torch.device("cpu")
+
+    # Initialize the model with the default 124M specs outlined in the paper
+    model = TokenformerDiT(
+        in_channels=32,
+        dim=768,
+        depth=12,
+        num_heads=12,
+        attn_kv_pairs=576,
+        ffn_kv_pairs=2304,
+        num_classes=12476
+    ).to(device)
+
+    # 1. Count and format parameters
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Parameters: {num_params / 1e6:.2f} M")
+
+    # 2. Create dummy inputs
+    batch_size = 2
+    latent_size = 16  # Represents H and W
+
+    x_in = torch.randn(batch_size, 32, latent_size, latent_size, device=device)
+    t = torch.rand(batch_size, device=device)
+
+    # Dummy tags for the MeanPoolingEmbedder
+    # Let's assume each item in the batch has exactly 3 tags
+    y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
+    y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
+
+    print("\nRunning forward pass...")
+
+    # 3. Run the forward pass
+    output = model(x_in, t, y_indices, y_offsets)
+
+    # 4. Verification
+    print(f"Input shape:  {x_in.shape}")
+    print(f"Output shape: {output.shape}")
+
+    assert x_in.shape == output.shape, "Error: Output shape does not match input shape!"
+    print("✅ Forward pass completed successfully!")

@@ -19,8 +19,9 @@ training:
   max_checkpoints: 3
 
 model:
-  type: "dit"      # Use SkipDiT
+  type: "dit"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
+  use_tiny_vae: true
   fcdm_dim: 1536    # Hidden dimension (Transformer)
   fcdm_depth: 16   # Number of layers
   num_heads: 24    # Number of attention heads

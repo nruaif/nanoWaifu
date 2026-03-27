@@ -2,19 +2,15 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 import yaml
 import os
 import argparse
-import numpy as np
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 import wandb
 import glob
 import builtins
-import random
 from dataset import WDSLoader
-from torch.optim import AdamW
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from huggingface_hub import upload_file
@@ -51,10 +47,10 @@ def get_model_and_sampler(config):
     model_type = config['model'].get('type', 'v2')
 
     if True:
-        from model_dit import DiTSkip as ModelClass, sample_flow as sample_fn
+        from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn
         # We'll use the TagProcessor from model_v2 as it's compatible
         from model_v2 import TagProcessor
-        print(">>> Training DiT-Skip Model (RMSNorm + QKNorm + Token Skip)")
+        print(">>> Training TokenformerDiT Model")
     elif config['model'].get('use_v2_model', False) or model_type == 'v2':
         from model_v2 import FCDMV2 as ModelClass, TagProcessor, sample_flow as sample_fn
         print(">>> Training V2 Model (CSP + Hybrid ViT + ReLU^2 + Gated Skip)")
@@ -133,7 +129,7 @@ def save_checkpoint(
 
     print(f"Checkpoint saved: {ckpt_path}")
 
-    # 🔥 Async upload
+    # Async upload
     if push_to_hf and repo_id is not None:
         thread = threading.Thread(
             target=_async_upload,
@@ -182,31 +178,50 @@ def train(config_path):
     image_size = config['training']['image_size']
 
     use_vae = config['model'].get('use_vae', False)
+    use_tiny_vae = config['model'].get('use_tiny_vae', False)
     in_channels = config['model'].get('in_channels', 3)
 
-    if use_vae:
+    # Load VAE and get Stats
+    if use_vae or use_tiny_vae:
         from diffusers import AutoencoderKLFlux2
-        print(">>> Loading Standard FLUX.2 VAE...")
-        vae = AutoencoderKLFlux2.from_pretrained(
+        print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
+        standard_vae = AutoencoderKLFlux2.from_pretrained(
             "black-forest-labs/FLUX.2-dev",
             subfolder="vae",
             torch_dtype=torch.bfloat16
         ).to(device=device).eval()
 
-        # Pre-compute normalization stats from the VAE's BatchNorm
-        latents_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device)
-        latents_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(device)
+        # Pre-compute normalization stats from the Standard VAE's BatchNorm
+        latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device)
+        latents_std = torch.sqrt(standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps).to(
+            device)
 
-        # 32 native channels * 4 (from unshuffle factor 2) = 128 channels
-        in_channels = 128
-        print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
+        if use_tiny_vae:
+            # Free up standard VAE memory since we only needed the stats
+            del standard_vae
+            torch.cuda.empty_cache()
+
+            from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
+            print(">>> Loading Tiny FLUX.2 VAE...")
+            vae = Flux2TinyAutoEncoder.from_pretrained(
+                "fal/FLUX.2-Tiny-AutoEncoder",
+            ).to(device=device, dtype=torch.bfloat16).eval()
+
+            in_channels = 128
+            print(f">>> Tiny VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
+
+        else:
+            vae = standard_vae
+            # 32 native channels * 4 (from unshuffle factor 2) = 128 channels
+            in_channels = 128
+            print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
     # Instantiate model
     if True:
         # Calculate latent size for RoPE
-        # VAE downsamples spatial dimensions by 8. Unshuffle by 2 downsamples by another 2.
-        # Total spatial reduction = 16.
-        latent_size = (image_size // 16) if use_vae else image_size // config['model'].get('patch_size', 16)
+        # Both VAEs downsample spatial dimensions by 16 overall
+        latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get(
+            'patch_size', 16)
 
         model = ModelClass(
             in_channels=in_channels,
@@ -309,8 +324,22 @@ def train(config_path):
                 prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
             )
 
-            # VAE Encoding if enabled
-            if use_vae:
+            # VAE Encoding Logic
+            if use_tiny_vae:
+                with torch.no_grad():
+                    v_images = images.to(dtype=torch.bfloat16)
+
+                    # encode directly returns the needed latents structure
+                    out = vae.encode(v_images, return_dict=False)
+                    latents = out[0] if isinstance(out, tuple) else out
+
+                    # Apply FLUX.2 specific normalization
+                    latents = (latents - latents_mean) / latents_std
+
+                    # No pixel_unshuffle needed for Tiny VAE
+                    inputs = latents.to(dtype=torch.float32)
+
+            elif use_vae:
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
 
@@ -392,7 +421,22 @@ def train(config_path):
                         noise=fixed_noise
                     )
 
-                    if use_vae:
+                    if use_tiny_vae:
+                        samples = samples.to(dtype=torch.bfloat16)
+
+                        # Reverse the FLUX.2 normalization
+                        latents = (samples * latents_std) + latents_mean
+
+                        with torch.no_grad():
+                            # Decode directly (no pixel shuffle needed)
+                            out = vae.decode(latents, return_dict=False)
+                            recon = out[0] if isinstance(out, tuple) else out
+
+                            # Convert from [-1, 1] to [0, 1] for saving/logging
+                            samples = recon.clamp(-1, 1) / 2.0 + 0.5
+                            samples = samples.to(dtype=torch.float32)
+
+                    elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
 
                         # Shuffle: 128 channels -> 32 channels (Height and Width are doubled)
