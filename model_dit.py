@@ -10,13 +10,18 @@ class MeanPoolingEmbedder(nn.Module):
         super().__init__()
         # Projects to dim * 4 so we can reshape into 4 distinct tokens
         self.embed = nn.EmbeddingBag(num_classes + 1, dim * 4, mode='mean')
-
+        self.mlp = nn.Sequential(
+            nn.Linear(dim * 4, dim * 16),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(dim * 16, dim * 4),
+        )
     def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
         """
         y_indices: (N,) concatenated indices
         y_offsets: (B,) start offsets into y_indices
         """
         x = self.embed(y_indices, y_offsets)  # (B, dim * 4)
+        x = self.mlp(x)
         return x.view(x.shape[0], 4, -1)  # (B, 4, dim)
 
 
@@ -223,7 +228,7 @@ class ConvNeXtBlock(nn.Module):
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
-        self.act = nn.GELU()
+        self.act = nn.GELU(approximate="tanh")
         self.pwconv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
 
     def forward(self, x):
