@@ -382,10 +382,10 @@ def train(config_path):
                 pred = model(xt, t, y_indices, y_offsets)
                 # Scale loss by accumulation steps
                 loss = F.mse_loss(pred, target)
-                x0_pred = xt - t * pred
+                x0_pred = xt - t_reshaped * pred
                 x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
                 contrast_loss = F.mse_loss(x0_pred, x0_neg)
-                loss = (loss + 0.05 * contrast_loss) / accum_steps
+                loss = (loss) / accum_steps
 
             loss.backward()
             loss_accum += loss.item()

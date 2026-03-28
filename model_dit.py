@@ -305,7 +305,7 @@ class TokenformerDiT(nn.Module):
 
         # Standard UNet-style end skip connection
         x = torch.cat([x, x_in], dim=1)
-        x = self.conv_mix(x)
+        #x = self.conv_mix(x)
         x = self.final_out_proj(x)
 
         if not return_features:
