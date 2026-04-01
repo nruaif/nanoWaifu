@@ -13,3 +13,4 @@ transformers
 accelerate
 nvitop
 bitsandbytes
+git+https://github.com/microsoft/dion.git

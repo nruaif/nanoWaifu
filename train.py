@@ -46,7 +46,10 @@ def disp_loss(Z, tau):
 def get_model_and_sampler(config):
     model_type = config['model'].get('type', 'v2')
 
-    if True:
+    if model_type == 'mar':
+        from model_mar import MARModel as ModelClass, TagProcessor, sample_mar as sample_fn
+        print(">>> Training MAR Model")
+    elif model_type == 'dit' or True:
         from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn
         # We'll use the TagProcessor from model_v2 as it's compatible
         from model_v2 import TagProcessor
@@ -101,7 +104,7 @@ def save_checkpoint(
         config,
         fixed_prompts=None,
         fixed_noise=None,
-        push_to_hf=True,
+        push_to_hf=False,
         repo_id="Shio-Koube/ConvNext-Diff"
 ):
     if rank != 0:
@@ -231,7 +234,7 @@ def train(config_path):
             num_classes=num_classes,
             latent_size=latent_size,
             use_checkpoint=config['training'].get('gradient_checkpointing', False)
-        ).to(device, memory_format=torch.channels_last)
+        ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
     else:
         model = ModelClass(
             in_channels=in_channels,
@@ -241,7 +244,7 @@ def train(config_path):
             patch_size=config['model'].get('patch_size', 16),
             use_t_cond=True,
             use_checkpoint=config['training'].get('gradient_checkpointing', False)
-        ).to(device, memory_format=torch.channels_last)
+        ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
 
     # Resume Logic
     global_step = 0
@@ -289,12 +292,67 @@ def train(config_path):
         print(">>> Compiling Model...")
         model = torch.compile(model)
 
-    optimizer = bnb.optim.AdamW8bit(
-        model.parameters(),
+    from dion import NorMuon, AdamW as DionAdamW
+    
+    adamw_params = []
+    normuon_params = []
+    
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+            
+        # 1 dim param (bias, LN/GN weights), conv dw (groups=C implies p.ndim=4 and p.shape[1]=1), embedding
+        is_1d = p.ndim == 1
+        is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
+        is_embedding = 'embed' in name or isinstance(p, torch.nn.Embedding) or isinstance(p, torch.nn.EmbeddingBag) or 'token_embed' in name
+        
+        if is_1d or is_dwconv or is_embedding:
+            adamw_params.append(p)
+        else:
+            normuon_params.append(p)
+            
+    opt_adamw = DionAdamW(
+        adamw_params,
         lr=config['training']['learning_rate'],
         weight_decay=0.1,
         betas=(0.9, 0.95)
     )
+    
+    try:
+        opt_normuon = NorMuon(
+            normuon_params,
+            lr=config['training']['learning_rate'],
+            weight_decay=0.1,
+            betas=(0.9, 0.95)
+        )
+    except TypeError:
+        opt_normuon = NorMuon(
+            normuon_params,
+            lr=config['training']['learning_rate'],
+            weight_decay=0.1
+        )
+        
+    class DualOptimizer:
+        def __init__(self, opt1, opt2):
+            self.opt1 = opt1
+            self.opt2 = opt2
+            
+        def step(self):
+            self.opt1.step()
+            self.opt2.step()
+            
+        def zero_grad(self, set_to_none=True):
+            self.opt1.zero_grad(set_to_none=set_to_none)
+            self.opt2.zero_grad(set_to_none=set_to_none)
+            
+        def state_dict(self):
+            return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
+            
+        def load_state_dict(self, state):
+            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
+            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
+            
+    optimizer = DualOptimizer(opt_adamw, opt_normuon)
 
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
@@ -359,33 +417,43 @@ def train(config_path):
                 fixed_prompts = prompts[:16]
                 fixed_noise = torch.randn_like(inputs[:16])
 
-            # --- Flow Matching / Rectified Flow Training ---
-            B, C, H, W = inputs.shape
+            if config['model'].get('type', 'v2') == 'mar':
+                inputs = inputs.to(torch.bfloat16)
+                loss = model(inputs, y_indices, y_offsets)
+                loss = loss / accum_steps
+                contrast_loss = torch.tensor(0.0)
+            else:
+                # --- Flow Matching / Rectified Flow Training ---
+                B, C, H, W = inputs.shape
 
-            # 1. Calculate effective dimension (m) and scaling factor (alpha)
-            m = C * H * W
-            n = 32768.0
-            alpha = (m / n) ** 0.5
+                # 1. Calculate effective dimension (m) and scaling factor (alpha)
+                m = C * H * W
+                n = 32768.0
+                alpha = (m / n) ** 0.5
 
-            # 2. Sample base uniform timestep
-            t_base = torch.rand((B,), device=device)
+                # 2. Sample base uniform timestep
+                t_base = torch.rand((B,), device=device)
 
-            # 3. Apply Dimension-Dependent Shift formula
-            t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
+                # 3. Apply Dimension-Dependent Shift formula
+                t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
 
-            t_reshaped = t.view(-1, 1, 1, 1)
-            noise = torch.randn_like(inputs)
-            xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-            target = noise - inputs
-            # -----------------------------------------------
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                t_reshaped = t.view(-1, 1, 1, 1)
+                noise = torch.randn_like(inputs)
+                xt = (1 - t_reshaped) * inputs + t_reshaped * noise
+                target = noise - inputs
+                # -----------------------------------------------
+                
+                xt = xt.to(torch.bfloat16)
+                t = t.to(torch.bfloat16)
+                target = target.to(torch.bfloat16)
+                
                 pred = model(xt, t, y_indices, y_offsets)
                 # Scale loss by accumulation steps
                 loss = F.mse_loss(pred, target)
-                x0_pred = xt - t_reshaped * pred
+                x0_pred = xt - t_reshaped.to(torch.bfloat16) * pred
                 x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
                 contrast_loss = F.mse_loss(x0_pred, x0_neg)
-                loss = (loss) / accum_steps
+                loss = loss / accum_steps
 
             loss.backward()
             loss_accum += loss.item()
@@ -416,7 +484,7 @@ def train(config_path):
                 with torch.no_grad():
                     samples = sample_fn(
                         model.module if hasattr(model, 'module') else model,
-                        tag_processor, inputs.shape[-1], 16, fixed_prompts, device,
+                        tag_processor, (inputs.shape[2], inputs.shape[3]), 16, fixed_prompts, device,
                         cfg_scale=config['training'].get('cfg_scale', 1.4),
                         noise=fixed_noise
                     )
@@ -461,6 +529,14 @@ def train(config_path):
         save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
                         global_step, config, fixed_prompts, fixed_noise)
         wandb.finish()
+    cleanup_ddp()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config.yaml")
+    args = parser.parse_args()
+    train(args.config)sh()
     cleanup_ddp()
 
 

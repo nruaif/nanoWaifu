@@ -21,42 +21,8 @@ class MeanPoolingEmbedder(nn.Module):
         y_offsets: (B,) start offsets into y_indices
         """
         x = self.embed(y_indices, y_offsets)  # (B, dim * 4)
-        x = self.mlp(x)
+        x = x + self.mlp(x)
         return x.view(x.shape[0], 4, -1)  # (B, 4, dim)
-
-
-class Pattention(nn.Module):
-    """
-    Token-Parameter Attention (Pattention) Layer optimized for PyTorch.
-    This replaces explicit K_P/V_P tensors with two bias-free Linear layers.
-    """
-
-    def __init__(self, in_dim: int, out_dim: int, num_pairs: int):
-        super().__init__()
-        self.num_pairs = num_pairs
-
-        # Layer 1 acts as K_P: Projects from input dimension to the number of parameter pairs (slots)
-        self.k_proj = nn.Linear(in_dim, num_pairs, bias=False)
-
-        # Layer 2 acts as V_P: Projects from the parameter slots back to the output dimension
-        self.v_proj = nn.Linear(num_pairs, out_dim, bias=False)
-
-        # Initialize weights to match the paper's scaling
-        nn.init.normal_(self.k_proj.weight, std=in_dim ** -0.5)
-        nn.init.normal_(self.v_proj.weight, std=out_dim ** -0.5)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Similarity Scores: X @ K_P^T
-        A = self.k_proj(x)  # Shape: (B, N, num_pairs)
-
-        # 2. Modified Softmax: L2 norm + GeLU
-        A_norm = F.normalize(A, p=2, dim=-1)
-        S = F.gelu(A_norm * math.sqrt(self.num_pairs))
-
-        # 3. Weighted Sum: S @ V_P
-        O = self.v_proj(S)  # Shape: (B, N, out_dim)
-
-        return O
 
 
 class GGRoPE2d(nn.Module):
@@ -90,24 +56,33 @@ class GGRoPE2d(nn.Module):
         )
         directions_hF2 = torch.stack((torch.cos(phi_hF), torch.sin(phi_hF)), dim=-1)
         freqs_hF2 = omega_F.unsqueeze(-1) * directions_hF2
-
         self.register_buffer("freqs_hF2", freqs_hF2)
+
+        # ADD A CACHE DICTIONARY
+        self._cache = {}
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, h, N, d = x.shape
-        F_dim = d // 2
 
-        xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
-        x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
-        y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
+        # CHECK CACHE FIRST
+        cache_key = (H, W, x.device, x.dtype)
+        if cache_key not in self._cache:
+            xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
+            x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
+            y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
 
-        y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
-        positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
+            y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
+            positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
 
-        theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
+            theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
 
-        cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)
-        sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
+            cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)
+            sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
+
+            self._cache[cache_key] = (cos, sin)
+
+        # RETRIEVE FROM CACHE
+        cos, sin = self._cache[cache_key]
 
         x_fp32 = x.float()
         x1, x2 = x_fp32.chunk(2, dim=-1)
@@ -120,7 +95,7 @@ class GGRoPE2d(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+    def __init__(self, dim, eps=1e-6, elementwise_affine=True):
         super().__init__()
         self.eps = eps
         self.dim = dim
@@ -134,71 +109,109 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (self.dim,), weight=self.weight, eps=self.eps)
 
 
-class TokenformerAttention(nn.Module):
-    def __init__(self, dim, num_heads=12, attn_kv_pairs=576, qk_norm=True):
+class MlpDW(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        out_features = out_features or in_features
+        self.fc1 = nn.Conv2d(in_features, hidden_features, 1)
+        self.dwconv = nn.Conv2d(hidden_features, hidden_features, 3, padding=1, groups=hidden_features)
+        self.act = nn.GELU(approximate="tanh")
+        self.fc2 = nn.Conv2d(hidden_features, out_features, 1)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.dwconv(self.fc1(x))))
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, num_heads):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
+        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
-        # Replaced standard linear QKV with Pattention layers
-        self.q_proj = Pattention(dim, dim, attn_kv_pairs)
-        self.k_proj = Pattention(dim, dim, attn_kv_pairs)
-        self.v_proj = Pattention(dim, dim, attn_kv_pairs)
-        self.o_proj = Pattention(dim, dim, attn_kv_pairs)
-
-        self.qk_norm = qk_norm
-        if qk_norm:
-            # Paper explicitly removes parameter weights from Norm to facilitate scaling
-            self.q_norm = RMSNorm(self.head_dim, elementwise_affine=False)
-            self.k_norm = RMSNorm(self.head_dim, elementwise_affine=False)
-
-    def forward(self, x, H, W, rope=None):
+    def forward(self, x, H, W, rope):
         B, N, C = x.shape
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2), qkv)
 
-        q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        
+        q = rope(q, H, W)
+        k = rope(k, H, W)
 
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-        if rope is not None:
-            # Dynamically slice to isolate spatial tokens from prefixes (t_token + y_tokens)
-            prefix_len = N - (H * W)
-            q_prefix, q_spatial = q[:, :, :prefix_len, :], q[:, :, prefix_len:, :]
-            k_prefix, k_spatial = k[:, :, :prefix_len, :], k[:, :, prefix_len:, :]
-
-            q_spatial = rope(q_spatial, H, W)
-            k_spatial = rope(k_spatial, H, W)
-
-            q = torch.cat([q_prefix, q_spatial], dim=2)
-            k = torch.cat([k_prefix, k_spatial], dim=2)
-
-        x_att = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=0.0,
-            is_causal=False
-        )
-
+        x_att = F.scaled_dot_product_attention(q, k, v)
         x_att = x_att.transpose(1, 2).reshape(B, N, C)
-        return self.o_proj(x_att)
+        return self.proj(x_att)
 
 
-class TokenformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, attn_kv_pairs, ffn_kv_pairs):
+class CrossAttention(nn.Module):
+    def __init__(self, dim, context_dim, num_heads):
         super().__init__()
-        self.norm1 = RMSNorm(dim, elementwise_affine=False)
-        self.attn = TokenformerAttention(dim, num_heads, attn_kv_pairs)
-        self.norm2 = RMSNorm(dim, elementwise_affine=False)
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(context_dim, dim * 2)
+        self.proj = nn.Linear(dim, dim)
+        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
+        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
-        # Tokenformer uses a single Pattention layer for the entire FFN block
-        self.ffn = Pattention(dim, dim, ffn_kv_pairs)
+    def forward(self, x, context):
+        B, N, C = x.shape
+        _, M, _ = context.shape
+        
+        q = self.q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(context).chunk(2, dim=-1)
+        k, v = map(lambda t: t.view(B, M, self.num_heads, self.head_dim).transpose(1, 2), kv)
 
-    def forward(self, x, H, W, rope=None):
-        x = x + self.attn(self.norm1(x), H, W, rope=rope)
-        x = x + self.ffn(self.norm2(x))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        x_att = F.scaled_dot_product_attention(q, k, v)
+        x_att = x_att.transpose(1, 2).reshape(B, N, C)
+        return self.proj(x_att)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, use_cross_attn=False, context_dim=None):
+        super().__init__()
+        self.norm1 = RMSNorm(dim)
+        self.self_attn = SelfAttention(dim, num_heads)
+        
+        self.use_cross_attn = use_cross_attn
+        if use_cross_attn:
+            self.norm2 = RMSNorm(dim)
+            self.cross_attn = CrossAttention(dim, context_dim, num_heads)
+            
+        self.norm3 = RMSNorm(dim)
+        self.mlp = MlpDW(dim, dim * 4, dim)
+
+    def forward(self, x, rope, context=None):
+        B, C, H, W = x.shape
+        
+        # Self attention
+        x_flat = x.flatten(2).transpose(1, 2)
+        x_norm1 = self.norm1(x_flat)
+        attn_out = self.self_attn(x_norm1, H, W, rope)
+        x = x + attn_out.transpose(1, 2).reshape(B, C, H, W)
+        
+        # Cross attention
+        if self.use_cross_attn:
+            x_flat = x.flatten(2).transpose(1, 2)
+            x_norm2 = self.norm2(x_flat)
+            cross_out = self.cross_attn(x_norm2, context)
+            x = x + cross_out.transpose(1, 2).reshape(B, C, H, W)
+            
+        # MLP
+        x_flat = x.flatten(2).transpose(1, 2)
+        x_norm3 = self.norm3(x_flat).transpose(1, 2).reshape(B, C, H, W)
+        mlp_out = self.mlp(x_norm3)
+        x = x + mlp_out
+        
         return x
 
 
@@ -222,41 +235,21 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(emb)
 
 
-class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
-        self.act = nn.GELU(approximate="tanh")
-        self.pwconv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
-
-    def forward(self, x):
-        shortcut = x
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        return x + shortcut
-
-
 class TokenformerDiT(nn.Module):
     """
-    Tokenformer Architecture (Default: 124M specs)
+    DiT with UNet architecture (2-4-2 blocks configs).
+    Conditions via cross attention at the mid stage, keeping the 2D feature map.
+    Includes DW conv in the MLP block.
     """
-
     def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
                  attn_kv_pairs=576, ffn_kv_pairs=2304, num_classes=12476,
                  use_checkpoint=False, **kwargs):
         super().__init__()
         self.dim = dim
-        self.depth = depth
         self.use_checkpoint = use_checkpoint
 
-        self.patch_embed = nn.Linear(in_channels, dim)
+        self.patch_embed = nn.Conv2d(in_channels, dim, kernel_size=1)
+        
         self.t_embedder = TimestepEmbedder(dim)
         self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
 
@@ -267,52 +260,87 @@ class TokenformerDiT(nn.Module):
             max_freq=100.0
         )
 
-        self.blocks = nn.ModuleList([
-            TokenformerBlock(dim, num_heads, attn_kv_pairs, ffn_kv_pairs)
-            for _ in range(depth)
+        # 2-4-2 blocks config
+        # Down stage: 2 blocks
+        self.down_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads, use_cross_attn=False) for _ in range(2)
+        ])
+        
+        self.downsample = nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1)
+        
+        # Mid stage: 4 blocks (Cross Attention injected here)
+        self.mid_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads, use_cross_attn=True, context_dim=dim) for _ in range(4)
+        ])
+        
+        self.upsample = nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1)
+        
+        # Up stage: 2 blocks
+        self.up_projs = nn.ModuleList([
+            nn.Conv2d(dim * 2, dim, kernel_size=1) for _ in range(2)
+        ])
+        self.up_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads, use_cross_attn=False) for _ in range(2)
         ])
 
-        self.final_norm = RMSNorm(dim, elementwise_affine=False)
-        self.final_proj = nn.Linear(dim, in_channels)
+        self.final_norm = RMSNorm(dim)
+        self.final_proj = nn.Conv2d(dim, in_channels, kernel_size=1)
 
-        self.conv_mix = ConvNeXtBlock(in_channels * 2)
         self.final_out_proj = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
 
     def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False):
         B, C, H, W = x_in.shape
-        x = x_in.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        x = self.patch_embed(x)
-
-        # Prefix is now precisely 5 tokens: 1 for time, 4 for condition
+        x = self.patch_embed(x_in)
+        
+        # Prefix tokens for context (t + 4*y = 5 tokens)
         t_token = self.t_embedder(t).unsqueeze(1)
-        y_token = self.y_embedder(y_indices, y_offsets)
-
-        x = torch.cat([t_token, y_token, x], dim=1)
-
-        # Removed internal DiT Skip Logic. Straight sequential processing.
-        for block in self.blocks:
+        y_tokens = self.y_embedder(y_indices, y_offsets)
+        context = torch.cat([t_token, y_tokens], dim=1)
+        
+        skips = []
+        
+        # Down blocks
+        for block in self.down_blocks:
             if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, H, W, self.rope, use_reentrant=False)
+                x = checkpoint(block, x, self.rope, None, use_reentrant=False)
             else:
-                x = block(x, H, W, rope=self.rope)
-
-        feat = x
-        x = self.final_norm(x)
-        x = self.final_proj(x)
-
-        # Remove the 5 prefix tokens
-        x = x[:, 5:, :].reshape(B, H, W, -1).permute(0, 3, 1, 2)
+                x = block(x, self.rope, None)
+            skips.append(x)
+            
+        x = self.downsample(x)
+        
+        # Mid blocks
+        for block in self.mid_blocks:
+            if self.use_checkpoint and self.training:
+                x = checkpoint(block, x, self.rope, context, use_reentrant=False)
+            else:
+                x = block(x, self.rope, context)
+                
+        feat = x.flatten(2).transpose(1, 2)
+        
+        x = self.upsample(x)
+        
+        # Up blocks
+        for proj, block, skip in zip(self.up_projs, self.up_blocks, reversed(skips)):
+            x = torch.cat([x, skip], dim=1)
+            x = proj(x)
+            if self.use_checkpoint and self.training:
+                x = checkpoint(block, x, self.rope, None, use_reentrant=False)
+            else:
+                x = block(x, self.rope, None)
+                
+        x_flat = x.flatten(2).transpose(1, 2)
+        x_norm = self.final_norm(x_flat).transpose(1, 2).reshape(B, self.dim, H, W)
+        x = self.final_proj(x_norm)
 
         # Standard UNet-style end skip connection
-        x = torch.cat([x, x_in], dim=1)
-        #x = self.conv_mix(x)
-        x = self.final_out_proj(x)
+        x_out = torch.cat([x, x_in], dim=1)
+        x_out = self.final_out_proj(x_out)
 
         if not return_features:
-            return x
+            return x_out
         else:
-            return x, feat
-
+            return x_out, feat
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
@@ -320,7 +348,7 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     """
     Simplified sample_flow (removed CFG dropping logic as requested).
     """
-    in_channels = model.final_proj.out_features
+    in_channels = model.final_proj.out_channels
     model.eval()
     H = W = latent_size
 
@@ -353,42 +381,32 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
 
 if __name__ == "__main__":
-    print("Initializing TokenformerDiT on CPU...")
+    print("Initializing UNetDiT on CPU...")
     device = torch.device("cpu")
 
-    # Initialize the model with the default 124M specs outlined in the paper
     model = TokenformerDiT(
         in_channels=32,
         dim=768,
-        depth=12,
         num_heads=12,
-        attn_kv_pairs=576,
-        ffn_kv_pairs=2304,
         num_classes=12476
     ).to(device)
 
-    # 1. Count and format parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model Parameters: {num_params / 1e6:.2f} M")
 
-    # 2. Create dummy inputs
     batch_size = 2
     latent_size = 16  # Represents H and W
 
     x_in = torch.randn(batch_size, 32, latent_size, latent_size, device=device)
     t = torch.rand(batch_size, device=device)
 
-    # Dummy tags for the MeanPoolingEmbedder
-    # Let's assume each item in the batch has exactly 3 tags
     y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
 
     print("\nRunning forward pass...")
 
-    # 3. Run the forward pass
     output = model(x_in, t, y_indices, y_offsets)
 
-    # 4. Verification
     print(f"Input shape:  {x_in.shape}")
     print(f"Output shape: {output.shape}")
 

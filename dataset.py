@@ -182,10 +182,16 @@ def transform_sample(sample):
             prompt = str(json_data)
             full_prompt = prompt
     elif "txt" in sample:
-        prompt = sample["txt"]
+        txt_data = sample["txt"]
+        if isinstance(txt_data, bytes):
+            txt_data = txt_data.decode("utf-8")
+        prompt = txt_data
         full_prompt = prompt
     elif "caption" in sample:
-        prompt = sample["caption"]
+        cap_data = sample["caption"]
+        if isinstance(cap_data, bytes):
+            cap_data = cap_data.decode("utf-8")
+        prompt = cap_data
         full_prompt = prompt
 
     return {
@@ -247,9 +253,25 @@ class WDSLoader:
             self.class_map = self.load_class_map(csv_path)
             self.num_classes = len(self.class_map)
 
-        # Transforms parameters
-        self.scale = (0.5, 1.0)
-        self.ratio = (3. / 4., 4. / 3.)
+        # Precalculate buckets
+        base_size = self.image_size
+        target_area = base_size ** 2
+        
+        # Common aspect ratios for anime/manga
+        # 1:1, 3:4, 4:3, 9:16, 16:9
+        aspect_ratios = [1.0, 0.75, 1.33, 0.56, 1.78]
+        self.buckets = []
+        for ar in aspect_ratios:
+            # w * h = area, w / h = ar  =>  h^2 * ar = area => h = sqrt(area / ar)
+            h = int(math.sqrt(target_area / ar))
+            w = int(h * ar)
+            # Round to nearest multiple of 16 for FCDM/MAR/Patching compatibility
+            h = (h // 16) * 16
+            w = (w // 16) * 16
+            if h > 0 and w > 0:
+                self.buckets.append((h, w))
+        
+        self.bucket_ars = [bw / bh for bh, bw in self.buckets]
 
     def load_class_map(self, csv_path):
         if csv_path.endswith('.txt'):
@@ -289,10 +311,16 @@ class WDSLoader:
                     prompt = meta.get("character", "unknown")
                     full_prompt = prompt
                 elif "txt" in sample:
-                    prompt = sample["txt"]
+                    txt_data = sample["txt"]
+                    if isinstance(txt_data, bytes):
+                        txt_data = txt_data.decode("utf-8")
+                    prompt = txt_data
                     full_prompt = prompt
                 elif "caption" in sample:
-                    prompt = sample["caption"]
+                    cap_data = sample["caption"]
+                    if isinstance(cap_data, bytes):
+                        cap_data = cap_data.decode("utf-8")
+                    prompt = cap_data
                     full_prompt = prompt
                 else:
                     prompt = ""
@@ -304,33 +332,13 @@ class WDSLoader:
             elif not isinstance(image, Image.Image):
                 return None
 
-            # Resolution Bucketing based on image_size
-            # We create buckets with same total pixel count (image_size^2) but different ARs
-            base_size = self.image_size
-            target_area = base_size ** 2
-            
-            # Common aspect ratios for anime/manga
-            # 1:1, 3:4, 4:3, 9:16, 16:9
-            aspect_ratios = [1.0, 0.75, 1.33, 0.56, 1.78]
-            buckets = []
-            for ar in aspect_ratios:
-                # w * h = area, w / h = ar  =>  h^2 * ar = area => h = sqrt(area / ar)
-                h = int(math.sqrt(target_area / ar))
-                w = int(h * ar)
-                # Round to nearest multiple of 16 for FCDM/Patching compatibility
-                h = (h // 32) * 32
-                w = (w // 32) * 32
-                buckets.append((h, w))
-            
-            bucket_ars = [bw / bh for bh, bw in buckets]
-
             w, h = image.size
             img_ar = w / h
 
             # Find closest bucket by aspect ratio
-            best_bucket_idx = min(range(len(bucket_ars)), key=lambda i: abs(bucket_ars[i] - img_ar))
-            target_h, target_w = buckets[best_bucket_idx]
-            target_ar = bucket_ars[best_bucket_idx]
+            best_bucket_idx = min(range(len(self.bucket_ars)), key=lambda i: abs(self.bucket_ars[i] - img_ar))
+            target_h, target_w = self.buckets[best_bucket_idx]
+            target_ar = self.bucket_ars[best_bucket_idx]
 
             # Resize to cover
             if img_ar > target_ar:
@@ -344,10 +352,14 @@ class WDSLoader:
 
             image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-            # Center crop to bucket size
-            left = (new_w - target_w) // 2
-            top = (new_h - target_h) // 2
+            # Random crop to bucket size
+            left = random.randint(0, max(0, new_w - target_w))
+            top = random.randint(0, max(0, new_h - target_h))
             image = image.crop((left, top, left + target_w, top + target_h))
+
+            # Random Horizontal Flip
+            if random.random() < 0.5:
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
 
             # To Tensor and Normalize [-1, 1]
             image = F.to_tensor(image)

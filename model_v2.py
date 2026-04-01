@@ -2,381 +2,473 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import random
-class ProjectedAdaLN(nn.Module):
-    def __init__(self, dim, cond_dim, eps=1e-6):
+
+from collections import namedtuple
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.proj = nn.Linear(cond_dim, 2 * dim)
-
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, x, c):
-        scale_shift = self.proj(c)
-        scale, shift = scale_shift.chunk(2, dim=1)
-        scale, shift = scale.tanh(), shift.tanh()
-
-        # Dynamically reshape for broadcasting depending on if x is 3D or 4D
-        for _ in range(x.dim() - 2):
-            scale = scale.unsqueeze(1)
-            shift = shift.unsqueeze(1)
-
-        x_norm = F.layer_norm(x, (x.shape[-1],), eps=self.eps)
-        return x_norm * (1 + scale) + shift
-
-def gelu_act(x):
-    return F.gelu(x, approximate='tanh')
-
-class GRN(nn.Module):
-    """Global Response Normalization [cite: 64, 101]"""
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, dim, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
-        return self.gamma * (x * nx) + self.beta + x
+        norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
 
-
-class FCDMBlock(nn.Module):
-    def __init__(self, dim, cond_dim, r=3):
+class SeparableConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, 
+                                   stride=stride, padding=padding, groups=in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-        # Replace standard LayerNorm with your new Projected module
-        self.norm = ProjectedAdaLN(dim, cond_dim)
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
 
-        self.pwconv1 = nn.Conv2d(dim, dim * r, kernel_size=1)
-        self.grn = GRN(dim * r)
-        self.pwconv2 = nn.Conv2d(dim * r, dim, kernel_size=1)
-
-        # We still need the gate/alpha for the residual connection.
-        # This is now just 1 * dim instead of 3 * dim
-        self.adaLN_gate = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, dim)
-        )
-        nn.init.zeros_(self.adaLN_gate[-1].weight)
-        nn.init.zeros_(self.adaLN_gate[-1].bias)
-
-    def forward(self, x, c):
-        shortcut = x
-        x = self.dwconv(x)
-
-        # Apply the projected norm
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x, c)  # Pass the combined condition 'c' here
-        x = x.permute(0, 3, 1, 2)
-
-        # Inverted bottleneck
-        x = self.pwconv1(x)
-        x = gelu_act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
-
-        # Get the gate parameter (alpha)
-        gate = self.adaLN_gate(c).tanh()[..., None, None]
-
-        return shortcut + x * gate
-class ViTBlock(nn.Module):
-    """Vision Transformer block with AdaLN and ReLU^2."""
-    def __init__(self, dim, cond_dim, r=4, head_dim=64):
+class Timesteps(nn.Module):
+    def __init__(self, num_channels: int = 256):
         super().__init__()
-        # Ensure head_dim is always 64 for GPU efficiency.
-        self.num_heads = dim // head_dim
-        if self.num_heads == 0: self.num_heads = 1
-        self.head_dim = head_dim
-        
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * r),
-            # ReLU^2 handled in forward
-            nn.Linear(dim * r, dim)
+        self.num_channels = num_channels
+
+    def forward(self, timesteps):
+        half_dim = self.num_channels // 2
+        exponent = -math.log(10000) * torch.arange(
+            half_dim, dtype=torch.float32, device=timesteps.device
         )
+        exponent = exponent / (half_dim - 0.0)
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, 6 * dim) # 3 for attn, 3 for mlp
-        )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        emb = torch.exp(exponent)
+        emb = timesteps[:, None].float() * emb[None, :]
 
-    def forward(self, x, c):
-        B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        
-        # AdaLN modulation
-        mods = self.adaLN_modulation(c).chunk(6, dim=1)
-        mods = [m.tanh() for m in mods]
-        shift1, scale1, gate1, shift2, scale2, gate2 = [m[:, None, :] for m in mods]
+        sin_emb = torch.sin(emb)
+        cos_emb = torch.cos(emb)
+        emb = torch.cat([cos_emb, sin_emb], dim=-1)
 
-        # Attention Branch
-        shortcut = x_flat
-        x_norm = self.norm1(x_flat)
-        x_norm = x_norm * scale1 + shift1
-        
-        # Flash Attention using scaled_dot_product_attention
-        qkv = self.qkv(x_norm).reshape(B, H * W, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        x_attn = F.scaled_dot_product_attention(q, k, v)
-        x_attn = x_attn.transpose(1, 2).reshape(B, H * W, C)
-        x_attn = self.proj(x_attn)
-        
-        x_flat = shortcut + x_attn * gate1
+        return emb
 
-        # MLP Branch
-        shortcut = x_flat
-        x_norm = self.norm2(x_flat)
-        x_norm = x_norm * scale2 + shift2
-        
-        x_mlp = self.mlp[0](x_norm)
-        x_mlp = gelu_act(x_mlp)
-        x_mlp = self.mlp[1](x_mlp)
-        
-        x_flat = shortcut + x_mlp * gate2
-        
-        return x_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)
+class TimestepEmbedding(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(TimestepEmbedding, self).__init__()
+        self.linear_1 = nn.Linear(in_features, out_features, bias=True)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(out_features, out_features, bias=True)
 
-class CSPStage(nn.Module):
-    """Cross Stage Partial Stage.
-    Switches to a ViT block every 3 blocks."""
-    def __init__(self, dim, cond_dim, num_blocks, use_checkpoint=False):
-        super().__init__()
-        self.split_dim = dim // 2
-        self.use_checkpoint = use_checkpoint
-        
-        blocks = []
-        for i in range(1, num_blocks + 1):
-            if i % 3 == 0:
-                blocks.append(ViTBlock(self.split_dim, cond_dim))
-            else:
-                blocks.append(FCDMBlock(self.split_dim, cond_dim))
-        
-        self.blocks = nn.ModuleList(blocks)
-        # Fusion layer to mix the partial branches
-        self.conv_fuse = nn.Conv2d(dim, dim, kernel_size=1)
+    def forward(self, sample):
+        sample = self.linear_1(sample)
+        sample = self.act(sample)
+        sample = self.linear_2(sample)
 
-    def _forward_blocks(self, x2, c):
-        for block in self.blocks:
-            x2 = block(x2, c)
-        return x2
+        return sample
 
-    def forward(self, x, c, feat_layers=None, start_idx=0):
-        # Split channels: x1 is identity, x2 goes through blocks
-        x1, x2 = x.chunk(2, dim=1)
-        
-        if self.use_checkpoint and x2.requires_grad:
-            x2 = torch.utils.checkpoint.checkpoint(self._forward_blocks, x2, c, use_reentrant=False)
+class ResnetBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, time_embed_dim=1024, conv_shortcut=True):
+        super(ResnetBlock2D, self).__init__()
+        self.norm1 = nn.GroupNorm(32, in_channels, eps=1e-05, affine=True)
+        self.conv1 = SeparableConv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.time_emb_proj = nn.Linear(time_embed_dim, out_channels, bias=True)
+        self.norm2 = nn.GroupNorm(32, out_channels, eps=1e-05, affine=True)
+        self.dropout = nn.Dropout(p=0.0, inplace=False)
+        self.conv2 = SeparableConv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.nonlinearity = nn.SiLU()
+        self.conv_shortcut = None
+        if conv_shortcut:
+            self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
+
+    def forward(self, input_tensor, temb):
+        hidden_states = input_tensor
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.conv1(hidden_states)
+
+        temb = self.nonlinearity(temb)
+        temb = self.time_emb_proj(temb)[:, :, None, None]
+        hidden_states = hidden_states + temb
+        hidden_states = self.norm2(hidden_states)
+
+        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states)
+
+        if self.conv_shortcut is not None:
+            input_tensor = self.conv_shortcut(input_tensor)
+
+        output_tensor = input_tensor + hidden_states
+
+        return output_tensor
+
+class Attention(nn.Module):
+    def __init__(self, inner_dim, cross_attention_dim=None, num_heads=None, dropout=0.0):
+        super(Attention, self).__init__()
+        if num_heads is None:
+            self.head_dim = 64
+            self.num_heads = inner_dim // self.head_dim
         else:
-            x2 = self._forward_blocks(x2, c)
+            self.num_heads = num_heads
+            self.head_dim = inner_dim // num_heads
 
-        # Intermediate feature extraction is harder with checkpointing if they are inside the checkpointed block.
-        # For simplicity, if feat_layers is requested, we might skip checkpointing or handle it carefully.
-        # Here, we'll just re-run or ignore feat_layers if checkpointing is on for the whole stage.
-        # But wait, feat_layers in original code was inside the loop.
+        self.scale = self.head_dim**-0.5
+        if cross_attention_dim is None:
+            cross_attention_dim = inner_dim
+        self.to_q = nn.Linear(inner_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+        self.to_out = nn.ModuleList([
+            nn.Linear(inner_dim, inner_dim), 
+            nn.Dropout(dropout, inplace=False)
+        ])
+
+    def forward(self, hidden_states, encoder_hidden_states=None):
+        q = self.to_q(hidden_states)
+        k = self.to_k(encoder_hidden_states) if encoder_hidden_states is not None else self.to_k(hidden_states)
+        v = self.to_v(encoder_hidden_states) if encoder_hidden_states is not None else self.to_v(hidden_states)
         
-        feats = {}
-        if feat_layers:
-            # If features are needed, we perform a non-checkpointed pass for now to keep it simple,
-            # or we could implement a more granular checkpointing.
-            # Let's stick to the requested change and keep it functional.
-            x2_feat = x.chunk(2, dim=1)[1]
-            for i, block in enumerate(self.blocks):
-                x2_feat = block(x2_feat, c)
-                if (start_idx + i + 1) in feat_layers:
-                    feats[start_idx + i + 1] = self.conv_fuse(torch.cat([x1, x2_feat], dim=1))
-
-        # Concatenate and fuse
-        out = self.conv_fuse(torch.cat([x1, x2], dim=1))
-        return out, feats
-
-class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep embedding"""
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.hidden_dim = hidden_dim
-
-    def forward(self, t):
-        half_dim = self.hidden_dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-        emb = t.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        return self.mlp(emb)
-
-class FCDMV2(nn.Module):
-    """Fully Convolutional Diffusion Model U-Net V2 with CSP, Hybrid ViT, ReLU^2 and PixelShuffle Head."""
-    def __init__(self, in_channels=3, base_channels=128, num_blocks=2, num_classes=12476, patch_size=16, use_t_cond=True, use_checkpoint=False):
-        super().__init__()
-        self.c = base_channels
-        self.l = num_blocks
-        self.in_channels = in_channels
-        self.patch_size = patch_size
-        self.num_classes = num_classes
-        self.use_t_cond = use_t_cond
-        self.use_checkpoint = use_checkpoint
+        b, t, _ = q.size()
         
-        if self.use_t_cond:
-            self.t_embedder = TimestepEmbedder(self.c * 4)
-        self.y_embedder = nn.EmbeddingBag(num_classes + 1, self.c * 4, mode='mean')
-        cond_dim = self.c * 4
+        q = q.view(b, t, self.num_heads, self.head_dim)
+        k = k.view(b, k.size(1), self.num_heads, self.head_dim)
+        v = v.view(b, v.size(1), self.num_heads, self.head_dim)
 
-        # Input Convolution with PixelUnshuffle
-        self.unshuffle = nn.PixelUnshuffle(patch_size)
-        self.conv_in = nn.Conv2d(in_channels * (patch_size ** 2), self.c, kernel_size=7, padding=3)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        # Stage 1 (Encoder)
-        self.enc1 = CSPStage(self.c, cond_dim, self.l, use_checkpoint=use_checkpoint)
-        self.down1 = nn.Conv2d(self.c, self.c * 2, kernel_size=2, stride=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # Stage 2 (Encoder)
-        self.enc2 = CSPStage(self.c * 2, cond_dim, self.l * 2, use_checkpoint=use_checkpoint)
-        self.down2 = nn.Conv2d(self.c * 2, self.c * 4, kernel_size=2, stride=2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, -1)
 
-        # Stage 3 (Bottleneck)
-        self.mid = CSPStage(self.c * 4, cond_dim, self.l * 4, use_checkpoint=use_checkpoint)
+        for layer in self.to_out:
+            attn_output = layer(attn_output)
 
-        # Stage 2 (Decoder)
-        self.up2 = nn.ConvTranspose2d(self.c * 4, self.c * 2, kernel_size=2, stride=2)
-        self.skip_proj2 = nn.Conv2d(self.c * 4, self.c * 2, kernel_size=1)
-        self.dec2 = CSPStage(self.c * 2, cond_dim, self.l * 2, use_checkpoint=use_checkpoint)
+        return attn_output
 
-        # Stage 1 (Decoder)
-        self.up1 = nn.ConvTranspose2d(self.c * 2, self.c, kernel_size=2, stride=2)
-        self.skip_proj1 = nn.Conv2d(self.c * 2, self.c, kernel_size=1)
-        self.dec1 = CSPStage(self.c, cond_dim, self.l, use_checkpoint=use_checkpoint)
+class GEGLU(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GEGLU, self).__init__()
+        self.proj = nn.Linear(in_features, out_features * 2, bias=True)
 
-        # Global Skip Connection Projections
-        self.skip_proj_final = nn.Conv2d(self.c, self.c, kernel_size=1)
-        self.curr_proj_final = nn.Conv2d(self.c, self.c, kernel_size=1)
+    def forward(self, x):
+        x_proj = self.proj(x)
+        x1, x2 = x_proj.chunk(2, dim=-1)
+        return x1 * torch.nn.functional.gelu(x2)
 
-        # Output Head: Simple "Unconv" (PixelShuffle)
-        # Use concat (2 * self.c) for better stability than multiplication
-        self.norm_out = nn.LayerNorm(2 * self.c)
-        self.conv_out = nn.Conv2d(2 * self.c, in_channels * (patch_size ** 2), kernel_size=3, padding=1)
-        self.shuffle = nn.PixelShuffle(patch_size)
+class FeedForward(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(FeedForward, self).__init__()
+        self.net = nn.ModuleList([
+            GEGLU(in_features, out_features * 3),
+            nn.Dropout(p=0.0, inplace=False),
+            nn.Linear(out_features * 3, out_features, bias=True),
+        ])
 
-    def forward(self, x, t, y_indices, y_offsets=None, feat_layers=None):
-        c = self.y_embedder(y_indices, y_offsets)
-        if self.use_t_cond:
-            c = c + self.t_embedder(t)
-        
-        # Pixel Unshuffle and project
-        x = self.unshuffle(x)
-        x = self.conv_in(x)
-        skip_in = x # Final skip connection
-        
-        feats = {}
-        # Encoder
-        x, f = self.enc1(x, c, feat_layers, start_idx=0)
-        if feat_layers: feats.update(f)
-        
-        skip1 = x
-        x = self.down1(x)
-        
-        x, f = self.enc2(x, c, feat_layers, start_idx=self.l)
-        if feat_layers: feats.update(f)
-        
-        skip2 = x
-        x = self.down2(x)
-        
-        # Mid
-        x, f = self.mid(x, c, feat_layers, start_idx=self.l + self.l * 2)
-        if feat_layers: feats.update(f)
-            
-        # Decoder
-        x = self.up2(x)
-        x = torch.cat([x, skip2], dim=1)
-        x = self.skip_proj2(x)
-        x, f = self.dec2(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4)
-        if feat_layers: feats.update(f)
-            
-        x = self.up1(x)
-        x = torch.cat([x, skip1], dim=1)
-        x = self.skip_proj1(x)
-        x, f = self.dec1(x, c, feat_layers, start_idx=self.l + self.l * 2 + self.l * 4 + self.l * 2)
-        if feat_layers: feats.update(f)
-            
-        # Output Head: Concatenated skip connection for stability
-        x = torch.cat([self.curr_proj_final(x), self.skip_proj_final(skip_in)], dim=1)
-        
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm_out(x)
-        x = x.permute(0, 3, 1, 2)
-        x = self.conv_out(x)
-        x = self.shuffle(x)
-        
-        if feat_layers:
-            return x, feats
+    def forward(self, x):
+        for layer in self.net:
+            x = layer(x)
         return x
 
-class TagProcessor:
-    def __init__(self, tags_file):
-        with open(tags_file, 'r', encoding='utf-8') as f:
-            self.tags = [line.strip() for line in f if line.strip()]
-        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
-        self.num_classes = len(self.tags)
-    
-    def process_prompts(self, prompts, device, dropout_prob=0.0):
-        indices = []
-        offsets = [0]
-        for p in prompts:
-            if random.random() < dropout_prob:
-                indices.append(self.num_classes)
-            else:
-                tags = p.split()
-                count = 0
-                for t in tags:
-                    if t in self.tag_to_idx:
-                        indices.append(self.tag_to_idx[t])
-                        count += 1
-                if count == 0:
-                    indices.append(self.num_classes)
-            offsets.append(len(indices))
+class BasicTransformerBlock(nn.Module):
+    def __init__(self, hidden_size, use_self_attn=True, cross_attention_dim=1024):
+        super(BasicTransformerBlock, self).__init__()
+        self.use_self_attn = use_self_attn
+        if self.use_self_attn:
+            self.norm1 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+            self.attn1 = Attention(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+        self.attn2 = Attention(hidden_size, cross_attention_dim)
+        self.norm3 = nn.LayerNorm(hidden_size, eps=1e-05, elementwise_affine=True)
+        self.ff = FeedForward(hidden_size, hidden_size)
+
+    def forward(self, x, encoder_hidden_states=None):
+        if self.use_self_attn:
+            residual = x
+            x = self.norm1(x)
+            x = self.attn1(x)
+            x = x + residual
+
+        residual = x
+        x = self.norm2(x)
+        if encoder_hidden_states is not None:
+            x = self.attn2(x, encoder_hidden_states)
+        else:
+            x = self.attn2(x)
+        x = x + residual
+
+        residual = x
+        x = self.norm3(x)
+        x = self.ff(x)
+        x = x + residual
+        return x
+
+class Transformer2DModel(nn.Module):
+    def __init__(self, in_channels, out_channels, n_layers, use_self_attn=True, cross_attention_dim=1024):
+        super(Transformer2DModel, self).__init__()
+        self.norm = nn.GroupNorm(32, in_channels, eps=1e-06, affine=True)
+        self.proj_in = nn.Linear(in_channels, out_channels, bias=True)
+        self.transformer_blocks = nn.ModuleList(
+            [BasicTransformerBlock(out_channels, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim) for _ in range(n_layers)]
+        )
+        self.proj_out = nn.Linear(out_channels, out_channels, bias=True)
+
+    def forward(self, hidden_states, encoder_hidden_states=None):
+        batch, _, height, width = hidden_states.shape
+        res = hidden_states
+        hidden_states = self.norm(hidden_states)
+        inner_dim = hidden_states.shape[1]
+        hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+        hidden_states = self.proj_in(hidden_states)
+
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, encoder_hidden_states)
+
+        hidden_states = self.proj_out(hidden_states)
+        hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+
+        return hidden_states + res
+
+class Downsample2D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample2D, self).__init__()
+        self.conv = SeparableConv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class Upsample2D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Upsample2D, self).__init__()
+        self.conv = SeparableConv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)
+
+class DownBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, time_embed_dim=1024):
+        super(DownBlock2D, self).__init__()
+        self.resnets = nn.ModuleList([
+            ResnetBlock2D(in_channels, out_channels, time_embed_dim=time_embed_dim, conv_shortcut=False),
+            ResnetBlock2D(out_channels, out_channels, time_embed_dim=time_embed_dim, conv_shortcut=False),
+        ])
+        self.downsamplers = nn.ModuleList([Downsample2D(out_channels, out_channels)])
+
+    def forward(self, hidden_states, temb):
+        output_states = []
+        for module in self.resnets:
+            hidden_states = module(hidden_states, temb)
+            output_states.append(hidden_states)
+
+        hidden_states = self.downsamplers[0](hidden_states)
+        output_states.append(hidden_states)
+
+        return hidden_states, output_states
+
+class CrossAttnDownBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, n_layers, has_downsamplers=True, use_self_attn=True, time_embed_dim=1024, cross_attention_dim=1024):
+        super(CrossAttnDownBlock2D, self).__init__()
+        self.attentions = nn.ModuleList([
+            Transformer2DModel(out_channels, out_channels, n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim),
+            Transformer2DModel(out_channels, out_channels, n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim),
+        ])
+        self.resnets = nn.ModuleList([
+            ResnetBlock2D(in_channels, out_channels, time_embed_dim=time_embed_dim),
+            ResnetBlock2D(out_channels, out_channels, time_embed_dim=time_embed_dim, conv_shortcut=False),
+        ])
+        self.downsamplers = None
+        if has_downsamplers:
+            self.downsamplers = nn.ModuleList([Downsample2D(out_channels, out_channels)])
+
+    def forward(self, hidden_states, temb, encoder_hidden_states):
+        output_states = []
+        for resnet, attn in zip(self.resnets, self.attentions):
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states)
+            output_states.append(hidden_states)
+
+        if self.downsamplers is not None:
+            hidden_states = self.downsamplers[0](hidden_states)
+            output_states.append(hidden_states)
+
+        return hidden_states, output_states
+
+class CrossAttnUpBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, prev_output_channel, n_layers, use_self_attn=True, time_embed_dim=1024, cross_attention_dim=1024):
+        super(CrossAttnUpBlock2D, self).__init__()
+        self.attentions = nn.ModuleList([
+            Transformer2DModel(out_channels, out_channels, n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim),
+            Transformer2DModel(out_channels, out_channels, n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim),
+            Transformer2DModel(out_channels, out_channels, n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim),
+        ])
+        self.resnets = nn.ModuleList([
+            ResnetBlock2D(prev_output_channel + out_channels, out_channels, time_embed_dim=time_embed_dim),
+            ResnetBlock2D(2 * out_channels, out_channels, time_embed_dim=time_embed_dim),
+            ResnetBlock2D(out_channels + in_channels, out_channels, time_embed_dim=time_embed_dim),
+        ])
+        self.upsamplers = nn.ModuleList([Upsample2D(out_channels, out_channels)])
+
+    def forward(self, hidden_states, res_hidden_states_tuple, temb, encoder_hidden_states):
+        for resnet, attn in zip(self.resnets, self.attentions):
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states)
+
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler(hidden_states)
+
+        return hidden_states
+
+class UpBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, prev_output_channel, time_embed_dim=1024):
+        super(UpBlock2D, self).__init__()
+        self.resnets = nn.ModuleList([
+            ResnetBlock2D(out_channels + prev_output_channel, out_channels, time_embed_dim=time_embed_dim),
+            ResnetBlock2D(out_channels * 2, out_channels, time_embed_dim=time_embed_dim),
+            ResnetBlock2D(out_channels + in_channels, out_channels, time_embed_dim=time_embed_dim),
+        ])
+
+    def forward(self, hidden_states, res_hidden_states_tuple, temb=None):
+        for resnet in self.resnets:
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = resnet(hidden_states, temb)
+
+        return hidden_states
+
+class UNetMidBlock2DCrossAttn(nn.Module):
+    def __init__(self, in_features, n_layers=4, use_self_attn=True, time_embed_dim=1024, cross_attention_dim=1024):
+        super(UNetMidBlock2DCrossAttn, self).__init__()
+        self.attentions = nn.ModuleList([Transformer2DModel(in_features, in_features, n_layers=n_layers, use_self_attn=use_self_attn, cross_attention_dim=cross_attention_dim)])
+        self.resnets = nn.ModuleList([
+            ResnetBlock2D(in_features, in_features, time_embed_dim=time_embed_dim, conv_shortcut=False),
+            ResnetBlock2D(in_features, in_features, time_embed_dim=time_embed_dim, conv_shortcut=False),
+        ])
+
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+        hidden_states = self.resnets[0](hidden_states, temb)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states)
+            hidden_states = resnet(hidden_states, temb)
+
+        return hidden_states
+
+class UNet2DConditionModel(nn.Module):
+    def __init__(self, num_classes=12476):
+        super(UNet2DConditionModel, self).__init__()
+        self.num_classes = num_classes
+
+        self.config = namedtuple("config", "in_channels sample_size")
+        self.config.in_channels = 4
+        self.config.sample_size = 64
+
+        time_embed_dim = 1024
         
-        indices = torch.tensor(indices, dtype=torch.long, device=device)
-        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
-        return indices, offsets
+        self.conv_in = nn.Conv2d(4, 256, kernel_size=3, stride=1, padding=1)
+        self.time_proj = Timesteps(num_channels=256)
+        self.time_embedding = TimestepEmbedding(in_features=256, out_features=time_embed_dim)
+        
+        self.y_embedder = nn.Embedding(num_classes + 1, time_embed_dim)
 
-@torch.no_grad()
-def sample_flow(model, tag_processor, image_size, batch_size, prompts, device,
-                steps=50, cfg_scale=1.4, noise=None):
-    if noise is not None:
-        if isinstance(noise, list):
-            x = torch.stack([n.to(device) for n in noise[:batch_size]])
-        else:
-            x = noise.clone().to(device)
-    else:
-        x = torch.randn(batch_size, 3, image_size, image_size, device=device)
+        # channels = [256, 512, 896], num_blocks = [0, 2, 4]
+        self.down_blocks = nn.ModuleList([
+            DownBlock2D(in_channels=256, out_channels=256, time_embed_dim=time_embed_dim),
+            CrossAttnDownBlock2D(
+                in_channels=256, out_channels=512, n_layers=2, 
+                has_downsamplers=True, use_self_attn=False, time_embed_dim=time_embed_dim
+            ),
+            CrossAttnDownBlock2D(
+                in_channels=512, out_channels=896, n_layers=4, 
+                has_downsamplers=False, use_self_attn=True, time_embed_dim=time_embed_dim
+            ),
+        ])
+        
+        self.up_blocks = nn.ModuleList([
+            CrossAttnUpBlock2D(
+                in_channels=512, out_channels=896, prev_output_channel=896, n_layers=4, 
+                use_self_attn=True, time_embed_dim=time_embed_dim
+            ),
+            CrossAttnUpBlock2D(
+                in_channels=256, out_channels=512, prev_output_channel=896, n_layers=2, 
+                use_self_attn=False, time_embed_dim=time_embed_dim
+            ),
+            UpBlock2D(in_channels=256, out_channels=256, prev_output_channel=512, time_embed_dim=time_embed_dim),
+        ])
+        
+        self.mid_block = UNetMidBlock2DCrossAttn(896, n_layers=4, use_self_attn=True, time_embed_dim=time_embed_dim)
+        
+        self.conv_norm_out = nn.GroupNorm(32, 256, eps=1e-05, affine=True)
+        self.conv_act = nn.SiLU()
+        self.conv_out = nn.Conv2d(256, 4, kernel_size=3, stride=1, padding=1)
 
-    y_indices, y_offsets = tag_processor.process_prompts(prompts, device)
-    null_indices = torch.full((batch_size,), fill_value=tag_processor.num_classes, dtype=torch.long, device=device)
-    null_offsets = torch.arange(batch_size, dtype=torch.long, device=device)
+    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, encoder_hidden_states=None, **kwargs):
+        timesteps = t.expand(x_in.shape[0])
+        t_emb = self.time_proj(timesteps).to(dtype=x_in.dtype)
 
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-    for i in range(steps):
-        t_curr = ts[i]
-        t_next = ts[i+1]
-        t_vec = torch.full((batch_size,), t_curr, device=device)
-        x1_cond = model(x, t_vec, y_indices, y_offsets)
-        x1_uncond = model(x, t_vec, null_indices, null_offsets)
-        x0_pred = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
-        if t_curr > 0:
-            x = (t_next / t_curr) * x + (1 - t_next / t_curr) * x0_pred
-        else:
-            x = x0_pred
-    images = (x / 2 + 0.5).clamp(0, 1)
-    return images
+        emb = self.time_embedding(t_emb)
+
+        if y_indices is not None:
+            if y_indices.dim() == 1 and y_offsets is not None:
+                sequences = []
+                offsets = y_offsets.tolist()
+                offsets.append(y_indices.size(0))
+                for i in range(len(offsets) - 1):
+                    start = offsets[i]
+                    end = offsets[i+1]
+                    sequences.append(y_indices[start:end])
+                y_indices = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=self.num_classes)
+            encoder_hidden_states = self.y_embedder(y_indices)
+
+        sample = self.conv_in(x_in)
+
+        s0 = sample
+        sample, [s1, s2, s3] = self.down_blocks[0](sample, temb=emb)
+        sample, [s4, s5, s6] = self.down_blocks[1](sample, temb=emb, encoder_hidden_states=encoder_hidden_states)
+        sample, [s7, s8] = self.down_blocks[2](sample, temb=emb, encoder_hidden_states=encoder_hidden_states)
+
+        sample = self.mid_block(sample, emb, encoder_hidden_states=encoder_hidden_states)
+
+        sample = self.up_blocks[0](
+            hidden_states=sample, temb=emb, res_hidden_states_tuple=[s6, s7, s8], encoder_hidden_states=encoder_hidden_states
+        )
+        sample = self.up_blocks[1](
+            hidden_states=sample, temb=emb, res_hidden_states_tuple=[s3, s4, s5], encoder_hidden_states=encoder_hidden_states
+        )
+        sample = self.up_blocks[2](
+            hidden_states=sample, temb=emb, res_hidden_states_tuple=[s0, s1, s2]
+        )
+
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        return [sample]
+
+if __name__ == "__main__":
+    model = UNet2DConditionModel()
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Total Parameters: {num_params / 1e6:.2f} M")
+    
+    batch_size = 2
+    sample = torch.randn(batch_size, 4, 64, 64)
+    timesteps = torch.tensor([1, 2])
+    encoder_hidden_states = torch.randn(batch_size, 77, 2048)
+    
+    # Batch of 2, unpadded sequence
+    y_indices = torch.tensor([10, 20, 30, 40, 50, 60])
+    y_offsets = torch.tensor([0, 4])  # First seq length 4, second length 2
+    
+    print("Running forward pass...")
+    out = model(sample, timesteps, y_indices, y_offsets)
+    print("Forward pass successful!")
+    print("Output shape:", out[0].shape)
