@@ -392,7 +392,6 @@ class WDSLoader:
             .map(self.preprocess, handler=warn_and_continue)
             .select(lambda x: x is not None)
             .compose(lambda data: bucket_batch(data, self.batch_size))
-            .prefetch(4)
         )
 
         loader = wds.WebLoader(
