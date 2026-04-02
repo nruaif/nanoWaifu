@@ -29,5 +29,5 @@ model:
   patch_size: 1    # Factor for initial projection
 
 data:
-  webdataset_url: 'train/train/00{060..121}.tar'
+  webdataset_url: 'train/train/00{001..060}.tar'
   use_advanced_captions: true
