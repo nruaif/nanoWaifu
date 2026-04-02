@@ -213,12 +213,12 @@ def bucket_batch(data, batch_size):
         img = sample["image"]
         h, w = img.shape[1:]
         key = (h, w)
-        
+
         if key not in buckets:
             buckets[key] = []
-        
+
         buckets[key].append(sample)
-        
+
         if len(buckets[key]) == batch_size:
             batch = buckets[key]
             images = torch.stack([s["image"] for s in batch])
@@ -226,6 +226,7 @@ def bucket_batch(data, batch_size):
             coords = torch.stack([s["coords"] for s in batch])
             yield images, prompts, coords
             buckets[key] = []
+
 
 class WDSLoader:
     def __init__(self, url, csv_path=None, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
@@ -256,7 +257,7 @@ class WDSLoader:
         # Precalculate buckets
         base_size = self.image_size
         target_area = base_size ** 2
-        
+
         # Common aspect ratios for anime/manga
         # 1:1, 3:4, 4:3, 9:16, 16:9
         aspect_ratios = [1.0, 0.75, 1.33, 0.56, 1.78]
@@ -270,7 +271,7 @@ class WDSLoader:
             w = (w // 16) * 16
             if h > 0 and w > 0:
                 self.buckets.append((h, w))
-        
+
         self.bucket_ars = [bw / bh for bh, bw in self.buckets]
 
     def load_class_map(self, csv_path):
@@ -385,16 +386,18 @@ class WDSLoader:
                 self.url,
                 nodesplitter=wds.split_by_node,
                 handler=warn_and_continue,
+                workersplitter=wds.split_by_worker
             )
-            .shuffle(1000)
+            .shuffle(10_000, initial=1_000)
             .map(self.preprocess, handler=warn_and_continue)
             .select(lambda x: x is not None)
             .compose(lambda data: bucket_batch(data, self.batch_size))
+            .prefetch(4)
         )
 
         loader = wds.WebLoader(
             dataset,
-            batch_size=None, # Already batched by bucket_batch
+            batch_size=None,  # Already batched by bucket_batch
             num_workers=self.num_workers,
             pin_memory=True,
         )

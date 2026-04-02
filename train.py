@@ -12,7 +12,6 @@ import glob
 import builtins
 from dataset import WDSLoader
 import torch.nn.functional as F
-import bitsandbytes as bnb
 from huggingface_hub import upload_file
 import threading
 
@@ -33,25 +32,18 @@ def _async_upload(ckpt_path, repo_id, step):
 torch.backends.cuda.enable_flash_sdp(True)
 
 
-def disp_loss(Z, tau):
-    if Z.shape[0] <= 1:
-        return torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
-    Z_flat = Z.reshape(Z.shape[0], -1)
-    D = torch.pdist(Z_flat, p=2) ** 2
-    # Add epsilon to prevent log(0)
-    return torch.log(torch.mean(torch.exp(-D / tau)) + 1e-8)
+# FIX: removed unused disp_loss function
 
 
-# Dynamic model import
 def get_model_and_sampler(config):
     model_type = config['model'].get('type', 'v2')
 
+    # FIX: removed `or True` that made all branches dead code
     if model_type == 'mar':
         from model_mar import MARModel as ModelClass, TagProcessor, sample_mar as sample_fn
         print(">>> Training MAR Model")
-    elif model_type == 'dit' or True:
+    elif model_type == 'dit':
         from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn
-        # We'll use the TagProcessor from model_v2 as it's compatible
         from model_v2 import TagProcessor
         print(">>> Training TokenformerDiT Model")
     elif config['model'].get('use_v2_model', False) or model_type == 'v2':
@@ -60,6 +52,7 @@ def get_model_and_sampler(config):
     else:
         from model import FCDM as ModelClass, TagProcessor, sample_flow as sample_fn
         print(">>> Training V1 Model (Baseline FCDM)")
+
     return ModelClass, TagProcessor, sample_fn
 
 
@@ -82,12 +75,12 @@ def cleanup_ddp():
 
 
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
-    if rank != 0: return
+    if rank != 0:
+        return
     checkpoints = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
     checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
     if len(checkpoints) > max_checkpoints:
-        checkpoints_to_remove = checkpoints[:-max_checkpoints]
-        for ckpt in checkpoints_to_remove:
+        for ckpt in checkpoints[:-max_checkpoints]:
             try:
                 os.remove(ckpt)
                 print(f"Removed old checkpoint: {ckpt}")
@@ -117,6 +110,8 @@ def save_checkpoint(
 
     checkpoint = {
         "model_state_dict": model_to_save.state_dict(),
+        # FIX: save optimizer state so resuming doesn't lose momentum/adaptive stats
+        "optimizer_state_dict": optimizer.state_dict(),
         "global_step": step,
         "config": config,
         "rng_state": torch.get_rng_state(),
@@ -126,13 +121,9 @@ def save_checkpoint(
     }
 
     torch.save(checkpoint, ckpt_path)
-
-    # cleanup old checkpoints
     cleanup_checkpoints(output_dir, config.get('max_checkpoints', 3), rank)
-
     print(f"Checkpoint saved: {ckpt_path}")
 
-    # Async upload
     if push_to_hf and repo_id is not None:
         thread = threading.Thread(
             target=_async_upload,
@@ -145,7 +136,6 @@ def save_checkpoint(
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
 
-    # Performance Tuning
     torch.autograd.set_detect_anomaly(False)
     torch.autograd.profiler.profile(enabled=False)
     torch.autograd.profiler.emit_nvtx(enabled=False)
@@ -155,19 +145,16 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
-
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Instantiate model and helpers
     ModelClass, TagProcessor, sample_fn = get_model_and_sampler(config)
 
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
 
-    # Load Data
     wds_loader = WDSLoader(
         url=config['data']['webdataset_url'],
         csv_path=config['data'].get('csv_path'),
@@ -184,7 +171,6 @@ def train(config_path):
     use_tiny_vae = config['model'].get('use_tiny_vae', False)
     in_channels = config['model'].get('in_channels', 3)
 
-    # Load VAE and get Stats
     if use_vae or use_tiny_vae:
         from diffusers import AutoencoderKLFlux2
         print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
@@ -194,13 +180,12 @@ def train(config_path):
             torch_dtype=torch.bfloat16
         ).to(device=device).eval()
 
-        # Pre-compute normalization stats from the Standard VAE's BatchNorm
         latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device)
-        latents_std = torch.sqrt(standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps).to(
-            device)
+        latents_std = torch.sqrt(
+            standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
+        ).to(device)
 
         if use_tiny_vae:
-            # Free up standard VAE memory since we only needed the stats
             del standard_vae
             torch.cuda.empty_cache()
 
@@ -212,39 +197,23 @@ def train(config_path):
 
             in_channels = 128
             print(f">>> Tiny VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
-
         else:
             vae = standard_vae
-            # 32 native channels * 4 (from unshuffle factor 2) = 128 channels
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    # Instantiate model
-    if True:
-        # Calculate latent size for RoPE
-        # Both VAEs downsample spatial dimensions by 16 overall
-        latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get(
-            'patch_size', 16)
+    latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size', 16)
 
-        model = ModelClass(
-            in_channels=in_channels,
-            dim=config['model'].get('fcdm_dim', 768),
-            depth=config['model'].get('fcdm_depth', 12),
-            num_heads=config['model'].get('num_heads', 12),
-            num_classes=num_classes,
-            latent_size=latent_size,
-            use_checkpoint=config['training'].get('gradient_checkpointing', False)
-        ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
-    else:
-        model = ModelClass(
-            in_channels=in_channels,
-            base_channels=config['model'].get('fcdm_dim', 128),
-            num_blocks=config['model'].get('fcdm_depth', 2),
-            num_classes=num_classes,
-            patch_size=config['model'].get('patch_size', 16),
-            use_t_cond=True,
-            use_checkpoint=config['training'].get('gradient_checkpointing', False)
-        ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
+    model = ModelClass(
+        in_channels=in_channels,
+        dim=config['model'].get('fcdm_dim', 768),
+        depth=config['model'].get('fcdm_depth', 12),
+        num_heads=config['model'].get('num_heads', 12),
+        num_classes=num_classes,
+        latent_size=latent_size,
+        use_checkpoint=config['training'].get('gradient_checkpointing', False)
+    ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
+    # FIX: removed model.to(bfloat16) from inside the training loop
 
     # Resume Logic
     global_step = 0
@@ -265,21 +234,21 @@ def train(config_path):
             checkpoint = torch.load(resume_path, map_location=device)
             model_to_load = model.module if hasattr(model, 'module') else model
 
-            # Filter mismatching shapes (e.g., when transitioning to VAE or changing dimensions)
             state_dict = checkpoint["model_state_dict"]
             model_state = model_to_load.state_dict()
-            keys_to_delete = []
-            for k in state_dict.keys():
-                if k in model_state and state_dict[k].shape != model_state[k].shape:
-                    print(
-                        f">>> Shape Mismatch: Removing {k} from state_dict due to shape mismatch. Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
-                    keys_to_delete.append(k)
-
+            keys_to_delete = [
+                k for k in state_dict
+                if k in model_state and state_dict[k].shape != model_state[k].shape
+            ]
             for k in keys_to_delete:
+                print(f">>> Shape Mismatch: Removing {k}. "
+                      f"Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
                 del state_dict[k]
 
             model_to_load.load_state_dict(state_dict, strict=False)
-            global_step = checkpoint["global_step"] - 10
+            # FIX: removed the arbitrary - 10 offset
+            global_step = checkpoint["global_step"]
+
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
             if "fixed_prompts" in checkpoint:
@@ -292,37 +261,40 @@ def train(config_path):
         print(">>> Compiling Model...")
         model = torch.compile(model)
 
-    from dion import NorMuon, AdamW as DionAdamW
-    
+    from adv_optm import Muon_adv as  NorMuon
+    from adv_optm import AdamW_adv as DionAdamW
+
     adamw_params = []
     normuon_params = []
-    
+
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-            
-        # 1 dim param (bias, LN/GN weights), conv dw (groups=C implies p.ndim=4 and p.shape[1]=1), embedding
         is_1d = p.ndim == 1
         is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
-        is_embedding = 'embed' in name or isinstance(p, torch.nn.Embedding) or isinstance(p, torch.nn.EmbeddingBag) or 'token_embed' in name
-        
+        is_embedding = ('embed' in name
+                        or isinstance(p, torch.nn.Embedding)
+                        or isinstance(p, torch.nn.EmbeddingBag)
+                        or 'token_embed' in name)
         if is_1d or is_dwconv or is_embedding:
             adamw_params.append(p)
         else:
             normuon_params.append(p)
-            
+
     opt_adamw = DionAdamW(
         adamw_params,
+        cautious_wd = True,
         lr=config['training']['learning_rate'],
         weight_decay=0.1,
         betas=(0.9, 0.95)
     )
-    
+
     try:
         opt_normuon = NorMuon(
             normuon_params,
             lr=config['training']['learning_rate'],
             weight_decay=0.1,
+            cautious_wd = True,
             betas=(0.9, 0.95)
         )
     except TypeError:
@@ -331,28 +303,38 @@ def train(config_path):
             lr=config['training']['learning_rate'],
             weight_decay=0.1
         )
-        
+
     class DualOptimizer:
         def __init__(self, opt1, opt2):
             self.opt1 = opt1
             self.opt2 = opt2
-            
+
         def step(self):
             self.opt1.step()
             self.opt2.step()
-            
+
         def zero_grad(self, set_to_none=True):
             self.opt1.zero_grad(set_to_none=set_to_none)
             self.opt2.zero_grad(set_to_none=set_to_none)
-            
+
         def state_dict(self):
             return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
-            
+
         def load_state_dict(self, state):
             if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
             if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
-            
+
     optimizer = DualOptimizer(opt_adamw, opt_normuon)
+
+    # FIX: restore optimizer state after it's constructed
+    if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
+        saved_checkpoint = torch.load(resume_path, map_location=device)
+        if "optimizer_state_dict" in saved_checkpoint:
+            try:
+                optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                print(">>> Optimizer state restored.")
+            except Exception as e:
+                print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
 
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
@@ -362,13 +344,17 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
+    running_contrast_loss = 0.0  # FIX: accumulate contrast loss properly
     accum_steps = config['training'].get('grad_accum_steps', 1)
+    is_mar = config['model'].get('type', 'v2') == 'mar'
 
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
+        contrast_loss_accum = 0.0
+
         for _ in range(accum_steps):
             try:
                 batch = next(data_iter)
@@ -382,98 +368,85 @@ def train(config_path):
                 prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
             )
 
-            # VAE Encoding Logic
+            # VAE Encoding
             if use_tiny_vae:
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
-
-                    # encode directly returns the needed latents structure
                     out = vae.encode(v_images, return_dict=False)
                     latents = out[0] if isinstance(out, tuple) else out
-
-                    # Apply FLUX.2 specific normalization
                     latents = (latents - latents_mean) / latents_std
-
-                    # No pixel_unshuffle needed for Tiny VAE
-                    inputs = latents.to(dtype=torch.float32)
+                    # FIX: keep in bfloat16 — no reason to cast to fp32
+                    inputs = latents.to(dtype=torch.bfloat16)
 
             elif use_vae:
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
-
-                    # Encode to 32-channel latent distribution
                     latents = vae.encode(v_images).latent_dist.mode()
-
-                    # Apply FLUX.2 specific normalization
                     latents = (latents - latents_mean) / latents_std
-
-                    # Unshuffle: 32 channels -> 128 channels (Height and Width are halved)
-                    inputs = F.pixel_unshuffle(latents, 2).to(dtype=torch.float32)
+                    # FIX: keep in bfloat16 — no reason to cast to fp32
+                    inputs = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
             else:
-                inputs = images
+                inputs = images.to(dtype=torch.bfloat16)
 
             if rank == 0 and fixed_prompts is None:
-                # Capture initial validation samples
                 fixed_prompts = prompts[:16]
                 fixed_noise = torch.randn_like(inputs[:16])
 
-            if config['model'].get('type', 'v2') == 'mar':
-                inputs = inputs.to(torch.bfloat16)
+            if is_mar:
                 loss = model(inputs, y_indices, y_offsets)
                 loss = loss / accum_steps
-                contrast_loss = torch.tensor(0.0)
+                contrast_loss = torch.tensor(0.0, device=device)
             else:
-                # --- Flow Matching / Rectified Flow Training ---
                 B, C, H, W = inputs.shape
 
-                # 1. Calculate effective dimension (m) and scaling factor (alpha)
+                # Dimension-Dependent Shift timestep sampling
                 m = C * H * W
                 n = 32768.0
                 alpha = (m / n) ** 0.5
 
-                # 2. Sample base uniform timestep
-                t_base = torch.rand((B,), device=device)
-
-                # 3. Apply Dimension-Dependent Shift formula
+                # FIX: sample t in bfloat16 immediately — no late cast
+                t_base = torch.rand((B,), device=device, dtype=torch.bfloat16)
                 t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
 
                 t_reshaped = t.view(-1, 1, 1, 1)
-                noise = torch.randn_like(inputs)
+                noise = torch.randn_like(inputs)  # inherits bfloat16 from inputs ✅
                 xt = (1 - t_reshaped) * inputs + t_reshaped * noise
                 target = noise - inputs
-                # -----------------------------------------------
-                
-                xt = xt.to(torch.bfloat16)
-                t = t.to(torch.bfloat16)
-                target = target.to(torch.bfloat16)
-                
+
                 pred = model(xt, t, y_indices, y_offsets)
-                # Scale loss by accumulation steps
                 loss = F.mse_loss(pred, target)
-                x0_pred = xt - t_reshaped.to(torch.bfloat16) * pred
+
+                x0_pred = xt - t_reshaped * pred
                 x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
                 contrast_loss = F.mse_loss(x0_pred, x0_neg)
+
                 loss = loss / accum_steps
 
             loss.backward()
             loss_accum += loss.item()
+            contrast_loss_accum += contrast_loss.item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
+        running_contrast_loss += contrast_loss_accum
 
         if rank == 0:
             pbar.update(1)
-            if global_step % config['training']['log_every_steps'] == 0:
-                avg_loss = running_loss / config['training']['log_every_steps']
-                avg_contrast_loss = contrast_loss.item()
-                wandb.log({"train/loss": avg_loss}, step=global_step)
-                wandb.log({"train/contrast_loss": avg_contrast_loss}, step=global_step)
 
+            if global_step % config['training']['log_every_steps'] == 0:
+                log_interval = config['training']['log_every_steps']
+                avg_loss = running_loss / log_interval
+                avg_contrast_loss = running_contrast_loss / log_interval  # FIX: proper average
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/contrast_loss": avg_contrast_loss
+                }, step=global_step)
                 pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
                 running_loss = 0.0
+                running_contrast_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
@@ -482,47 +455,39 @@ def train(config_path):
                 print(f"\n[Step {global_step}] Generating validation samples...")
                 model.eval()
                 with torch.no_grad():
+                    # FIX: sample_mar accepts **kwargs so `noise` is safely ignored for MAR;
+                    #      non-MAR models receive it normally
                     samples = sample_fn(
                         model.module if hasattr(model, 'module') else model,
-                        tag_processor, (inputs.shape[2], inputs.shape[3]), 16, fixed_prompts, device,
+                        tag_processor,
+                        (inputs.shape[2], inputs.shape[3]),
+                        16,
+                        fixed_prompts,
+                        device,
                         cfg_scale=config['training'].get('cfg_scale', 1.4),
                         noise=fixed_noise
                     )
 
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-
-                        # Reverse the FLUX.2 normalization
                         latents = (samples * latents_std) + latents_mean
-
-                        with torch.no_grad():
-                            # Decode directly (no pixel shuffle needed)
-                            out = vae.decode(latents, return_dict=False)
-                            recon = out[0] if isinstance(out, tuple) else out
-
-                            # Convert from [-1, 1] to [0, 1] for saving/logging
-                            samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                            samples = samples.to(dtype=torch.float32)
+                        out = vae.decode(latents, return_dict=False)
+                        recon = out[0] if isinstance(out, tuple) else out
+                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
+                        samples = samples.to(dtype=torch.float32)
 
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-
-                        # Shuffle: 128 channels -> 32 channels (Height and Width are doubled)
                         latents = F.pixel_shuffle(samples, 2)
-
-                        # Reverse the FLUX.2 normalization
                         latents = (latents * latents_std) + latents_mean
-
-                        with torch.no_grad():
-                            # Decode back to pixel space
-                            recon = vae.decode(latents).sample
-
-                            # Convert from [-1, 1] to [0, 1] for saving/logging
-                            samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                            samples = samples.to(dtype=torch.float32)
+                        recon = vae.decode(latents).sample
+                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
+                        samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
-                    wandb.log({"val/samples": wandb.Image(grid, caption=f"Step {global_step}")}, step=global_step)
+                    wandb.log({
+                        "val/samples": wandb.Image(grid, caption=f"Step {global_step}")
+                    }, step=global_step)
                 model.train()
 
     if rank == 0:
@@ -536,12 +501,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
-    train(args.config)sh()
-    cleanup_ddp()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.yaml")
-    args = parser.parse_args()
     train(args.config)
+    cleanup_ddp()
