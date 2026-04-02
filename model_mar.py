@@ -335,7 +335,7 @@ class TagProcessor:
 class MARModel(nn.Module):
     def __init__(self, in_channels=128, dim=768, depth=12, num_heads=12, num_classes=12476,
                  latent_size=16, use_checkpoint=False, mask_ratio_min=0.7, label_drop_prob=0.1,
-                 buffer_size=64, diffloss_d=3, diffloss_w=1024, num_sampling_steps=100,
+                 buffer_size=64, diffloss_d=3, diffloss_w=512, num_sampling_steps=100,
                  diffusion_batch_mul=4, **kwargs):
         super().__init__()
         self.vae_embed_dim = in_channels
