@@ -10,9 +10,9 @@ training:
 
   save_image_every_steps: 5000
   image_size: 256
-  num_workers: 8
+  num_workers: 4
   class_dropout_prob: 0.1
-  cfg_scale: 1.4
+  cfg_scale: 4
   output_dir: "outputs_dit"
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
