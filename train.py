@@ -97,7 +97,7 @@ def save_checkpoint(
         config,
         fixed_prompts=None,
         fixed_noise=None,
-        push_to_hf=False,
+        push_to_hf=True,
         repo_id="Shio-Koube/ConvNext-Diff"
 ):
     if rank != 0:
