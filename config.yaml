@@ -19,7 +19,7 @@ training:
   max_checkpoints: 3
 
 model:
-  type: "dit"      # Use TokenformerDiT
+  type: "mar"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
   use_tiny_vae: true
   fcdm_dim: 768    # Hidden dimension (Transformer)
