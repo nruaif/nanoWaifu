@@ -453,7 +453,6 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
             x = noise.clone().to(device)
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
-
     # Conditional tags
     y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
 
@@ -462,14 +461,14 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    x = x.to(torch.bfloat16)
 
     for i in range(steps):
         t_curr = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_curr
-
         t_vec = torch.full((batch_size,), t_curr.item(), device=device)
-
+        t_vec = t_vec.to(torch.bfloat16)
         # Conditional prediction (full path)
         v_cond = model(x, t_vec, y_indices, y_offsets)
 
