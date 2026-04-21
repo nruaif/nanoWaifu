@@ -196,8 +196,7 @@ def train(config_path):
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
         drop_ratio=config['model'].get('drop_ratio', 0.0),
         path_drop_prob=config['model'].get('path_drop_prob', 0.0)
-    ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
-    # FIX: removed model.to(bfloat16) from inside the training loop
+    ).to(device=device, dtype=torch.bfloat16)
 
     # Resume Logic
     global_step = 0
@@ -331,7 +330,6 @@ def train(config_path):
     running_contrast_loss = 0.0  # FIX: accumulate contrast loss properly
     accum_steps = config['training'].get('grad_accum_steps', 1)
     is_mar = config['model'].get('type', 'v2') == 'mar'
-    model.to(torch.bfloat16)
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -388,7 +386,7 @@ def train(config_path):
             t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
 
             t_reshaped = t.view(-1, 1, 1, 1)
-            noise = torch.randn_like(inputs)  # inherits bfloat16 from inputs ✅
+            noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
             target = noise - inputs
 

@@ -246,7 +246,7 @@ class TimestepEmbedder(nn.Module):
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
         emb = t.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(torch.bfloat16)
         return self.mlp(emb)
 
 
