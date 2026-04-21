@@ -437,7 +437,7 @@ class TagProcessor:
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                    steps=50, guidance_scale=1.5, noise=None):
+                    steps=50, guidance_scale=1.5, noise=None, cfg_scale = 0):
     """
     PF-ODE sampling with Path-Drop Guidance (PDG).
     """
