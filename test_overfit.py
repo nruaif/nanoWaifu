@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from model_v2 import FCDMV2, TagProcessor, sample_flow
+from model_dit import TokenformerDiT as FCDMV2, TagProcessor, sample_flow
 
 def test_overfit():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

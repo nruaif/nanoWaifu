@@ -399,6 +399,8 @@ class WDSLoader:
             batch_size=None,  # Already batched by bucket_batch
             num_workers=self.num_workers,
             pin_memory=True,
+            prefetch_factor=4 if self.num_workers > 0 else None,
+            persistent_workers=self.num_workers > 0
         )
 
         return loader

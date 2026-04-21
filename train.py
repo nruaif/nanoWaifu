@@ -35,25 +35,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 # FIX: removed unused disp_loss function
 
 
-def get_model_and_sampler(config):
-    model_type = config['model'].get('type', 'v2')
-
-    # FIX: removed `or True` that made all branches dead code
-    if model_type == 'mar':
-        from model_mar import MARModel as ModelClass, TagProcessor, sample_mar as sample_fn
-        print(">>> Training MAR Model")
-    elif model_type == 'dit':
-        from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn
-        from model_v2 import TagProcessor
-        print(">>> Training TokenformerDiT Model")
-    elif config['model'].get('use_v2_model', False) or model_type == 'v2':
-        from model_v2 import FCDMV2 as ModelClass, TagProcessor, sample_flow as sample_fn
-        print(">>> Training V2 Model (CSP + Hybrid ViT + ReLU^2 + Gated Skip)")
-    else:
-        from model import FCDM as ModelClass, TagProcessor, sample_flow as sample_fn
-        print(">>> Training V1 Model (Baseline FCDM)")
-
-    return ModelClass, TagProcessor, sample_fn
+from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
 
 
 def setup_ddp():
@@ -211,7 +193,9 @@ def train(config_path):
         num_heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
         latent_size=latent_size,
-        use_checkpoint=config['training'].get('gradient_checkpointing', False)
+        use_checkpoint=config['training'].get('gradient_checkpointing', False),
+        drop_ratio=config['model'].get('drop_ratio', 0.0),
+        path_drop_prob=config['model'].get('path_drop_prob', 0.0)
     ).to(device=device, dtype=torch.bfloat16, memory_format=torch.channels_last)
     # FIX: removed model.to(bfloat16) from inside the training loop
 
@@ -259,7 +243,7 @@ def train(config_path):
 
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
-        model = torch.compile(model)
+        model = torch.compile(model, mode="max-autotune")
 
     from adv_optm import Muon_adv as  NorMuon
     from adv_optm import AdamW_adv as DionAdamW
@@ -270,7 +254,7 @@ def train(config_path):
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        is_1d = p.ndim == 1
+        is_1d = p.ndim <= 1
         is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
         is_embedding = ('embed' in name
                         or isinstance(p, torch.nn.Embedding)
@@ -392,35 +376,35 @@ def train(config_path):
                 fixed_prompts = prompts[:16]
                 fixed_noise = torch.randn_like(inputs[:16])
 
-            if is_mar:
-                loss = model(inputs, y_indices, y_offsets)
-                loss = loss / accum_steps
-                contrast_loss = torch.tensor(0.0, device=device)
-            else:
-                B, C, H, W = inputs.shape
+            B, C, H, W = inputs.shape
 
-                # Dimension-Dependent Shift timestep sampling
-                m = C * H * W
-                n = 32768.0
-                alpha = (m / n) ** 0.5
+            # Dimension-Dependent Shift timestep sampling
+            m = C * H * W
+            n = 32768.0
+            alpha = (m / n) ** 0.5
 
-                # FIX: sample t in bfloat16 immediately — no late cast
-                t_base = torch.rand((B,), device=device, dtype=torch.bfloat16)
-                t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
+            # FIX: sample t in bfloat16 immediately — no late cast
+            t_base = torch.rand((B,), device=device, dtype=torch.bfloat16)
+            t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
 
-                t_reshaped = t.view(-1, 1, 1, 1)
-                noise = torch.randn_like(inputs)  # inherits bfloat16 from inputs ✅
-                xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-                target = noise - inputs
+            t_reshaped = t.view(-1, 1, 1, 1)
+            noise = torch.randn_like(inputs)  # inherits bfloat16 from inputs ✅
+            xt = (1 - t_reshaped) * inputs + t_reshaped * noise
+            target = noise - inputs
 
-                pred = model(xt, t, y_indices, y_offsets)
-                loss = F.mse_loss(pred, target)
+            uniformity_weight = config['model'].get('uniformity_weight', 0.0)
+            path_drop_prob = config['model'].get('path_drop_prob', 0.0)
 
-                x0_pred = xt - t_reshaped * pred
-                x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
-                contrast_loss = F.mse_loss(x0_pred, x0_neg)
+            pred, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
+            loss = F.mse_loss(pred, target)
+            if u_loss is not None:
+                loss = loss + (uniformity_weight * u_loss)
 
-                loss = loss / accum_steps
+            x0_pred = xt - t_reshaped * pred
+            x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
+            contrast_loss = F.mse_loss(x0_pred, x0_neg)
+
+            loss = loss / accum_steps
 
             loss.backward()
             loss_accum += loss.item()
@@ -432,7 +416,6 @@ def train(config_path):
         global_step += 1
         running_loss += loss_accum
         running_contrast_loss += contrast_loss_accum
-
         if rank == 0:
             pbar.update(1)
 
@@ -442,7 +425,8 @@ def train(config_path):
                 avg_contrast_loss = running_contrast_loss / log_interval  # FIX: proper average
                 wandb.log({
                     "train/loss": avg_loss,
-                    "train/contrast_loss": avg_contrast_loss
+                    "train/contrast_loss": avg_contrast_loss,
+                    "train/uniformity_weighted": u_loss.item()
                 }, step=global_step)
                 pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
                 running_loss = 0.0

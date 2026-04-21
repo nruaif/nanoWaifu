@@ -2,7 +2,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
+
+class GatherLayer(torch.autograd.Function):
+    """Gather tensors from all processes, supporting backward propagation."""
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        output = [torch.zeros_like(input) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, input.contiguous())
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        (input,) = ctx.saved_tensors
+        grad_out = torch.zeros_like(input)
+        grad_out[:] = grads[dist.get_rank()]
+        return grad_out
+
+def uniformity_loss(features):
+    if dist.is_initialized():
+        features = torch.cat(GatherLayer.apply(features), dim=0)
+    features = torch.nn.functional.normalize(features, dim=-1)
+    sim = features @ features.T 
+    loss = sim.pow(2).mean()
+    return loss
 
 
 class MeanPoolingEmbedder(nn.Module):
@@ -61,7 +86,7 @@ class GGRoPE2d(nn.Module):
         # ADD A CACHE DICTIONARY
         self._cache = {}
 
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int, W: int, seq_indices: torch.Tensor = None) -> torch.Tensor:
         B, h, N, d = x.shape
 
         # CHECK CACHE FIRST
@@ -83,6 +108,12 @@ class GGRoPE2d(nn.Module):
 
         # RETRIEVE FROM CACHE
         cos, sin = self._cache[cache_key]
+
+        if seq_indices is not None:
+            # seq_indices is (B, N)
+            # Gather along the spatial dimension (dim=2)
+            cos = torch.gather(cos.expand(B, -1, -1, -1), 2, seq_indices.unsqueeze(1).unsqueeze(-1).expand(-1, h, -1, cos.shape[-1]))
+            sin = torch.gather(sin.expand(B, -1, -1, -1), 2, seq_indices.unsqueeze(1).unsqueeze(-1).expand(-1, h, -1, sin.shape[-1]))
 
         x_fp32 = x.float()
         x1, x2 = x_fp32.chunk(2, dim=-1)
@@ -109,18 +140,21 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (self.dim,), weight=self.weight, eps=self.eps)
 
 
-class MlpDW(nn.Module):
+class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
-        self.fc1 = nn.Conv2d(in_features, hidden_features, 1)
-        self.dwconv = nn.Conv2d(hidden_features, hidden_features, 3, padding=1, groups=hidden_features)
+        
+        self.fc1 = nn.Linear(in_features, hidden_features * 2)
         self.act = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Conv2d(hidden_features, out_features, 1)
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        return self.fc2(self.act(self.dwconv(self.fc1(x))))
+        x = self.fc1(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = x * self.act(gate)
+        return self.fc2(x)
 
 
 class SelfAttention(nn.Module):
@@ -133,86 +167,67 @@ class SelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
         self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
-    def forward(self, x, H, W, rope):
-        B, N, C = x.shape
+    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None):
+        B, N_seq, C = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2), qkv)
+        q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        q = rope(q, H, W)
-        k = rope(k, H, W)
+        if num_context_tokens > 0:
+            c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
+            c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
+            s_q = rope(s_q, H, W, seq_indices)
+            s_k = rope(s_k, H, W, seq_indices)
+            q = torch.cat([c_q, s_q], dim=2)
+            k = torch.cat([c_k, s_k], dim=2)
+        else:
+            q = rope(q, H, W, seq_indices)
+            k = rope(k, H, W, seq_indices)
 
         x_att = F.scaled_dot_product_attention(q, k, v)
-        x_att = x_att.transpose(1, 2).reshape(B, N, C)
-        return self.proj(x_att)
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, dim, context_dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.q = nn.Linear(dim, dim)
-        self.kv = nn.Linear(context_dim, dim * 2)
-        self.proj = nn.Linear(dim, dim)
-        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-
-    def forward(self, x, context):
-        B, N, C = x.shape
-        _, M, _ = context.shape
-        
-        q = self.q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv(context).chunk(2, dim=-1)
-        k, v = map(lambda t: t.view(B, M, self.num_heads, self.head_dim).transpose(1, 2), kv)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        x_att = F.scaled_dot_product_attention(q, k, v)
-        x_att = x_att.transpose(1, 2).reshape(B, N, C)
+        x_att = x_att.transpose(1, 2).reshape(B, N_seq, C)
         return self.proj(x_att)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, use_cross_attn=False, context_dim=None):
+    def __init__(self, dim, num_heads):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.self_attn = SelfAttention(dim, num_heads)
-        
-        self.use_cross_attn = use_cross_attn
-        if use_cross_attn:
-            self.norm2 = RMSNorm(dim)
-            self.cross_attn = CrossAttention(dim, context_dim, num_heads)
-            
         self.norm3 = RMSNorm(dim)
-        self.mlp = MlpDW(dim, dim * 4, dim)
+        self.mlp = Mlp(dim, dim * 4, dim)
 
-    def forward(self, x, rope, context=None):
-        B, C, H, W = x.shape
+    def forward(self, x, H, W, rope, context=None, seq_indices=None):
+        B, N, C = x.shape
         
-        # Self attention
-        x_flat = x.flatten(2).transpose(1, 2)
-        x_norm1 = self.norm1(x_flat)
-        attn_out = self.self_attn(x_norm1, H, W, rope)
-        x = x + attn_out.transpose(1, 2).reshape(B, C, H, W)
-        
-        # Cross attention
-        if self.use_cross_attn:
-            x_flat = x.flatten(2).transpose(1, 2)
-            x_norm2 = self.norm2(x_flat)
-            cross_out = self.cross_attn(x_norm2, context)
-            x = x + cross_out.transpose(1, 2).reshape(B, C, H, W)
+        num_context_tokens = 0
+        if context is not None:
+            # Concatenate context tokens before spatial tokens
+            x_seq = torch.cat([context, x], dim=1)  # (B, M + N, C)
+            num_context_tokens = context.shape[1]
+        else:
+            x_seq = x
             
-        # MLP
-        x_flat = x.flatten(2).transpose(1, 2)
-        x_norm3 = self.norm3(x_flat).transpose(1, 2).reshape(B, C, H, W)
-        mlp_out = self.mlp(x_norm3)
-        x = x + mlp_out
+        # Self attention
+        x_norm1 = self.norm1(x_seq)
+        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens, seq_indices)
         
-        return x
+        # Residual connection
+        x_seq = x_seq + attn_out
+        
+        # MLP (On both context and spatial tokens)
+        x_seq = x_seq + self.mlp(self.norm3(x_seq))
+        
+        # Split context/spatial back
+        if context is not None:
+            context = x_seq[:, :num_context_tokens, :]
+            x = x_seq[:, num_context_tokens:, :]
+        else:
+            x = x_seq
+        
+        return x, context
 
 
 class TimestepEmbedder(nn.Module):
@@ -237,18 +252,18 @@ class TimestepEmbedder(nn.Module):
 
 class TokenformerDiT(nn.Module):
     """
-    DiT with UNet architecture (2-4-2 blocks configs).
-    Conditions via cross attention at the mid stage, keeping the 2D feature map.
-    Includes DW conv in the MLP block.
+    Pure DiT architecture with SPRINT (Sparse-Dense Residual Fusion).
+    Conditions via concatenated tokens in self-attention.
     """
     def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
                  attn_kv_pairs=576, ffn_kv_pairs=2304, num_classes=12476,
-                 use_checkpoint=False, **kwargs):
+                 use_checkpoint=False, drop_ratio=0.0, **kwargs):
         super().__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
+        self.drop_ratio = drop_ratio
 
-        self.patch_embed = nn.Conv2d(in_channels, dim, kernel_size=1)
+        self.patch_embed = nn.Linear(in_channels, dim)
         
         self.t_embedder = TimestepEmbedder(dim)
         self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
@@ -260,98 +275,177 @@ class TokenformerDiT(nn.Module):
             max_freq=100.0
         )
 
-        # 2-4-2 blocks config
-        # Down stage: 2 blocks
-        self.down_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_cross_attn=False) for _ in range(2)
+        # SPRINT division: 2 encoder blocks, depth-4 middle blocks, 2 decoder blocks
+        self.num_encoder_blocks = 2
+        self.num_decoder_blocks = 2
+        self.num_middle_blocks = depth - self.num_encoder_blocks - self.num_decoder_blocks
+
+        self.encoder_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads) for _ in range(self.num_encoder_blocks)
         ])
         
-        self.downsample = nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1)
-        
-        # Mid stage: 4 blocks (Cross Attention injected here)
-        self.mid_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_cross_attn=True, context_dim=dim) for _ in range(4)
+        self.middle_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads) for _ in range(self.num_middle_blocks)
         ])
         
-        self.upsample = nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1)
-        
-        # Up stage: 2 blocks
-        self.up_projs = nn.ModuleList([
-            nn.Conv2d(dim * 2, dim, kernel_size=1) for _ in range(2)
+        self.decoder_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads) for _ in range(self.num_decoder_blocks)
         ])
-        self.up_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_cross_attn=False) for _ in range(2)
-        ])
+
+        # SPRINT fusion
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.fusion = nn.Linear(dim * 2, dim)
 
         self.final_norm = RMSNorm(dim)
-        self.final_proj = nn.Conv2d(dim, in_channels, kernel_size=1)
+        self.final_proj = nn.Linear(dim, in_channels)
+        
+        # k-Diff learnable target parameter
+        self.w_k = nn.Parameter(torch.tensor(0.0))
 
-        self.final_out_proj = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
+    def compute_v(self, z, u_pred, t):
+        k = torch.sigmoid(self.w_k)
 
-    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False):
+        t = t.view(-1, 1, 1, 1)
+
+        denom = k * (1 - t) + (1 - k) * t
+        denom = torch.clamp(denom, min=0.001)
+
+        v_pred = ((1 - 2 * k) * z + u_pred) / denom
+        return v_pred
+
+    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0, force_path_drop=False, return_uniformity=False):
         B, C, H, W = x_in.shape
-        x = self.patch_embed(x_in)
+        N = H * W
+        x = x_in.flatten(2).transpose(1, 2)
+        x = self.patch_embed(x)
         
         # Prefix tokens for context (t + 4*y = 5 tokens)
         t_token = self.t_embedder(t).unsqueeze(1)
         y_tokens = self.y_embedder(y_indices, y_offsets)
         context = torch.cat([t_token, y_tokens], dim=1)
         
-        skips = []
-        
-        # Down blocks
-        for block in self.down_blocks:
+        # 1. Encoder blocks (f_theta)
+        for block in self.encoder_blocks:
             if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, self.rope, None, use_reentrant=False)
+                x, context = checkpoint(block, x, H, W, self.rope, context, None, use_reentrant=False)
             else:
-                x = block(x, self.rope, None)
-            skips.append(x)
-            
-        x = self.downsample(x)
-        
-        # Mid blocks
-        for block in self.mid_blocks:
-            if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, self.rope, context, use_reentrant=False)
-            else:
-                x = block(x, self.rope, context)
+                x, context = block(x, H, W, self.rope, context, None)
                 
-        feat = x.flatten(2).transpose(1, 2)
+        f_t = x
         
-        x = self.upsample(x)
-        
-        # Up blocks
-        for proj, block, skip in zip(self.up_projs, self.up_blocks, reversed(skips)):
-            x = torch.cat([x, skip], dim=1)
-            x = proj(x)
-            if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, self.rope, None, use_reentrant=False)
-            else:
-                x = block(x, self.rope, None)
-                
-        x_flat = x.flatten(2).transpose(1, 2)
-        x_norm = self.final_norm(x_flat).transpose(1, 2).reshape(B, self.dim, H, W)
-        x = self.final_proj(x_norm)
-
-        # Standard UNet-style end skip connection
-        x_out = torch.cat([x, x_in], dim=1)
-        x_out = self.final_out_proj(x_out)
-
-        if not return_features:
-            return x_out
+        # 2. Token dropping
+        if self.drop_ratio > 0.0 and self.training:
+            num_keep = int(N * (1 - self.drop_ratio))
+            noise = torch.rand(B, N, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            seq_indices = ids_shuffle[:, :num_keep]
+            x_middle = torch.gather(x, dim=1, index=seq_indices.unsqueeze(-1).expand(-1, -1, self.dim))
         else:
-            return x_out, feat
+            x_middle = x
+            seq_indices = None
+
+        if force_path_drop:
+            g_pad_t = self.mask_token.expand(B, N, -1)
+            u_loss = torch.tensor(0.0, device=x.device) if return_uniformity else None
+        else:
+            # 3. Middle blocks (g_theta)
+            for block in self.middle_blocks:
+                if self.use_checkpoint and self.training:
+                    x_middle, context = checkpoint(block, x_middle, H, W, self.rope, context, seq_indices, use_reentrant=False)
+                else:
+                    x_middle, context = block(x_middle, H, W, self.rope, context, seq_indices)
+                    
+            # Compute uniformity loss on middle layer before reconstructing the full sequence
+            u_loss = None
+            if return_uniformity and self.training:
+                # We pool the sparse tokens to get a single vector per image for the loss
+                x_mid_pooled = x_middle.mean(dim=1)
+                u_loss = uniformity_loss(x_mid_pooled)
+            elif return_uniformity:
+                u_loss = torch.tensor(0.0, device=x.device)
+
+            # 4. Path-drop learning / Fusion
+            if self.training and path_drop_prob > 0.0 and torch.rand(1).item() < path_drop_prob:
+                g_pad_t = self.mask_token.expand(B, N, -1)
+            else:
+                g_pad_t = self.mask_token.expand(B, N, -1).clone()
+                if seq_indices is not None:
+                    g_pad_t.scatter_(1, seq_indices.unsqueeze(-1).expand(-1, -1, self.dim), x_middle)
+                else:
+                    g_pad_t = x_middle
+                    
+        # Sparse-dense residual fusion
+        h_t = self.fusion(torch.cat([f_t, g_pad_t], dim=-1))
+        
+        # 5. Decoder blocks (h_theta)
+        for block in self.decoder_blocks:
+            if self.use_checkpoint and self.training:
+                h_t, context = checkpoint(block, h_t, H, W, self.rope, context, None, use_reentrant=False)
+            else:
+                h_t, context = block(h_t, H, W, self.rope, context, None)
+                
+        feat = h_t
+        
+        x_norm = self.final_norm(h_t)
+        x_out = self.final_proj(x_norm)
+        x_out = x_out.transpose(1, 2).reshape(B, C, H, W)
+
+        out_v = self.compute_v(x_in, x_out, t)
+
+        if return_uniformity:
+            if not return_features:
+                return out_v, u_loss
+            else:
+                return out_v, feat, u_loss
+        else:
+            if not return_features:
+                return out_v
+            else:
+                return out_v, feat
+
+
+import random
+
+class TagProcessor:
+    def __init__(self, tags_file):
+        with open(tags_file, 'r', encoding='utf-8') as f:
+            self.tags = [line.strip() for line in f if line.strip()]
+        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
+        self.num_classes = len(self.tags)
+
+    def process_prompts(self, prompts, device, dropout_prob=0.0):
+        # prompts is a list of strings
+        indices = []
+        offsets = [0]
+        for p in prompts:
+            if random.random() < dropout_prob:
+                indices.append(self.num_classes) # Null tag
+            else:
+                tags = p.split()
+                count = 0
+                for t in tags:
+                    if t in self.tag_to_idx:
+                        indices.append(self.tag_to_idx[t])
+                        count += 1
+                if count == 0:
+                    indices.append(self.num_classes) # Null tag if no match
+            offsets.append(len(indices))
+
+        indices = torch.tensor(indices, dtype=torch.long, device=device)
+        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
+        return indices, offsets
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                steps=50, noise=None):
+                    steps=50, guidance_scale=1.5, noise=None):
     """
-    Simplified sample_flow (removed CFG dropping logic as requested).
+    PF-ODE sampling with Path-Drop Guidance (PDG).
     """
-    in_channels = model.final_proj.out_channels
+    in_channels = model.final_proj.out_features
     model.eval()
     H = W = latent_size
 
+    # Init noise
     if noise is not None:
         if isinstance(noise, list):
             x = torch.stack([n.to(device) for n in noise[:batch_size]])
@@ -360,7 +454,12 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
 
+    # Conditional tags
     y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
+
+    # "Null" tags (unconditional)
+    null_prompts = [""] * batch_size
+    y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
@@ -371,24 +470,36 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
         t_vec = torch.full((batch_size,), t_curr.item(), device=device)
 
-        # Single conditional pass
-        v_final = model(x, t_vec, y_indices, y_offsets)
+        # Conditional prediction (full path)
+        v_cond = model(x, t_vec, y_indices, y_offsets)
 
-        x = x + dt * v_final
+        # Unconditional prediction via PDG (drop middle path)
+        v_uncond = model(
+            x, t_vec,
+            y_null_indices, y_null_offsets,
+            force_path_drop=True
+        )
+
+        # PDG combination (same form as CFG)
+        v = v_uncond + guidance_scale * (v_cond - v_uncond)
+
+        # ODE step
+        x = x + dt * v
 
     model.train()
     return x
 
-
 if __name__ == "__main__":
-    print("Initializing UNetDiT on CPU...")
+    print("Initializing DiT on CPU...")
     device = torch.device("cpu")
 
     model = TokenformerDiT(
         in_channels=32,
         dim=768,
+        depth=12,
         num_heads=12,
-        num_classes=12476
+        num_classes=12476,
+        drop_ratio=0.75
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -403,12 +514,23 @@ if __name__ == "__main__":
     y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
 
-    print("\nRunning forward pass...")
-
-    output = model(x_in, t, y_indices, y_offsets)
+    print("\nRunning forward pass (training)...")
+    model.train()
+    output = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1)
 
     print(f"Input shape:  {x_in.shape}")
     print(f"Output shape: {output.shape}")
+
+    print("\nRunning forward pass (inference / eval)...")
+    model.eval()
+    with torch.no_grad():
+        output_eval = model(x_in, t, y_indices, y_offsets)
+        print(f"Eval Output shape: {output_eval.shape}")
+        
+    print("\nRunning forward pass (inference / PDG force_path_drop)...")
+    with torch.no_grad():
+        output_pdg = model(x_in, t, y_indices, y_offsets, force_path_drop=True)
+        print(f"PDG Output shape: {output_pdg.shape}")
 
     assert x_in.shape == output.shape, "Error: Output shape does not match input shape!"
     print("✅ Forward pass completed successfully!")
