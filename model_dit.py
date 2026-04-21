@@ -302,7 +302,7 @@ class TokenformerDiT(nn.Module):
         # k-Diff learnable target parameter
         self.w_k = nn.Parameter(torch.tensor(0.0))
 
-    def compute_v(self, z, u_pred, t):
+    def compute_v(self, z, w_pred, t):
         k = torch.sigmoid(self.w_k)
 
         t = t.view(-1, 1, 1, 1)
@@ -310,7 +310,7 @@ class TokenformerDiT(nn.Module):
         denom = k * (1 - t) + (1 - k) * t
         denom = torch.clamp(denom, min=0.001)
 
-        v_pred = ((1 - 2 * k) * z + u_pred) / denom
+        v_pred = ((1 - 2 * k) * z + w_pred) / denom
         return v_pred
 
     def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0, force_path_drop=False, return_uniformity=False):

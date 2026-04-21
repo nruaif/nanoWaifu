@@ -230,7 +230,7 @@ def train(config_path):
 
             model_to_load.load_state_dict(state_dict, strict=False)
             # FIX: removed the arbitrary - 10 offset
-            global_step = checkpoint["global_step"] - 10
+            global_step = checkpoint["global_step"]
 
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
