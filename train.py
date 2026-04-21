@@ -331,7 +331,7 @@ def train(config_path):
     running_contrast_loss = 0.0  # FIX: accumulate contrast loss properly
     accum_steps = config['training'].get('grad_accum_steps', 1)
     is_mar = config['model'].get('type', 'v2') == 'mar'
-
+    model.to(torch.bfloat16)
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
