@@ -366,9 +366,9 @@ def train(config_path):
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     latents = vae.encode(v_images).latent_dist.mode()
-                    latents = (latents - latents_mean) / latents_std
+                    latents = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
+                    inputs = (latents - latents_mean) / latents_std
                     # FIX: keep in bfloat16 — no reason to cast to fp32
-                    inputs = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
             else:
                 inputs = images.to(dtype=torch.bfloat16)
 
@@ -462,8 +462,8 @@ def train(config_path):
 
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
+                        samples = (samples * latents_std) + latents_mean
                         latents = F.pixel_shuffle(samples, 2)
-                        latents = (latents * latents_std) + latents_mean
                         recon = vae.decode(latents).sample
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
