@@ -406,7 +406,7 @@ def train(config_path):
 
             loss.backward()
             loss_accum += loss.item()
-            contrast_loss_accum += contrast_loss.item() / accum_steps
+            contrast_loss_accum -= contrast_loss.item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
