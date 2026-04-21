@@ -21,7 +21,7 @@ training:
 model:
   type: "dit"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
-  use_tiny_vae: true
+  use_tiny_vae: false
   fcdm_dim: 768    # Hidden dimension (Transformer)
   fcdm_depth: 12   # Number of layers
   num_heads: 12    # Number of attention heads

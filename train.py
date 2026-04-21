@@ -278,13 +278,17 @@ def train(config_path):
             lr=config['training']['learning_rate'],
             weight_decay=0.1,
             cautious_wd = True,
-            betas=(0.9, 0.95)
+            betas=(0.9, 0.95),
+            normuon_variant = True
         )
     except TypeError:
         opt_normuon = NorMuon(
             normuon_params,
             lr=config['training']['learning_rate'],
-            weight_decay=0.1
+            weight_decay=0.1,
+            normuon_variant = True  ,
+            cautious_wd = True,
+            betas=(0.9, 0.95),
         )
 
     class DualOptimizer:
