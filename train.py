@@ -131,8 +131,8 @@ def train(config_path):
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-
-    ModelClass, TagProcessor, sample_fn = get_model_and_sampler(config)
+    from model_dit import TokenformerDiT, TagProcessor, sample_flow
+    ModelClass, TagProcessor, sample_fn = TokenformerDiT, TagProcessor, sample_flow
 
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
