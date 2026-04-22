@@ -32,5 +32,5 @@ model:
   uniformity_weight: 0.01 # Weight for the uniformity loss
 
 data:
-  webdataset_url: '/root/data/train/00{001..040}.tar'
+  webdataset_url: '/root/data/train/00{049..080}.tar'
   use_advanced_captions: true
