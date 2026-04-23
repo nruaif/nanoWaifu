@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
+from tqdm.auto import tqdm
 
 class GatherLayer(torch.autograd.Function):
     """Gather tensors from all processes, supporting backward propagation."""
@@ -83,31 +84,21 @@ class GGRoPE2d(nn.Module):
         freqs_hF2 = omega_F.unsqueeze(-1) * directions_hF2
         self.register_buffer("freqs_hF2", freqs_hF2)
 
-        # ADD A CACHE DICTIONARY
-        self._cache = {}
-
     def forward(self, x: torch.Tensor, H: int, W: int, seq_indices: torch.Tensor = None) -> torch.Tensor:
         B, h, N, d = x.shape
 
-        # CHECK CACHE FIRST
-        cache_key = (H, W, x.device, x.dtype)
-        if cache_key not in self._cache:
-            xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
-            x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
-            y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
+        # Compute RoPE frequencies (no cache to avoid graph breaks with torch.compile)
+        xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
+        x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
+        y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
 
-            y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
-            positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
+        y_HW, x_HW = torch.meshgrid(y_grid, x_grid, indexing='ij')
+        positions_HW2 = torch.stack((x_HW, y_HW), dim=-1).reshape(H * W, 1, 1, 2)
 
-            theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
+        theta = (self.freqs_hF2 * positions_HW2).sum(dim=-1)
 
-            cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)
-            sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
-
-            self._cache[cache_key] = (cos, sin)
-
-        # RETRIEVE FROM CACHE
-        cos, sin = self._cache[cache_key]
+        cos = torch.cos(theta).permute(1, 0, 2).unsqueeze(0)
+        sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
 
         if seq_indices is not None:
             # seq_indices is (B, N)
@@ -246,7 +237,7 @@ class TimestepEmbedder(nn.Module):
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
         emb = t.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(torch.bfloat16)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
         return self.mlp(emb)
 
 
@@ -302,16 +293,19 @@ class TokenformerDiT(nn.Module):
         # k-Diff learnable target parameter
         self.w_k = nn.Parameter(torch.tensor(0.0))
 
-    def compute_v(self, z, w_pred, t):
+    def get_velocity(self, z, u_pred, t):
+        """Convert u-prediction to velocity for the ODE.
+        Adapted for convention z = (1-t)*x + t*eps (t=0 clean, t=1 noise).
+
+        z: noisy input (B, C, H, W)
+        u_pred: model output (B, C, H, W)
+        t: timestep (B,) or (B, 1, 1, 1)
+        """
         k = torch.sigmoid(self.w_k)
-
-        t = t.view(-1, 1, 1, 1)
-
-        denom = k * (1 - t) + (1 - k) * t
-        denom = torch.clamp(denom, min=0.001)
-
-        v_pred = ((1 - 2 * k) * z + w_pred) / denom
-        return v_pred
+        if t.dim() == 1:
+            t = t.view(-1, 1, 1, 1)
+        denom = (k * t + (1 - k) * (1 - t)).clamp(min=0.05)
+        return -((1 - 2 * k) * z + u_pred) / denom
 
     def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0, force_path_drop=False, return_uniformity=False):
         B, C, H, W = x_in.shape
@@ -364,15 +358,18 @@ class TokenformerDiT(nn.Module):
             elif return_uniformity:
                 u_loss = torch.tensor(0.0, device=x.device)
 
-            # 4. Path-drop learning / Fusion
-            if self.training and path_drop_prob > 0.0 and torch.rand(1).item() < path_drop_prob:
-                g_pad_t = self.mask_token.expand(B, N, -1)
+            # 4. Path-drop learning / Fusion (tensor ops to avoid graph breaks)
+            g_full = self.mask_token.expand(B, N, -1).clone()
+            if seq_indices is not None:
+                g_full.scatter_(1, seq_indices.unsqueeze(-1).expand(-1, -1, self.dim), x_middle)
             else:
-                g_pad_t = self.mask_token.expand(B, N, -1).clone()
-                if seq_indices is not None:
-                    g_pad_t.scatter_(1, seq_indices.unsqueeze(-1).expand(-1, -1, self.dim), x_middle)
-                else:
-                    g_pad_t = x_middle
+                g_full = x_middle
+
+            if self.training and path_drop_prob > 0.0:
+                drop_mask = (torch.rand(1, device=x.device) < path_drop_prob).view(1, 1, 1)
+                g_pad_t = torch.where(drop_mask, self.mask_token.expand(B, N, -1), g_full)
+            else:
+                g_pad_t = g_full
                     
         # Sparse-dense residual fusion
         h_t = self.fusion(torch.cat([f_t, g_pad_t], dim=-1))
@@ -390,18 +387,17 @@ class TokenformerDiT(nn.Module):
         x_out = self.final_proj(x_norm)
         x_out = x_out.transpose(1, 2).reshape(B, C, H, W)
 
-        out_v = self.compute_v(x_in, x_out, t)
-
+        # Return raw u-prediction (velocity conversion happens outside)
         if return_uniformity:
             if not return_features:
-                return out_v, u_loss
+                return x_out, u_loss
             else:
-                return out_v, feat, u_loss
+                return x_out, feat, u_loss
         else:
             if not return_features:
-                return out_v
+                return x_out
             else:
-                return out_v, feat
+                return x_out, feat
 
 
 import random
@@ -437,13 +433,17 @@ class TagProcessor:
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                    steps=50, guidance_scale=1.5, noise=None, cfg_scale = 0):
+                    steps=50, guidance_scale=1.5, noise=None, cfg_scale=0):
     """
     PF-ODE sampling with Path-Drop Guidance (PDG).
+    Uses u-prediction -> velocity conversion for the ODE step.
     """
     in_channels = model.final_proj.out_features
     model.eval()
-    H = W = latent_size
+    if isinstance(latent_size, (tuple, list)):
+        H, W = latent_size
+    else:
+        H = W = latent_size
 
     # Init noise
     if noise is not None:
@@ -461,23 +461,24 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-    x = x.to(torch.bfloat16)
 
-    for i in range(steps):
+    for i in tqdm(range(steps)):
         t_curr = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_curr
         t_vec = torch.full((batch_size,), t_curr.item(), device=device)
-        t_vec = t_vec.to(torch.bfloat16)
-        # Conditional prediction (full path)
-        v_cond = model(x, t_vec, y_indices, y_offsets)
 
-        # Unconditional prediction via PDG (drop middle path)
-        v_uncond = model(
+        # Conditional u-prediction (full path) -> velocity
+        u_cond = model(x, t_vec, y_indices, y_offsets)
+        v_cond = model.get_velocity(x, u_cond, t_vec)
+
+        # Unconditional u-prediction via PDG (drop middle path) -> velocity
+        u_uncond = model(
             x, t_vec,
             y_null_indices, y_null_offsets,
             force_path_drop=True
         )
+        v_uncond = model.get_velocity(x, u_uncond, t_vec)
 
         # PDG combination (same form as CFG)
         v = v_uncond + guidance_scale * (v_cond - v_uncond)

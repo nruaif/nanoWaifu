@@ -244,6 +244,9 @@ def train(config_path):
         print(">>> Compiling Model...")
         model = torch.compile(model, mode="max-autotune")
 
+    # Reference to the unwrapped model for accessing k-diff parameters
+    model_raw = model.module if hasattr(model, 'module') else model
+
     from adv_optm import Muon_adv as  NorMuon
     from adv_optm import AdamW_adv as DionAdamW
 
@@ -329,7 +332,6 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
-    running_contrast_loss = 0.0  # FIX: accumulate contrast loss properly
     accum_steps = config['training'].get('grad_accum_steps', 1)
     is_mar = config['model'].get('type', 'v2') == 'mar'
     while global_step < config['training'].get('max_train_steps', 1000000):
@@ -337,7 +339,6 @@ def train(config_path):
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
-        contrast_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -390,47 +391,62 @@ def train(config_path):
             t_reshaped = t.view(-1, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-            target = noise - inputs
+
+            # --- Training Augmentations (each applied independently w/ 50% chance) ---
+            # 1. Gaussian noise injection to xt to simulate drift during inference
+            noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
+            if noise_inject_ratio > 0:
+                noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
+                xt = xt + noise_mask * noise_inject_ratio * torch.randn_like(xt)
+
+            # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
+            #    from a different clean sample to simulate mean-seeking drift
+            cross_ratio = config['training'].get('cross_ratio', 0.1)
+            if cross_ratio > 0:
+                cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
+                inputs_neg = inputs.roll(shifts=1, dims=0)
+                noise_neg = torch.randn_like(inputs)
+                xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
+                xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
             uniformity_weight = config['model'].get('uniformity_weight', 0.0)
             path_drop_prob = config['model'].get('path_drop_prob', 0.0)
 
-            pred, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
-            loss = F.mse_loss(pred, target)
+            # Model outputs raw u-prediction
+            u_pred, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
+
+            # Compute velocity-space loss for uniform weighting (k-diff)
+            k = torch.sigmoid(model_raw.w_k)
+            u_target = k * inputs - (1 - k) * noise
+            v_pred = model_raw.get_velocity(xt, u_pred, t_reshaped)
+            v_target = model_raw.get_velocity(xt, u_target, t_reshaped)
+            loss = F.mse_loss(v_pred, v_target)
             if u_loss is not None:
                 loss = loss + (uniformity_weight * u_loss)
 
-            x0_pred = xt - t_reshaped * pred
-            x0_neg = torch.roll(x0_pred, shifts=1, dims=0).detach()
-            contrast_loss = F.mse_loss(x0_pred, x0_neg)
-
             loss = loss / accum_steps
-
             loss.backward()
             loss_accum += loss.item()
-            contrast_loss_accum -= contrast_loss.item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
-        running_contrast_loss += contrast_loss_accum
         if rank == 0:
             pbar.update(1)
 
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
-                avg_contrast_loss = running_contrast_loss / log_interval  # FIX: proper average
+                k_val = torch.sigmoid(model_raw.w_k).item()
                 wandb.log({
                     "train/loss": avg_loss,
-                    "train/contrast_loss": avg_contrast_loss,
+                    "train/k_value": k_val,
                     "train/uniformity_weighted": u_loss.item()
                 }, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "k": f"{k_val:.3f}"})
                 running_loss = 0.0
-                running_contrast_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],

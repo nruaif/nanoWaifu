@@ -17,6 +17,8 @@ training:
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
+  noise_inject_ratio: 0.1
+  cross_ratio: 0.1
 
 model:
   type: "dit"      # Use TokenformerDiT
