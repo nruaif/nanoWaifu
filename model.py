@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 
@@ -68,10 +69,52 @@ class ResnetInvertedBottleneckBlock(nn.Module):
 
 
 # ==========================================================
-# Binary token bottleneck
+# Ternary quantization with temperature annealing
+# ==========================================================
+
+class TernarySTE(torch.autograd.Function):
+    """Ternary Straight-Through Estimator with sigmoid surrogate gradient.
+    Produces {-1, 0, +1} values with smooth backward pass."""
+    @staticmethod
+    def forward(ctx, x, temp):
+        ctx.save_for_backward(x, temp)
+        return torch.sign(x) * (x.abs() > 1).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, temp = ctx.saved_tensors
+
+        def sigmoid_derivative(z):
+            s = torch.sigmoid(z)
+            return s * (1.0 - s)
+
+        # Surrogate gradient: sum of sigmoid derivatives at the two thresholds
+        # Scaled by 1/temp so the area under the gradient curve remains constant
+        surrogate_grad = (sigmoid_derivative((x - 1.0) / temp) +
+                          sigmoid_derivative((x + 1.0) / temp)) / temp
+
+        return grad_output * surrogate_grad, None
+
+
+class AdaptiveBitwiseSign(nn.Module):
+    """Ternary quantizer with annealing temperature for gradual sharpening."""
+    def __init__(self, initial_temp=1.0):
+        super().__init__()
+        self.register_buffer('temp', torch.tensor(initial_temp, dtype=torch.float32))
+
+    def forward(self, x):
+        return TernarySTE.apply(x, self.temp)
+
+    def anneal_temp(self, factor=0.98, min_temp=0.01):
+        """Call each epoch to gradually sharpen quantization."""
+        self.temp.mul_(factor).clamp_(min=min_temp)
+
+
+# ==========================================================
+# Ternary token bottleneck
 # ==========================================================
 class QuantizedTokenBottleneck(nn.Module):
-    def __init__(self, dim_in, dim_latent):
+    def __init__(self, dim_in, dim_latent, initial_temp=1.0):
         super().__init__()
 
         self.proj_in = nn.Linear(dim_in, dim_latent)
@@ -80,12 +123,11 @@ class QuantizedTokenBottleneck(nn.Module):
         self.proj_out = nn.Linear(dim_latent, dim_in)
         self.norm2 = nn.LayerNorm(dim_in)
 
+        self.quant = AdaptiveBitwiseSign(initial_temp=initial_temp)
+
     def forward(self, x):
         z = self.norm1(self.proj_in(x))
-
-        q = torch.where(z >= 0, 1.0, -1.0)
-        z_q = z + (q - z).detach()   # STE
-
+        z_q = self.quant(z)
         out = self.norm2(self.proj_out(z_q))
         return out, z_q
 
@@ -106,6 +148,8 @@ class SimpleAutoencoder(nn.Module):
         checkpoint_blocks=True,
         mask_ratio=0.75,
         mask_patch=2,
+        use_masking=True,
+        initial_temp=1.0,
     ):
         super().__init__()
 
@@ -113,6 +157,7 @@ class SimpleAutoencoder(nn.Module):
         self.checkpoint_blocks = checkpoint_blocks
         self.mask_ratio = mask_ratio
         self.mask_patch = mask_patch
+        self.use_masking = use_masking
 
         # --------------------------------------------------
         # Initial downsample x2
@@ -177,7 +222,8 @@ class SimpleAutoencoder(nn.Module):
         # --------------------------------------------------
         self.bottleneck = QuantizedTokenBottleneck(
             dim_in=c,
-            dim_latent=latent_dim
+            dim_latent=latent_dim,
+            initial_temp=initial_temp
         )
 
         # --------------------------------------------------
@@ -227,7 +273,7 @@ class SimpleAutoencoder(nn.Module):
     # always mask half batch during training
     # ======================================================
     def apply_masking(self, tokens, B, C, H, W):
-        if (not self.training) or B < 2:
+        if (not self.training) or B < 2 or (not self.use_masking):
             return tokens
 
         num_masked = B // 2
@@ -306,6 +352,10 @@ class SimpleAutoencoder(nn.Module):
         x = self.conv_out(x)
 
         return x, latent
+
+    def anneal_temperature(self, factor=0.98, min_temp=0.01):
+        """Anneal the quantization temperature for gradual sharpening."""
+        self.bottleneck.quant.anneal_temp(factor=factor, min_temp=min_temp)
 
 
 # ==========================================================

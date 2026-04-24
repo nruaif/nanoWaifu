@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_optimizer.optimizer import ScheduleFreeAdamW
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -17,8 +16,37 @@ import builtins
 from torch.optim.lr_scheduler import LambdaLR
 from model import SimpleAutoencoder
 from dataset import WDSLoader
-from dino_perceptual import DINOPerceptual
 
+
+# ==========================================================
+# Losses & Metrics
+# ==========================================================
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier loss: blend of L1 + L2 for sharper reconstructions than pure MSE."""
+    def __init__(self, eps=5e-4):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        return torch.abs(diff).mean() + torch.square(diff).mean()
+
+
+def compute_psnr(pred, target):
+    """Compute PSNR for batch of images in [-1, 1] range."""
+    # Convert to [0, 1] range
+    pred = (pred + 1) / 2
+    target = (target + 1) / 2
+
+    mse = F.mse_loss(pred, target, reduction='none').mean(dim=[1, 2, 3])
+    psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
+    return psnr.mean().item()
+
+
+# ==========================================================
+# DDP Utilities
+# ==========================================================
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -64,8 +92,15 @@ def get_pca_latent(latent):
     return X_pca.reshape(B, H, W, 3).permute(0, 3, 1, 2)
 
 
+# ==========================================================
+# Training
+# ==========================================================
+
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
+
+    # Performance settings
+    torch.backends.cudnn.benchmark = True
 
     def lr_lambda(current_step):
         if current_step < 1000:
@@ -95,39 +130,54 @@ def train(config_path):
     )
     dataloader = wds_loader.make_loader()
 
+    # Model with configurable masking and temperature
     model = SimpleAutoencoder(
         in_channels=config['model'].get('in_channels', 3),
         hidden_dims=config['model'].get('hidden_dims', [64, 128, 256, 512, 512]),
         expand_ratio=config['model'].get('expand_ratio', 4),
         num_transformer_blocks=config['model'].get('num_transformer_blocks', 4),
-        latent_dim=config['model'].get('dim', 16)
+        latent_dim=config['model'].get('dim', 16),
+        use_masking=config['training'].get('use_masking', True),
+        initial_temp=config['training'].get('initial_temp', 1.0),
     ).to(device)
+
     from adv_optm import AdamW_adv as DionAdamW
     optimizer = DionAdamW(model.parameters(), cautious_wd=True,
                           lr=config['training']['learning_rate'],
                           weight_decay=0.1,
                           betas=(0.9, 0.95)
                           )
+
+    # GradScaler for proper mixed-precision training
+    scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
+
     model.compile()
     start_epoch = 0
     global_step = 0
-    resume_path = config.get('resume_from', "")
-    lpips_loss_fn = DINOPerceptual(model_size="B").cuda().bfloat16().eval()
-    lpips_loss_fn.compile()
 
-    print(f"Resuming from checkpoint: {resume_path}")
-    try:
-        checkpoint = torch.load("outputs/ckpt_step_45000.pth", map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            if "optimizer_state_dict" in checkpoint:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            global_step = checkpoint.get("global_step", 0) - 10
-        else:
-            model.load_state_dict(checkpoint, strict=False)
-        print("Successfully loaded checkpoint.")
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
+    # Loss function
+    charbonnier = CharbonnierLoss()
+
+    # Load checkpoint
+    resume_path = config['training'].get('resume_from', "")
+    if resume_path and os.path.exists(resume_path):
+        print(f"Resuming from checkpoint: {resume_path}")
+        try:
+            checkpoint = torch.load(resume_path, map_location=device)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                if "optimizer_state_dict" in checkpoint:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if "scaler_state_dict" in checkpoint:
+                    scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                global_step = checkpoint.get("global_step", 0)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+            print(f"Successfully loaded checkpoint at step {global_step}.")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+    else:
+        print("No checkpoint found, starting fresh.")
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
@@ -136,6 +186,8 @@ def train(config_path):
     os.makedirs(config['training']['output_dir'], exist_ok=True)
 
     max_train_steps = config['training'].get('max_train_steps', config['training']['num_epochs'] * 1000)
+    temp_anneal_factor = config['training'].get('temp_anneal_factor', 0.98)
+    temp_anneal_min = config['training'].get('temp_anneal_min', 0.01)
 
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
@@ -150,36 +202,51 @@ def train(config_path):
         try:
             batch = next(data_iter)
         except StopIteration:
+            # Epoch boundary: anneal temperature
+            model_raw = model.module if is_ddp else model
+            model_raw.anneal_temperature(factor=temp_anneal_factor, min_temp=temp_anneal_min)
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        x1 = batch[0].to(device)
+        x1 = batch[0].to(device, memory_format=torch.channels_last)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             x_rec, latent = model(x1)
-            l1 = torch.mean((x_rec - x1) ** 2)
-            perceptual = lpips_loss_fn(x_rec, x1).mean() * 250.0
-            loss = l1 + perceptual
-        optimizer.zero_grad()
-        loss.backward()
+            loss = charbonnier(x_rec, x1)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
 
         global_step += 1
 
         if rank == 0:
             pbar.update(1)
+
+            # Get current temperature
+            model_raw = model.module if is_ddp else model
+            current_temp = model_raw.bottleneck.quant.temp.item()
+
             logs = {
-                "loss": l1.item(),
-                "perceptual": perceptual.item(),
+                "loss": loss.item(),
                 "lr": optimizer.param_groups[0]['lr'],
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                "temp": current_temp,
             }
-            pbar.set_postfix(**logs)
+            pbar.set_postfix(**{k: f"{v:.4f}" for k, v in logs.items()})
 
             if global_step % config['training']['log_every_steps'] == 0:
+                # Compute PSNR
+                with torch.no_grad():
+                    psnr = compute_psnr(x_rec, x1)
+
                 wandb_log = {f"train/{k}": v for k, v in logs.items()}
+                wandb_log["train/psnr"] = psnr
                 wandb.log(wandb_log, step=global_step)
 
         if global_step % config['training']['save_image_every_steps'] == 0:
@@ -193,32 +260,31 @@ def train(config_path):
                     "model_state_dict": model_to_save.state_dict(),
                     "global_step": global_step,
                     "config": config,
-                    "optimizer_state_dict": optimizer.state_dict()
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                 }
                 ckpt_path = os.path.join(config['training']['output_dir'], f'ckpt_step_{global_step}.pth')
                 torch.save(ckpt_state, ckpt_path)
-                cleanup_checkpoints(config['training']['output_dir'], config.get('max_checkpoints', 3), rank)
+                cleanup_checkpoints(config['training']['output_dir'], config['training'].get('max_checkpoints', 3), rank)
 
                 model.eval()
                 with torch.no_grad():
-                    # Visualize first 4 samples from batch
-                    x1_sample = x1[:4]
-                    x_rec, latent = model(x1_sample)
+                    n_viz = min(8, x1.shape[0])
+                    x1_sample = x1[:n_viz]
+                    x_rec_sample, _ = model(x1_sample)
 
-                    # Denormalize assuming x1 is in [-1, 1] range to [0, 1]
-                    x1_vis = (x1_sample + 1) / 2.0
-                    x_rec_vis = (x_rec + 1) / 2.0
+                    # Compute PSNR for visualization batch
+                    viz_psnr = compute_psnr(x_rec_sample, x1_sample)
 
-                    # Difference map
-                    diff = torch.abs(x1_vis - x_rec_vis)
+                    # Top row: originals, Bottom row: reconstructions
+                    comparison = torch.cat([x1_sample, x_rec_sample], dim=0)
+                    grid = make_grid(comparison, nrow=n_viz, normalize=True, value_range=(-1, 1))
 
-                    # Concatenate to form a grid: row 1 (original), row 2 (recon), row 3 (diff), row 4 (pca)
-                    all_vis = torch.cat([x1_vis, x_rec_vis, diff], dim=0)
-                    all_vis = torch.clamp(all_vis, 0, 1)
-
-                    grid = make_grid(all_vis, nrow=3)
-                    wandb_image = wandb.Image(grid, caption=f"Orig | Recon | Diff | PCA (Step {global_step})")
-                    wandb.log({"samples": wandb_image}, step=global_step)
+                    wandb_image = wandb.Image(
+                        grid,
+                        caption=f"Step {global_step} | PSNR: {viz_psnr:.2f} dB | Top: Original, Bottom: Recon"
+                    )
+                    wandb.log({"eval/reconstructions": wandb_image}, step=global_step)
 
                 model.train()
                 print("Checkpoint and sampling complete.\n")

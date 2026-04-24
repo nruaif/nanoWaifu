@@ -16,8 +16,16 @@ training:
   cfg_scale: 4.0
   output_dir: "outputs"
   wandb_project: "nanoWaifu-ae"
-  resume_from: "outputs/ckpt_step_5000.pth" # Path to checkpoint to resume from (e.g. "outputs/ckpt_step_1000.pth"), empty for new run
+  resume_from: "" # Path to checkpoint to resume from (e.g. "outputs/ckpt_step_5000.pth")
   max_checkpoints: 3 # Keep only top N latest checkpoints
+
+  # Ternary quantization temperature annealing
+  initial_temp: 1.0         # Starting quantization temperature
+  temp_anneal_factor: 0.98  # Temperature decay per epoch boundary
+  temp_anneal_min: 0.01     # Minimum temperature clamp
+
+  # MAE-style masking (set to false to disable)
+  use_masking: true
 
 model:
   hidden_dims: [64, 128, 256, 512, 512] # f32 downsampling
@@ -29,4 +37,3 @@ model:
 data:
   webdataset_url: "/data/train/000{40..80}.tar" # Example URL
   csv_path: "characters.csv"
-
