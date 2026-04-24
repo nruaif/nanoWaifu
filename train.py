@@ -137,6 +137,10 @@ def train(config_path):
         latent_continuous=config['model'].get('latent_continuous', 32),
         residual_dropout_prob=config['training'].get('residual_dropout', 0.1),
         num_transformer_blocks=config['model'].get('num_transformer_blocks', 8),
+        num_cls_tokens=config['model'].get('num_cls_tokens', 4),
+        use_masking=config['training'].get('use_masking', True),
+        mask_ratio=config['training'].get('mask_ratio', 0.75),
+        mask_patch=config['training'].get('mask_patch', 2),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -228,7 +232,7 @@ def train(config_path):
 
             # Get current temperature
             model_raw = model.module if is_ddp else model
-            current_temp = model_raw.encoder.quant.temp.item()
+            current_temp = model_raw.quant.temp.item()
 
             logs = {
                 "loss": loss.item(),

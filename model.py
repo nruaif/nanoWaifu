@@ -105,11 +105,11 @@ class InceptionNeXtBlock(nn.Module):
 
 
 # ==========================================================
-# Transformer Block for Final Stage
+# Transformer Block (operates on [B, N, C] token sequences)
 # ==========================================================
 
 class TransformerBlock(nn.Module):
-    """Transformer block operating on spatial feature maps."""
+    """Transformer block operating on token sequences [B, N, C]."""
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -126,26 +126,20 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        x_flat = x.flatten(2).transpose(1, 2)
-
-        x_norm = self.norm1(x_flat)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x_flat = x_flat + attn_out
-
-        x_flat = x_flat + self.mlp(self.norm2(x_flat))
-
-        x = x_flat.transpose(1, 2).reshape(B, C, H, W)
+        # x: [B, N, C]
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 # ==========================================================
-# Multi-Scale Encoder & Decoder (with Sub-Pixel Sampling)
+# Multi-Scale CNN Encoder (InceptionNeXt stages only, no transformers)
 # ==========================================================
 
-class MultiScaleEncoder(nn.Module):
-    def __init__(self, patch=4, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3),
-                 latent_discrete=256, latent_continuous=32, num_transformer_blocks=8):
+class MultiScaleCNNEncoder(nn.Module):
+    def __init__(self, patch=4, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3)):
         super().__init__()
         self.unshuffle = nn.PixelUnshuffle(patch)
         self.stem = nn.Conv2d(3 * patch * patch, dims[0], 7, padding=3)
@@ -160,21 +154,10 @@ class MultiScaleEncoder(nn.Module):
                 nn.PixelUnshuffle(2),
                 nn.Conv2d(dims[i] * 4, dims[i + 1], 1)
             )
-            if i == len(dims) - 2:  # Last stage: add transformer blocks
-                blocks = nn.Sequential(
-                    *[InceptionNeXtBlock(dims[i + 1]) for _ in range(depths[i + 1])],
-                    *[TransformerBlock(dims[i + 1], num_heads=8) for _ in range(num_transformer_blocks)]
-                )
-            else:
-                blocks = nn.Sequential(
-                    *[InceptionNeXtBlock(dims[i + 1]) for _ in range(depths[i + 1])]
-                )
+            blocks = nn.Sequential(
+                *[InceptionNeXtBlock(dims[i + 1]) for _ in range(depths[i + 1])]
+            )
             self.stages.append(nn.ModuleList([downsample, blocks]))
-
-        self.to_latent_discrete = nn.Conv2d(dims[-1], latent_discrete, 3, padding=1)
-        self.to_latent_continuous = nn.Conv2d(dims[-1], latent_continuous, 3, padding=1)
-
-        self.quant = AdaptiveBitwiseSign()
 
     def forward(self, x):
         x = self.unshuffle(x)
@@ -185,23 +168,16 @@ class MultiScaleEncoder(nn.Module):
             x = downsample(x)
             x = blocks(x)
 
-        z_discrete = self.quant(self.to_latent_discrete(x))
-        z_continuous = self.to_latent_continuous(x)
-
-        return z_discrete, z_continuous
+        return x  # [B, dims[-1], H, W]
 
 
-class MultiScaleDecoder(nn.Module):
-    def __init__(self, patch=4, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3),
-                 latent_discrete=256, latent_continuous=32, num_transformer_blocks=8):
+# ==========================================================
+# Multi-Scale CNN Decoder (InceptionNeXt stages only, no transformers)
+# ==========================================================
+
+class MultiScaleCNNDecoder(nn.Module):
+    def __init__(self, patch=4, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3)):
         super().__init__()
-        total_latent = latent_discrete + latent_continuous
-        self.from_latent = nn.Conv2d(total_latent, dims[-1], 1)
-
-        self.initial_blocks = nn.Sequential(
-            *[InceptionNeXtBlock(dims[-1]) for _ in range(depths[-1])],
-            *[TransformerBlock(dims[-1], num_heads=8) for _ in range(num_transformer_blocks)]
-        )
 
         self.stages = nn.ModuleList()
         for i in range(len(dims) - 1, 0, -1):
@@ -217,11 +193,8 @@ class MultiScaleDecoder(nn.Module):
         self.to_pixels = nn.Conv2d(dims[0], 3 * patch * patch, 3, padding=1)
         self.shuffle = nn.PixelShuffle(patch)
 
-    def forward(self, z_discrete, z_continuous):
-        z = torch.cat([z_discrete, z_continuous], dim=1)
-        x = self.from_latent(z)
-        x = self.initial_blocks(x)
-
+    def forward(self, x):
+        # x: [B, dims[-1], H, W]
         for upsample, blocks in self.stages:
             x = upsample(x)
             x = blocks(x)
@@ -235,42 +208,157 @@ class MultiScaleDecoder(nn.Module):
 # ==========================================================
 
 class BinaryAutoencoder(nn.Module):
-    def __init__(self, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3),
-                 latent_discrete=256, latent_continuous=32,
-                 residual_dropout_prob=0.1, num_transformer_blocks=8):
+    def __init__(
+        self,
+        dims=(96, 192, 384, 768),
+        depths=(3, 3, 9, 3),
+        latent_discrete=256,
+        latent_continuous=32,
+        residual_dropout_prob=0.1,
+        num_transformer_blocks=8,
+        num_cls_tokens=4,
+        mask_ratio=0.75,
+        mask_patch=2,
+        use_masking=True,
+    ):
         super().__init__()
-        self.encoder = MultiScaleEncoder(
-            dims=dims, depths=depths,
-            latent_discrete=latent_discrete,
-            latent_continuous=latent_continuous,
-            num_transformer_blocks=num_transformer_blocks,
-        )
-        self.decoder = MultiScaleDecoder(
-            dims=dims, depths=depths,
-            latent_discrete=latent_discrete,
-            latent_continuous=latent_continuous,
-            num_transformer_blocks=num_transformer_blocks,
-        )
-        self.latent_discrete = latent_discrete
-        self.latent_continuous = latent_continuous
+
         self.residual_dropout_prob = residual_dropout_prob
+        self.num_cls_tokens = num_cls_tokens
+        self.mask_ratio = mask_ratio
+        self.mask_patch = mask_patch
+        self.use_masking = use_masking
 
+        token_dim = dims[-1]
+
+        # --------------------------------------------------
+        # CNN backbone (no transformers)
+        # --------------------------------------------------
+        self.encoder_cnn = MultiScaleCNNEncoder(dims=dims, depths=depths)
+        self.decoder_cnn = MultiScaleCNNDecoder(dims=dims, depths=depths)
+
+        # --------------------------------------------------
+        # Transformer stacks (operate on [B, N, C] tokens)
+        # --------------------------------------------------
+        self.encoder_transformers = nn.ModuleList([
+            TransformerBlock(token_dim, num_heads=8)
+            for _ in range(num_transformer_blocks)
+        ])
+        self.decoder_transformers = nn.ModuleList([
+            TransformerBlock(token_dim, num_heads=8)
+            for _ in range(num_transformer_blocks)
+        ])
+
+        # --------------------------------------------------
+        # CLS tokens and mask token
+        # --------------------------------------------------
+        self.cls_tokens = nn.Parameter(torch.randn(1, num_cls_tokens, token_dim))
+        self.mask_token = nn.Parameter(torch.randn(1, 1, token_dim))
+
+        # --------------------------------------------------
+        # Spatial bottleneck (ternary discrete + continuous bypass)
+        # --------------------------------------------------
+        self.to_latent_discrete = nn.Conv2d(token_dim, latent_discrete, 3, padding=1)
+        self.to_latent_continuous = nn.Conv2d(token_dim, latent_continuous, 3, padding=1)
+        self.from_latent = nn.Conv2d(latent_discrete + latent_continuous, token_dim, 1)
+        self.quant = AdaptiveBitwiseSign()
+
+    # ======================================================
+    # MAE-style masking (applied to half the batch)
+    # ======================================================
+    def apply_masking(self, tokens, B, C, H, W):
+        """Block-wise masking on spatial tokens. CLS tokens are never masked."""
+        if (not self.training) or B < 2 or (not self.use_masking):
+            return tokens
+
+        num_masked = B // 2
+
+        # Random half of batch to mask
+        idx = torch.randperm(B, device=tokens.device)
+        masked_ids = idx[:num_masked]
+
+        cls_part = tokens[:, :self.num_cls_tokens]
+        spatial = tokens[:, self.num_cls_tokens:]
+
+        # Reshape spatial to [B, C, H, W] for block masking
+        fmap = spatial.transpose(1, 2).reshape(B, C, H, W)
+
+        p = self.mask_patch
+        coarse_h = H // p
+        coarse_w = W // p
+
+        # Create block mask at coarse resolution, then upscale
+        mask = (
+            torch.rand(num_masked, 1, coarse_h, coarse_w, device=tokens.device)
+            < self.mask_ratio
+        )
+        mask = mask.repeat_interleave(p, 2).repeat_interleave(p, 3)
+
+        # Replace masked positions with learned mask token
+        target = fmap[masked_ids]
+        mask_tok = self.mask_token.transpose(1, 2).unsqueeze(-1)  # [1, C, 1, 1]
+        mask_tok = mask_tok.expand_as(target)
+        target = torch.where(mask, mask_tok, target)
+        fmap[masked_ids] = target
+
+        spatial = fmap.flatten(2).transpose(1, 2)
+        return torch.cat([cls_part, spatial], dim=1)
+
+    # ======================================================
+    # forward
+    # ======================================================
     def forward(self, x):
-        z_discrete, z_continuous = self.encoder(x)
+        # 1. CNN encode
+        features = self.encoder_cnn(x)  # [B, C, H, W]
+        B, C, H, W = features.shape
 
-        # Residual dropout: randomly zero continuous channels per-sample
+        # 2. Encoder transformers with CLS tokens
+        spatial = features.flatten(2).transpose(1, 2)  # [B, HW, C]
+        cls = self.cls_tokens.expand(B, -1, -1)         # [B, num_cls, C]
+        tokens = torch.cat([cls, spatial], dim=1)       # [B, num_cls + HW, C]
+
+        for block in self.encoder_transformers:
+            tokens = block(tokens)
+
+        # Separate CLS and spatial
+        enc_cls = tokens[:, :self.num_cls_tokens]
+        spatial = tokens[:, self.num_cls_tokens:]
+        features = spatial.transpose(1, 2).reshape(B, C, H, W)
+
+        # 3. Spatial bottleneck
+        z_discrete = self.quant(self.to_latent_discrete(features))
+        z_continuous = self.to_latent_continuous(features)
+
+        # Residual dropout on continuous channels
         if self.training and self.residual_dropout_prob > 0:
-            batch_size = z_continuous.shape[0]
-            mask = torch.rand(batch_size, 1, 1, 1, device=z_continuous.device) > self.residual_dropout_prob
+            mask = torch.rand(B, 1, 1, 1, device=z_continuous.device) > self.residual_dropout_prob
             z_continuous = z_continuous * mask.float()
 
-        recon = self.decoder(z_discrete, z_continuous)
-        recon = torch.clamp(recon, -1, 1)
+        z = torch.cat([z_discrete, z_continuous], dim=1)
+        features = self.from_latent(z)  # [B, C, H, W]
 
-        return recon, z_discrete
+        # 4. Decoder transformers with CLS + MAE masking
+        spatial = features.flatten(2).transpose(1, 2)
+        tokens = torch.cat([enc_cls, spatial], dim=1)
+
+        # Apply MAE masking on decoder input (after bottleneck)
+        tokens = self.apply_masking(tokens, B, C, H, W)
+
+        for block in self.decoder_transformers:
+            tokens = block(tokens)
+
+        # Remove CLS tokens
+        spatial = tokens[:, self.num_cls_tokens:]
+        features = spatial.transpose(1, 2).reshape(B, C, H, W)
+
+        # 5. CNN decode
+        img = self.decoder_cnn(features)
+        img = torch.clamp(img, -1, 1)
+
+        return img, z_discrete
 
     def anneal_temperature(self, factor=0.98, min_temp=0.01):
-        self.encoder.quant.anneal_temp(factor=factor, min_temp=min_temp)
+        self.quant.anneal_temp(factor=factor, min_temp=min_temp)
 
 
 # ==========================================================
