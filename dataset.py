@@ -9,9 +9,11 @@ import io
 from PIL import Image
 import json
 
+
 def warn_and_continue(exn):
     print(f"Warning: {exn}")
     return True
+
 
 class WDSLoader:
     def __init__(self, url, csv_path, image_size=64, batch_size=16, num_workers=4):
@@ -38,7 +40,7 @@ class WDSLoader:
             if key in sample:
                 image_key = key
                 break
-        
+
         if image_key is None:
             # Debug: Print keys if image not found (first few times)
             if not hasattr(self, "_log_missing_key_count"): self._log_missing_key_count = 0
@@ -53,7 +55,7 @@ class WDSLoader:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             print(f"Error decoding image: {e}")
-            return None # Skip broken images
+            return None  # Skip broken images
 
         # Decode JSON for class
         # If 'json' key missing, treat as unknown/unconditioned
@@ -61,8 +63,8 @@ class WDSLoader:
             if "json" in sample:
                 meta = json.loads(sample["json"])
             else:
-                meta = {} # Empty meta implies unknown character
-            
+                meta = {}  # Empty meta implies unknown character
+
             char_name = meta.get("character", "unknown")
             # Map to self.num_classes if not found. This aligns with the DiT null token index,
             # effectively treating unknown characters as "unconditioned" samples.
@@ -73,10 +75,10 @@ class WDSLoader:
 
         # Random Resized Crop logic
         i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=self.scale, ratio=self.ratio)
-        
+
         # Original size
         W, H = image.size
-        
+
         # Relative coords: top, left, height, width
         # i (top), j (left), h, w
         # Normalize by H, W
@@ -85,10 +87,10 @@ class WDSLoader:
 
         # Apply crop and resize
         image = F.resized_crop(image, i, j, h, w, size=(self.image_size, self.image_size))
-        
+
         # To Tensor and Normalize [-1, 1]
         image = F.to_tensor(image)
-        image = (image - 0.5) * 2.0 
+        image = (image - 0.5) * 2.0
 
         return {
             "image": image,
@@ -98,17 +100,17 @@ class WDSLoader:
 
     def make_loader(self):
         dataset = (
-            wds.WebDataset(self.url, nodesplitter=wds.split_by_node, handler=warn_and_continue,)
+            wds.WebDataset(self.url, nodesplitter=wds.split_by_node, handler=warn_and_continue, )
             .shuffle(1000)
-            .map(self.preprocess, handler=warn_and_continue,)
+            .map(self.preprocess, handler=warn_and_continue, )
             .select(lambda x: x is not None)
-            .to_tuple("image", "class_id", "coords", handler=warn_and_continue,)
+            .to_tuple("image", "class_id", "coords", handler=warn_and_continue, )
             .batched(self.batch_size, partial=False)
         )
-        
+
         loader = DataLoader(
             dataset,
-            batch_size=None, # Batched in webdataset
+            batch_size=None,  # Batched in webdataset
             num_workers=self.num_workers,
             pin_memory=True
         )

@@ -1,22 +1,25 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 
 
+# ==========================================================
+# Transformer Block
+# ==========================================================
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+
+        self.norm1 = nn.RMSNorm(dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
             batch_first=True
         )
 
-        self.norm2 = nn.LayerNorm(dim)
-
-        hidden = int(dim * mlp_ratio)
+        self.norm2 = nn.RMSNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden),
             nn.GELU(),
@@ -24,16 +27,16 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, L, C)
-
         h = self.norm1(x)
-        attn_out, _ = self.attn(h, h, h)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
         x = x + attn_out
-
         x = x + self.mlp(self.norm2(x))
         return x
 
 
+# ==========================================================
+# Conv Residual MBConv-style block
+# ==========================================================
 class ResnetInvertedBottleneckBlock(nn.Module):
     def __init__(self, channels, expand_ratio=4):
         super().__init__()
@@ -64,61 +67,56 @@ class ResnetInvertedBottleneckBlock(nn.Module):
         return x + self.block(x)
 
 
+# ==========================================================
+# Binary token bottleneck
+# ==========================================================
 class QuantizedTokenBottleneck(nn.Module):
-    """
-    Operates on token sequences:
-        input  : (B, L, C)
-        latent : (B, L, D)
-        output : (B, L, C)
-
-    Includes BOTH cls tokens and spatial tokens.
-    """
-
     def __init__(self, dim_in, dim_latent):
         super().__init__()
 
         self.proj_in = nn.Linear(dim_in, dim_latent)
+        self.norm1 = nn.LayerNorm(dim_latent)
+
         self.proj_out = nn.Linear(dim_latent, dim_in)
+        self.norm2 = nn.LayerNorm(dim_in)
 
     def forward(self, x):
-        # x: (B, L, C)
+        z = self.norm1(self.proj_in(x))
 
-        z = self.proj_in(x)
+        q = torch.where(z >= 0, 1.0, -1.0)
+        z_q = z + (q - z).detach()   # STE
 
-        # binary quantization with STE
-        q = (torch.sign(z) + 1.0) / 2.0
-        z_q = z + (q - z).detach()
-
-        out = self.proj_out(z_q)
-
+        out = self.norm2(self.proj_out(z_q))
         return out, z_q
 
 
+# ==========================================================
+# Main Model
+# ==========================================================
 class SimpleAutoencoder(nn.Module):
-    """
-    CNN encoder -> Transformer -> Quantized token bottleneck
-    -> Transformer -> CNN decoder
-
-    Both CLS tokens and spatial tokens pass through bottleneck.
-    """
-
     def __init__(
         self,
         in_channels=3,
-        hidden_dims=[64, 128, 256, 512, 512],
+        hidden_dims=(64, 128, 256, 512, 512),
         expand_ratio=4,
         num_transformer_blocks=4,
         latent_dim=16,
         num_cls_tokens=4,
-        num_heads=8
+        num_heads=8,
+        checkpoint_blocks=True,
+        mask_ratio=0.75,
+        mask_patch=2,
     ):
         super().__init__()
 
         self.num_cls_tokens = num_cls_tokens
+        self.checkpoint_blocks = checkpoint_blocks
+        self.mask_ratio = mask_ratio
+        self.mask_patch = mask_patch
 
-        # -------------------------
+        # --------------------------------------------------
         # Initial downsample x2
-        # -------------------------
+        # --------------------------------------------------
         self.conv_in = nn.Conv2d(
             in_channels,
             hidden_dims[0],
@@ -126,96 +124,74 @@ class SimpleAutoencoder(nn.Module):
             stride=2
         )
 
-        # -------------------------
-        # Encoder
-        # total downsample = 32x
-        # -------------------------
-        encoder_layers = []
+        # --------------------------------------------------
+        # CNN Encoder
+        # Total downsample = 32x
+        # --------------------------------------------------
+        enc = []
+        c = hidden_dims[0]
 
-        current_channels = hidden_dims[0]
-
-        for h_dim in hidden_dims[1:]:
-            encoder_layers.extend([
+        for h in hidden_dims[1:]:
+            enc.extend([
                 nn.PixelUnshuffle(2),
 
-                nn.Conv2d(
-                    current_channels * 4,
-                    h_dim,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False
-                ),
-                nn.BatchNorm2d(h_dim),
+                nn.Conv2d(c * 4, h, 3, padding=1, bias=False),
+                nn.BatchNorm2d(h),
                 nn.SiLU(),
 
-                ResnetInvertedBottleneckBlock(h_dim, expand_ratio),
-                ResnetInvertedBottleneckBlock(h_dim, expand_ratio),
+                ResnetInvertedBottleneckBlock(h, expand_ratio),
+                ResnetInvertedBottleneckBlock(h, expand_ratio),
+
             ])
+            c = h
 
-            current_channels = h_dim
+        self.encoder = nn.Sequential(*enc)
+        self.token_dim = c
 
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        # -------------------------
-        # CLS + Mask token
-        # -------------------------
+        # --------------------------------------------------
+        # Tokens
+        # --------------------------------------------------
         self.cls_tokens = nn.Parameter(
-            torch.randn(1, num_cls_tokens, current_channels)
+            torch.randn(1, num_cls_tokens, c)
         )
 
         self.mask_token = nn.Parameter(
-            torch.randn(1, 1, current_channels)
+            torch.randn(1, 1, c)
         )
 
-        # -------------------------
-        # Transformer encoder
-        # -------------------------
-        self.encoder_transformers = nn.Sequential(*[
-            TransformerBlock(
-                dim=current_channels,
-                num_heads=num_heads
-            )
+        # --------------------------------------------------
+        # Transformer stacks
+        # --------------------------------------------------
+        self.encoder_transformers = nn.ModuleList([
+            TransformerBlock(c, num_heads)
             for _ in range(num_transformer_blocks)
         ])
 
-        # -------------------------
-        # Token bottleneck
-        # -------------------------
+        self.decoder_transformers = nn.ModuleList([
+            TransformerBlock(c, num_heads)
+            for _ in range(num_transformer_blocks)
+        ])
+
+        # --------------------------------------------------
+        # Bottleneck
+        # --------------------------------------------------
         self.bottleneck = QuantizedTokenBottleneck(
-            dim_in=current_channels,
+            dim_in=c,
             dim_latent=latent_dim
         )
 
-        # -------------------------
-        # Transformer decoder
-        # -------------------------
-        self.decoder_transformers = nn.Sequential(*[
-            TransformerBlock(
-                dim=current_channels,
-                num_heads=num_heads
-            )
-            for _ in range(num_transformer_blocks)
-        ])
-
-        # -------------------------
-        # CNN decoder
-        # -------------------------
-        decoder_layers = []
-
-        rev = hidden_dims[::-1]
+        # --------------------------------------------------
+        # CNN Decoder
+        # --------------------------------------------------
+        dec = []
+        rev = list(hidden_dims[::-1])
 
         for i in range(len(rev) - 1):
             in_dim = rev[i]
             out_dim = rev[i + 1]
 
-            decoder_layers.extend([
-                nn.Conv2d(
-                    in_dim,
-                    out_dim * 4,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False
-                ),
+            dec.extend([
+                nn.Conv2d(in_dim, out_dim * 4, 3, padding=1, bias=False),
                 nn.BatchNorm2d(out_dim * 4),
                 nn.SiLU(),
 
@@ -223,11 +199,11 @@ class SimpleAutoencoder(nn.Module):
 
                 ResnetInvertedBottleneckBlock(out_dim, expand_ratio),
                 ResnetInvertedBottleneckBlock(out_dim, expand_ratio),
+
             ])
 
-        self.decoder = nn.Sequential(*decoder_layers)
+        self.decoder = nn.Sequential(*dec)
 
-        # final x2 upsample
         self.conv_out = nn.ConvTranspose2d(
             hidden_dims[0],
             in_channels,
@@ -235,93 +211,114 @@ class SimpleAutoencoder(nn.Module):
             stride=2
         )
 
-    def forward(self, x):
-        # ---------------------------------
-        # CNN encode
-        # ---------------------------------
-        x0 = self.conv_in(x)
-        z = self.encoder(x0)
+    # ======================================================
+    # checkpoint helper
+    # ======================================================
+    def run_blocks(self, x, blocks):
+        for block in blocks:
+            if self.training and self.checkpoint_blocks:
+                x = cp.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return x
 
-        # z: (B, C, H, W)
+    # ======================================================
+    # token masking
+    # always mask half batch during training
+    # ======================================================
+    def apply_masking(self, tokens, B, C, H, W):
+        if (not self.training) or B < 2:
+            return tokens
+
+        num_masked = B // 2
+
+        # random half of batch
+        idx = torch.randperm(B, device=tokens.device)
+        masked_ids = idx[:num_masked]
+
+        cls_part = tokens[:, :self.num_cls_tokens]
+        spatial = tokens[:, self.num_cls_tokens:]
+
+        fmap = spatial.transpose(1, 2).reshape(B, C, H, W)
+
+        p = self.mask_patch
+
+        coarse_h = H // p
+        coarse_w = W // p
+
+        mask = (
+            torch.rand(
+                num_masked,
+                1,
+                coarse_h,
+                coarse_w,
+                device=tokens.device
+            ) < self.mask_ratio
+        )
+
+        mask = mask.repeat_interleave(p, 2).repeat_interleave(p, 3)
+
+        target = fmap[masked_ids]
+
+        mask_tok = self.mask_token.view(1, C, 1, 1)
+        mask_tok = mask_tok.expand_as(target)
+
+        target = torch.where(mask, mask_tok, target)
+        fmap[masked_ids] = target
+
+        spatial = fmap.flatten(2).transpose(1, 2)
+        return torch.cat([cls_part, spatial], dim=1)
+
+    # ======================================================
+    # forward
+    # ======================================================
+    def forward(self, x):
+        # ---------------- CNN encode ----------------
+        x = self.conv_in(x)
+        z = self.encoder(x)
+
         B, C, H, W = z.shape
 
-        # ---------------------------------
-        # Flatten spatial -> tokens
-        # ---------------------------------
-        spatial_tokens = z.flatten(2).transpose(1, 2)   # (B, HW, C)
+        # ---------------- tokens ----------------
+        spatial = z.flatten(2).transpose(1, 2)
+        cls = self.cls_tokens.expand(B, -1, -1)
 
-        cls = self.cls_tokens.expand(B, -1, -1)         # (B, T, C)
+        tokens = torch.cat([cls, spatial], dim=1)
 
-        tokens = torch.cat([cls, spatial_tokens], dim=1)  # (B, T+HW, C)
+        # ---------------- encoder transformer ----------------
+        tokens = self.run_blocks(tokens, self.encoder_transformers)
 
-        # ---------------------------------
-        # Encoder transformer
-        # ---------------------------------
-        tokens = self.encoder_transformers(tokens)
-
-        # ---------------------------------
-        # Quantized bottleneck
-        # BOTH cls + spatial tokens
-        # ---------------------------------
+        # ---------------- bottleneck ----------------
         tokens_q, latent = self.bottleneck(tokens)
 
-        # latent: (B, T+HW, latent_dim)
+        # ---------------- masking ----------------
+        tokens_q = self.apply_masking(tokens_q, B, C, H, W)
 
-        # ---------------------------------
-        # Optional token masking
-        # only mask spatial tokens
-        # ---------------------------------
-        if self.training and torch.rand(1).item() < 0.5:
+        # ---------------- decoder transformer ----------------
+        tokens = self.run_blocks(tokens_q, self.decoder_transformers)
 
-            cls_part = tokens_q[:, :self.num_cls_tokens, :]
-            spatial_part = tokens_q[:, self.num_cls_tokens:, :]
+        # ---------------- remove cls ----------------
+        spatial = tokens[:, self.num_cls_tokens:]
+        z = spatial.transpose(1, 2).reshape(B, C, H, W)
 
-            spatial_map = spatial_part.transpose(1, 2).reshape(B, C, H, W)
+        # ---------------- decode ----------------
+        x = self.decoder(z)
+        x = self.conv_out(x)
 
-            mask = torch.rand(
-                B, 1, H // 2, W // 2,
-                device=x.device
-            ) < 0.75
-
-            mask = mask.repeat_interleave(2, dim=2)
-            mask = mask.repeat_interleave(2, dim=3)
-
-            mask_tok = self.mask_token.view(1, C, 1, 1).expand(B, C, H, W)
-
-            spatial_map = torch.where(mask, mask_tok, spatial_map)
-
-            spatial_part = spatial_map.flatten(2).transpose(1, 2)
-
-            tokens_q = torch.cat([cls_part, spatial_part], dim=1)
-
-        # ---------------------------------
-        # Decoder transformer
-        # ---------------------------------
-        tokens_dec = self.decoder_transformers(tokens_q)
-
-        # ---------------------------------
-        # Remove cls tokens
-        # ---------------------------------
-        spatial_dec = tokens_dec[:, self.num_cls_tokens:, :]  # (B, HW, C)
-
-        z_dec = spatial_dec.transpose(1, 2).reshape(B, C, H, W)
-
-        # ---------------------------------
-        # CNN decode
-        # ---------------------------------
-        x_rec = self.decoder(z_dec)
-        x_rec = self.conv_out(x_rec)
-
-        return x_rec, latent
+        return x, latent
 
 
+# ==========================================================
+# test
+# ==========================================================
 if __name__ == "__main__":
-    model = SimpleAutoencoder()
+    model = SimpleAutoencoder().cuda()
+    model.train()
 
-    x = torch.randn(1, 3, 256, 256)
+    x = torch.randn(8, 3, 256, 256).cuda()
 
-    x_rec, latent = model(x)
-    print(latent)
+    y, latent = model(x)
+
     print("input :", x.shape)
-    print("recon :", x_rec.shape)
+    print("recon :", y.shape)
     print("latent:", latent.shape)
