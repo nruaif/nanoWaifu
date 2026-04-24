@@ -11,7 +11,7 @@ training:
   save_image_every_steps: 5000
   image_size: 256  # Small for testing/raw pixel speed
   patch_size: 16   # Small patch size since image is small (64/4 = 16 patches per side)
-  num_workers: 2
+  num_workers: 4
   class_dropout_prob: 0.1
   cfg_scale: 4.0
   output_dir: "outputs"
@@ -22,10 +22,11 @@ training:
   # Ternary quantization temperature annealing
   initial_temp: 1.0         # Starting quantization temperature
   temp_anneal_factor: 0.98  # Temperature decay per epoch boundary
-  temp_anneal_min: 0.01     # Minimum temperature clamp
+  temp_anneal_min: 0.95     # Minimum temperature clamp
 
-  # MAE-style masking (set to false to disable)
-  use_masking: true
+  # MAE-style masking (set to true to enable)
+  use_masking: false
+  residual_dropout: 0.1  # Probability of dropping continuous latent channels per sample
 
 model:
   hidden_dims: [64, 128, 256, 512, 512] # f32 downsampling
@@ -33,7 +34,8 @@ model:
   num_transformer_blocks: 8
   in_channels: 3
   dim: 256
+  latent_continuous: 32  # Continuous bypass channels (gradient highway)
 
 data:
-  webdataset_url: "/data/train/000{40..80}.tar" # Example URL
+  webdataset_url: "/data/train/000{01..40}.tar" # Example URL
   csv_path: "characters.csv"

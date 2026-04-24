@@ -111,25 +111,45 @@ class AdaptiveBitwiseSign(nn.Module):
 
 
 # ==========================================================
-# Ternary token bottleneck
+# Spatial bottleneck with discrete + continuous latent split
 # ==========================================================
-class QuantizedTokenBottleneck(nn.Module):
-    def __init__(self, dim_in, dim_latent, initial_temp=1.0):
+class SpatialBottleneck(nn.Module):
+    """Spatial Conv2d bottleneck with ternary discrete + continuous bypass.
+    
+    Key design decisions vs the old QuantizedTokenBottleneck:
+    - Operates on [B, C, H, W] spatial features (not flattened tokens)
+    - No LayerNorm before quantizer (avoids normalizing values into dead zone)
+    - Continuous channels provide gradient highway that bypasses STE
+    - Residual dropout on continuous channels prevents them from dominating
+    """
+    def __init__(self, dim_in, latent_discrete=256, latent_continuous=32, initial_temp=1.0):
         super().__init__()
 
-        self.proj_in = nn.Linear(dim_in, dim_latent)
-        self.norm1 = nn.LayerNorm(dim_latent)
+        self.latent_discrete = latent_discrete
+        self.latent_continuous = latent_continuous
 
-        self.proj_out = nn.Linear(dim_latent, dim_in)
-        self.norm2 = nn.LayerNorm(dim_in)
+        # Project to latent spaces (3x3 conv for spatial context)
+        self.to_discrete = nn.Conv2d(dim_in, latent_discrete, 3, padding=1)
+        self.to_continuous = nn.Conv2d(dim_in, latent_continuous, 3, padding=1)
+
+        # Project back to working dimension (1x1 conv)
+        self.from_latent = nn.Conv2d(latent_discrete + latent_continuous, dim_in, 1)
 
         self.quant = AdaptiveBitwiseSign(initial_temp=initial_temp)
 
-    def forward(self, x):
-        z = self.norm1(self.proj_in(x))
-        z_q = self.quant(z)
-        out = self.norm2(self.proj_out(z_q))
-        return out, z_q
+    def forward(self, x, residual_dropout_prob=0.0, training=True):
+        # x: [B, C, H, W]
+        z_discrete = self.quant(self.to_discrete(x))
+        z_continuous = self.to_continuous(x)
+
+        # Residual dropout: randomly zero continuous channels per-sample
+        if training and residual_dropout_prob > 0:
+            mask = torch.rand(x.shape[0], 1, 1, 1, device=x.device) > residual_dropout_prob
+            z_continuous = z_continuous * mask.float()
+
+        z = torch.cat([z_discrete, z_continuous], dim=1)
+        out = self.from_latent(z)
+        return out, z_discrete
 
 
 # ==========================================================
@@ -142,13 +162,15 @@ class SimpleAutoencoder(nn.Module):
         hidden_dims=(64, 128, 256, 512, 512),
         expand_ratio=4,
         num_transformer_blocks=4,
-        latent_dim=16,
+        latent_dim=256,
+        latent_continuous=32,
+        residual_dropout_prob=0.1,
         num_cls_tokens=4,
         num_heads=8,
-        checkpoint_blocks=True,
+        checkpoint_blocks=False,
         mask_ratio=0.75,
         mask_patch=2,
-        use_masking=True,
+        use_masking=False,
         initial_temp=1.0,
     ):
         super().__init__()
@@ -158,6 +180,7 @@ class SimpleAutoencoder(nn.Module):
         self.mask_ratio = mask_ratio
         self.mask_patch = mask_patch
         self.use_masking = use_masking
+        self.residual_dropout_prob = residual_dropout_prob
 
         # --------------------------------------------------
         # Initial downsample x2
@@ -218,11 +241,12 @@ class SimpleAutoencoder(nn.Module):
         ])
 
         # --------------------------------------------------
-        # Bottleneck
+        # Spatial Bottleneck (Conv2d with continuous bypass)
         # --------------------------------------------------
-        self.bottleneck = QuantizedTokenBottleneck(
+        self.bottleneck = SpatialBottleneck(
             dim_in=c,
-            dim_latent=latent_dim,
+            latent_discrete=latent_dim,
+            latent_continuous=latent_continuous,
             initial_temp=initial_temp
         )
 
@@ -321,33 +345,42 @@ class SimpleAutoencoder(nn.Module):
     def forward(self, x):
         # ---------------- CNN encode ----------------
         x = self.conv_in(x)
-        z = self.encoder(x)
+        z = self.encoder(x)  # [B, C, H, W]
 
         B, C, H, W = z.shape
 
-        # ---------------- tokens ----------------
-        spatial = z.flatten(2).transpose(1, 2)
-        cls = self.cls_tokens.expand(B, -1, -1)
-
-        tokens = torch.cat([cls, spatial], dim=1)
-
         # ---------------- encoder transformer ----------------
+        spatial = z.flatten(2).transpose(1, 2)  # [B, HW, C]
+        cls = self.cls_tokens.expand(B, -1, -1)
+        tokens = torch.cat([cls, spatial], dim=1)
         tokens = self.run_blocks(tokens, self.encoder_transformers)
 
-        # ---------------- bottleneck ----------------
-        tokens_q, latent = self.bottleneck(tokens)
+        # Extract spatial features back (remove cls for spatial bottleneck)
+        enc_cls = tokens[:, :self.num_cls_tokens]
+        spatial = tokens[:, self.num_cls_tokens:]
+        z = spatial.transpose(1, 2).reshape(B, C, H, W)
 
-        # ---------------- masking ----------------
-        tokens_q = self.apply_masking(tokens_q, B, C, H, W)
+        # ---------------- spatial bottleneck [B, C, H, W] ----------------
+        z, latent = self.bottleneck(
+            z,
+            residual_dropout_prob=self.residual_dropout_prob,
+            training=self.training
+        )
 
         # ---------------- decoder transformer ----------------
-        tokens = self.run_blocks(tokens_q, self.decoder_transformers)
+        spatial = z.flatten(2).transpose(1, 2)
+        tokens = torch.cat([enc_cls, spatial], dim=1)
+
+        # Optional masking (applied after bottleneck)
+        tokens = self.apply_masking(tokens, B, C, H, W)
+
+        tokens = self.run_blocks(tokens, self.decoder_transformers)
 
         # ---------------- remove cls ----------------
         spatial = tokens[:, self.num_cls_tokens:]
         z = spatial.transpose(1, 2).reshape(B, C, H, W)
 
-        # ---------------- decode ----------------
+        # ---------------- CNN decode ----------------
         x = self.decoder(z)
         x = self.conv_out(x)
 

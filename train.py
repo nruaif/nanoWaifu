@@ -136,17 +136,19 @@ def train(config_path):
         hidden_dims=config['model'].get('hidden_dims', [64, 128, 256, 512, 512]),
         expand_ratio=config['model'].get('expand_ratio', 4),
         num_transformer_blocks=config['model'].get('num_transformer_blocks', 4),
-        latent_dim=config['model'].get('dim', 16),
-        use_masking=config['training'].get('use_masking', True),
+        latent_dim=config['model'].get('dim', 256),
+        latent_continuous=config['model'].get('latent_continuous', 32),
+        residual_dropout_prob=config['training'].get('residual_dropout', 0.1),
+        use_masking=config['training'].get('use_masking', False),
         initial_temp=config['training'].get('initial_temp', 1.0),
     ).to(device)
 
-    from adv_optm import AdamW_adv as DionAdamW
-    optimizer = DionAdamW(model.parameters(), cautious_wd=True,
-                          lr=config['training']['learning_rate'],
-                          weight_decay=0.1,
-                          betas=(0.9, 0.95)
-                          )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config['training']['learning_rate'],
+        weight_decay=0.01,
+        betas=(0.9, 0.95)
+    )
 
     # GradScaler for proper mixed-precision training
     scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
@@ -212,7 +214,7 @@ def train(config_path):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
             x_rec, latent = model(x1)
             loss = charbonnier(x_rec, x1)
 
