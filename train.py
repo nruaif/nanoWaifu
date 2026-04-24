@@ -14,7 +14,7 @@ import wandb
 import glob
 import builtins
 from torch.optim.lr_scheduler import LambdaLR
-from model import SimpleAutoencoder
+from model import BinaryAutoencoder
 from dataset import WDSLoader
 
 
@@ -130,17 +130,13 @@ def train(config_path):
     )
     dataloader = wds_loader.make_loader()
 
-    # Model with configurable masking and temperature
-    model = SimpleAutoencoder(
-        in_channels=config['model'].get('in_channels', 3),
-        hidden_dims=config['model'].get('hidden_dims', [64, 128, 256, 512, 512]),
-        expand_ratio=config['model'].get('expand_ratio', 4),
-        num_transformer_blocks=config['model'].get('num_transformer_blocks', 4),
-        latent_dim=config['model'].get('dim', 256),
+    model = BinaryAutoencoder(
+        dims=config['model'].get('dims', [96, 192, 384, 768]),
+        depths=config['model'].get('depths', [3, 3, 9, 3]),
+        latent_discrete=config['model'].get('latent_discrete', 256),
         latent_continuous=config['model'].get('latent_continuous', 32),
         residual_dropout_prob=config['training'].get('residual_dropout', 0.1),
-        use_masking=config['training'].get('use_masking', False),
-        initial_temp=config['training'].get('initial_temp', 1.0),
+        num_transformer_blocks=config['model'].get('num_transformer_blocks', 8),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -232,7 +228,7 @@ def train(config_path):
 
             # Get current temperature
             model_raw = model.module if is_ddp else model
-            current_temp = model_raw.bottleneck.quant.temp.item()
+            current_temp = model_raw.encoder.quant.temp.item()
 
             logs = {
                 "loss": loss.item(),
