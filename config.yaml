@@ -19,12 +19,11 @@ training:
   max_checkpoints: 3 # Keep only top N latest checkpoints
 
 model:
-  dim: 1536
-  depth: 24 # Number of DiT blocks
-  heads: 24
-  mlp_dim: 6144 # 4 * dim
-  num_classes: 0 # Will be loaded from CSV
+  hidden_dims: [64, 128, 256, 512, 512] # f32 downsampling
+  expand_ratio: 4
+  num_transformer_blocks: 4
   in_channels: 3
+  dim: 16
 
 data:
   webdataset_url: "/workspace/shinon/t2i/nanoWaifu/anime/train/000{01..47}.tar" # Example URL

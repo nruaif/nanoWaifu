@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pytorch_optimizer.optimizer import ScheduleFreeAdamW
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -14,7 +15,7 @@ import wandb
 import glob
 import builtins
 
-from model import DiT
+from model import SimpleAutoencoder
 from dataset import WDSLoader
 
 
@@ -38,12 +39,9 @@ def cleanup_ddp():
 
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0: return
-    # Find all checkpoints
     checkpoints = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
-    # Sort by step number (extracted from filename)
     checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
 
-    # Remove older checkpoints if we have more than max_checkpoints
     if len(checkpoints) > max_checkpoints:
         checkpoints_to_remove = checkpoints[:-max_checkpoints]
         for ckpt in checkpoints_to_remove:
@@ -54,52 +52,23 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
                 print(f"Error removing {ckpt}: {e}")
 
 
-@torch.no_grad()
-def sample_flow(model, image_size, batch_size, classes, coords, device, steps=50, cfg_scale=4.0):
-    """
-    Sample using Euler integration of the flow ODE with Classifier-Free Guidance.
-    """
-    # Handle DDP model wrapper
-    model_engine = model.module if isinstance(model, DDP) else model
-
-    # Start from noise x_0
-    x = torch.randn((batch_size, 3, image_size, image_size), device=device)
-
-    dt = 1.0 / steps
-    indices = torch.linspace(0, 1, steps, device=device)
-
-    # Pre-prepare null classes for unconditioned pass
-    null_classes = torch.full_like(classes, model_engine.num_classes, device=device)
-
-    for i in tqdm(range(steps), desc='Sampling', leave=False):
-        t = indices[i]
-
-        # Prepare inputs for batch (cond + uncond)
-        x_in = torch.cat([x, x])
-        t_batch = torch.full((batch_size * 2,), t.item(), device=device, dtype=torch.float)
-        c_in = torch.cat([classes, null_classes])
-        coords_in = torch.cat([coords, coords])
-
-        # Predict velocity field v_t
-        v_pred, _ = model(x_in, t_batch * 1000, c_in, coords_in)
-
-        v_cond, v_uncond = v_pred.chunk(2)
-        v = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        # Euler step: x_{t+dt} = x_t + v_t * dt
-        x = x + v * dt
-
-    return x
+def get_pca_latent(latent):
+    B, C, H, W = latent.shape
+    X = latent.permute(0, 2, 3, 1).reshape(-1, C)
+    X = X - X.mean(dim=0)
+    U, S, V = torch.pca_lowrank(X, q=3)
+    X_pca = torch.matmul(X, V[:, :3])
+    # Normalize to [0, 1] for visualization
+    X_pca = (X_pca - X_pca.min()) / (X_pca.max() - X_pca.min() + 1e-5)
+    return X_pca.reshape(B, H, W, 3).permute(0, 3, 1, 2)
 
 
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
 
-    # Suppress printing on non-master ranks
     if rank != 0:
         def print_pass(*args, **kwargs):
             pass
-
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -107,11 +76,9 @@ def train(config_path):
 
     print(f"Using device: {device}, Rank: {rank}, World Size: {world_size}")
 
-    # Initialize WandB only on rank 0
     if rank == 0:
-        wandb.init(project=config.get('wandb_project', 'nanoWaifu-DiT'), config=config)
+        wandb.init(project=config.get('wandb_project', 'nanoWaifu-AE'), config=config)
 
-    # Load Data
     wds_loader = WDSLoader(
         url=config['data']['webdataset_url'],
         csv_path=config['data']['csv_path'],
@@ -121,160 +88,49 @@ def train(config_path):
     )
     dataloader = wds_loader.make_loader()
 
-    # Init Model
-    num_classes = wds_loader.num_classes
-    
-    model = DiT(
-        input_size=config['training']['image_size'],
-        patch_size=config['training']['patch_size'],
-        in_channels=config['model']['in_channels'],
-        hidden_size=config['model']['dim'],
-        depth=config['model']['depth'],
-        num_heads=config['model']['heads'],
-        mlp_ratio=config['model']['mlp_dim'] / config['model']['dim'],
-        num_classes=num_classes,
-        class_dropout_prob=config['training']['class_dropout_prob'],
+    model = SimpleAutoencoder(
+        in_channels=config['model'].get('in_channels', 3),
+        hidden_dims=config['model'].get('hidden_dims', [64, 128, 256, 512, 512]),
+        expand_ratio=config['model'].get('expand_ratio', 4),
+        num_transformer_blocks=config['model'].get('num_transformer_blocks', 4),
+        dim=config['model'].get('dim', 16)
     ).to(device)
 
-    if config['training'].get('gradient_checkpointing', False):
-        model.enable_gradient_checkpointing()
-        print("Gradient checkpointing enabled.")
+    optimizer = ScheduleFreeAdamW(model.parameters(), lr=config['training']['learning_rate'], weight_decay=1e-2)
 
-    if config['training'].get('freeze_backbone', False):
-        print("Freezing backbone parameters...")
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-
-    optimizer = ScheduleFreeAdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['training']['learning_rate'], weight_decay=1e-2)
-
-    # Resume from checkpoint if specified
     start_epoch = 0
     global_step = 0
-    resume_path = config.get('resume_from', "/workspace/shinon/t2i/nanoWaifu/outputs/ckpt_step_145000.pth")
+    resume_path = config.get('resume_from', "")
 
     if resume_path and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
         try:
             checkpoint = torch.load(resume_path, map_location=device)
-
-            # Extract state dict whether it's wrapped or raw
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                state_dict = checkpoint["model_state_dict"]
-            else:
-                state_dict = checkpoint
-
-            model_state = model.state_dict()
-            new_state_dict = {}
-
-            # Remap keys
-            for k, v in state_dict.items():
-                target_key = None
-                
-                # Check for old keys and map to new architecture
-                if "attn.in_proj_weight" in k:
-                    target_key = k.replace("attn.in_proj_weight", "attn.qkv.weight")
-                elif "attn.in_proj_bias" in k:
-                    target_key = k.replace("attn.in_proj_bias", "attn.qkv.bias")
-                elif "attn.out_proj.weight" in k:
-                    target_key = k.replace("attn.out_proj.weight", "attn.proj.weight")
-                elif "attn.out_proj.bias" in k:
-                    target_key = k.replace("attn.out_proj.bias", "attn.proj.bias")
-                elif "mlp.0.weight" in k:
-                    target_key = k.replace("mlp.0.weight", "fc1.weight")
-                elif "mlp.0.bias" in k:
-                    target_key = k.replace("mlp.0.bias", "fc1.bias")
-                elif "mlp.2.weight" in k:
-                    target_key = k.replace("mlp.2.weight", "fc2.weight")
-                elif "mlp.2.bias" in k:
-                    target_key = k.replace("mlp.2.bias", "fc2.bias")
-                else:
-                    target_key = k # No change needed for other keys
-
-                # Try backbone prefix match if not found directly
-                if target_key not in model_state and f"backbone.{target_key}" in model_state:
-                     target_key = f"backbone.{target_key}"
-                
-                # Debug print for MLP keys
-                if "mlp.0.weight" in k:
-                    print(f"DEBUG: Processing {k} -> {target_key}")
-                    if target_key in model_state:
-                        print(f"  Found in model_state. Shape match: {model_state[target_key].shape == v.shape} ({model_state[target_key].shape} vs {v.shape})")
-                    else:
-                        print(f"  NOT found in model_state. Keys similar to {target_key}: {[x for x in model_state.keys() if 'fc1' in x and 'blocks.0' in x]}")
-
-                # Final check if key exists in model
-                if target_key in model_state:
-                     if model_state[target_key].shape == v.shape:
-                        new_state_dict[target_key] = v
-                     else:
-                        print(f"Skipping key {k} -> {target_key} due to shape mismatch: {v.shape} vs {model_state[target_key].shape}")
-                else:
-                    # If we still can't find it, maybe it's an exact match (e.g. non-block params)
-                    if k in model_state:
-                         if model_state[k].shape == v.shape:
-                             new_state_dict[k] = v
-                    elif f"backbone.{k}" in model_state:
-                         if model_state[f"backbone.{k}"].shape == v.shape:
-                             new_state_dict[f"backbone.{k}"] = v
-
-            missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded checkpoint. Missing keys (expected for new head): {len(missing)}")
-
-            if new_state_dict:
-                print(f"Loaded keys: {len(new_state_dict)}")
-                for key in sorted(new_state_dict.keys()):
-                    print(f"  + {key}")
-
-            if missing:
-                print("Missing keys:")
-                for key in sorted(missing):
-                    print(f"  - {key}")
-            
-            if unexpected:
-                print(f"Unexpected keys: {len(unexpected)}")
-                for key in sorted(unexpected):
-                    print(f"  - {key}")
-
-            # Attempt to load optimizer state if available and compatible
-            if isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint:
-                try:
+                model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                if "optimizer_state_dict" in checkpoint:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                    print("Loaded optimizer state.")
-                except Exception as e:
-                    print(f"Could not load optimizer state (expected since architecture changed): {e}")
-
-            # Load global step
-            if isinstance(checkpoint, dict) and "global_step" in checkpoint:
-                global_step = checkpoint["global_step"]
-                print(f"Resuming from global step: {global_step}")
-
+                global_step = checkpoint.get("global_step", 0)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
             print("Successfully loaded checkpoint.")
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
 
-    # Wrap model in DDP
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
 
-    # model.compile() # Optional, can enable if needed
     os.makedirs(config['training']['output_dir'], exist_ok=True)
 
-    cfg_scale = config['training'].get('cfg_scale', 4.0)
-
-    # Training Loop
-    # Calculate max_train_steps if not explicitly provided
     max_train_steps = config['training'].get('max_train_steps', config['training']['num_epochs'] * 1000)
 
-    # Create progress bar only on rank 0
     if rank == 0:
         pbar = tqdm(range(global_step, max_train_steps), desc="Steps", dynamic_ncols=True)
     else:
         pbar = None
 
-    # Create iterator
     data_iter = iter(dataloader)
 
-    # Training Loop
     while global_step < max_train_steps:
         model.train()
         optimizer.train()
@@ -285,105 +141,93 @@ def train(config_path):
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        x1, class_ids, coords = batch
-        x1 = x1.to(device)
-        class_ids = class_ids.to(device)
-        coords = coords.to(device)
-
-        # Flow Matching Training
-        t = torch.rand((x1.shape[0],), device=device)
-        x0 = torch.randn_like(x1)
-        t_reshaped = t.view(-1, 1, 1, 1)
-        xt = (1 - t_reshaped) * x0 + t_reshaped * x1
-        ut = x1 - x0
+        x1 = batch[0].to(device)
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            v_head, x_backbone = model(xt, t * 1000, class_ids, coords)
-            loss_head = torch.mean((v_head - ut) ** 2)
-            loss_backbone = torch.mean((x_backbone - x1) ** 2)
-            loss = loss_head + loss_backbone
+            x_rec, latent = model(x1)
+            loss = torch.mean((x_rec - x1) ** 2)
 
         optimizer.zero_grad()
         loss.backward()
-
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
         global_step += 1
 
-        # Update progress bar and logs
         if rank == 0:
             pbar.update(1)
-
-            current_lr = optimizer.param_groups[0]['lr']
             logs = {
                 "loss": loss.item(),
-                "loss_head_v": loss_head.item(),
-                "loss_backbone_x": loss_backbone.item(),
-                "lr": current_lr,
+                "lr": optimizer.param_groups[0]['lr'],
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
             }
-            
             pbar.set_postfix(**logs)
 
-            # Log to W&B (only on rank 0)
             if global_step % config['training']['log_every_steps'] == 0:
                 wandb_log = {f"train/{k}": v for k, v in logs.items()}
                 wandb.log(wandb_log, step=global_step)
 
-        # Sample and save checkpoint (only on rank 0)
         if global_step % config['training']['save_image_every_steps'] == 0:
-            # Synchronize all processes before checkpoint
             if is_ddp:
                 dist.barrier()
 
             if rank == 0:
                 print("\nSampling and Saving Checkpoint...")
-
-                # Save Checkpoint (Unwrap DDP)
                 model_to_save = model.module if is_ddp else model
                 ckpt_state = {
                     "model_state_dict": model_to_save.state_dict(),
                     "global_step": global_step,
-                    "config": config
+                    "config": config,
+                    "optimizer_state_dict": optimizer.state_dict()
                 }
                 ckpt_path = os.path.join(config['training']['output_dir'], f'ckpt_step_{global_step}.pth')
                 torch.save(ckpt_state, ckpt_path)
                 cleanup_checkpoints(config['training']['output_dir'], config.get('max_checkpoints', 3), rank)
 
-                # Sample
                 model.eval()
                 optimizer.eval()
                 with torch.no_grad():
-                    sample_classes = torch.randint(0, num_classes, (4,), device=device)
-                    sample_coords = torch.tensor([[0.0, 0.0, 1.0, 1.0]] * 4, device=device)
-                    samples = sample_flow(model, config['training']['image_size'], 4,
-                                          sample_classes, sample_coords, device, cfg_scale=cfg_scale)
-                    samples = (samples + 1) / 2.0
-                    samples = torch.clamp(samples, 0, 1)
-                    grid = make_grid(samples, nrow=2)
-                    wandb_image = wandb.Image(grid, caption=f"Sample Step {global_step} (CFG={cfg_scale})")
+                    # Visualize first 4 samples from batch
+                    x1_sample = x1[:4]
+                    x_rec, latent = model(x1_sample)
+
+                    # Denormalize assuming x1 is in [-1, 1] range to [0, 1]
+                    x1_vis = (x1_sample + 1) / 2.0
+                    x_rec_vis = (x_rec + 1) / 2.0
+                    
+                    # Difference map
+                    diff = torch.abs(x1_vis - x_rec_vis)
+                    
+                    # PCA of latent
+                    latent_pca = get_pca_latent(latent)
+                    # Interpolate PCA latent to match original image size for easier viewing
+                    latent_pca = F.interpolate(latent_pca, size=(x1_sample.shape[2], x1_sample.shape[3]), mode='nearest')
+
+                    # Concatenate to form a grid: row 1 (original), row 2 (recon), row 3 (diff), row 4 (pca)
+                    all_vis = torch.cat([x1_vis, x_rec_vis, diff, latent_pca], dim=0)
+                    all_vis = torch.clamp(all_vis, 0, 1)
+                    
+                    grid = make_grid(all_vis, nrow=4)
+                    wandb_image = wandb.Image(grid, caption=f"Orig | Recon | Diff | PCA (Step {global_step})")
                     wandb.log({"samples": wandb_image}, step=global_step)
 
                 model.train()
                 optimizer.train()
                 print("Checkpoint and sampling complete.\n")
 
-            # Synchronize again after checkpoint
             if is_ddp:
                 dist.barrier()
 
     print("Training Complete.")
     if rank == 0:
-        pbar.close()
-        final_path = os.path.join(config['training']['output_dir'], 'dit_model_final.pth')
+        if pbar is not None:
+            pbar.close()
+        final_path = os.path.join(config['training']['output_dir'], 'ae_model_final.pth')
         model_to_save = model.module if is_ddp else model
         torch.save(model_to_save.state_dict(), final_path)
         wandb.finish()
 
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
