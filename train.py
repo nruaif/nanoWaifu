@@ -153,7 +153,6 @@ def train(config_path):
     # GradScaler for proper mixed-precision training
     scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
 
-    model.compile()
     start_epoch = 0
     global_step = 0
 
@@ -215,7 +214,7 @@ def train(config_path):
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            x_rec, latent = model(x1)
+            x_rec, latent, masked_ids = model(x1)
             loss = charbonnier(x_rec, x1)
 
         scaler.scale(loss).backward()
@@ -234,21 +233,37 @@ def train(config_path):
             model_raw = model.module if is_ddp else model
             current_temp = model_raw.quant.temp.item()
 
+            # Compute separate PSNR for masked and unmasked samples
+            with torch.no_grad():
+                B = x1.shape[0]
+                if masked_ids is not None and len(masked_ids) > 0:
+                    # Build boolean masks
+                    is_masked = torch.zeros(B, dtype=torch.bool, device=x1.device)
+                    is_masked[masked_ids] = True
+
+                    psnr_clean = compute_psnr(x_rec[~is_masked], x1[~is_masked])
+                    psnr_masked = compute_psnr(x_rec[is_masked], x1[is_masked])
+                else:
+                    psnr_clean = compute_psnr(x_rec, x1)
+                    psnr_masked = 0.0
+
             logs = {
                 "loss": loss.item(),
                 "lr": optimizer.param_groups[0]['lr'],
                 "grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
                 "temp": current_temp,
             }
-            pbar.set_postfix(**{k: f"{v:.4f}" for k, v in logs.items()})
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                psnr_c=f"{psnr_clean:.1f}",
+                psnr_m=f"{psnr_masked:.1f}",
+                temp=f"{current_temp:.4f}",
+            )
 
             if global_step % config['training']['log_every_steps'] == 0:
-                # Compute PSNR
-                with torch.no_grad():
-                    psnr = compute_psnr(x_rec, x1)
-
                 wandb_log = {f"train/{k}": v for k, v in logs.items()}
-                wandb_log["train/psnr"] = psnr
+                wandb_log["train/psnr_clean"] = psnr_clean
+                wandb_log["train/psnr_masked"] = psnr_masked
                 wandb.log(wandb_log, step=global_step)
 
         if global_step % config['training']['save_image_every_steps'] == 0:
@@ -273,20 +288,44 @@ def train(config_path):
                 with torch.no_grad():
                     n_viz = min(8, x1.shape[0])
                     x1_sample = x1[:n_viz]
-                    x_rec_sample, _ = model(x1_sample)
 
-                    # Compute PSNR for visualization batch
-                    viz_psnr = compute_psnr(x_rec_sample, x1_sample)
+                    # Clean reconstruction (eval mode = no masking)
+                    x_rec_clean, _, _ = model(x1_sample)
+                    psnr_clean_viz = compute_psnr(x_rec_clean, x1_sample)
 
-                    # Top row: originals, Bottom row: reconstructions
-                    comparison = torch.cat([x1_sample, x_rec_sample], dim=0)
-                    grid = make_grid(comparison, nrow=n_viz, normalize=True, value_range=(-1, 1))
-
-                    wandb_image = wandb.Image(
-                        grid,
-                        caption=f"Step {global_step} | PSNR: {viz_psnr:.2f} dB | Top: Original, Bottom: Recon"
+                    # Top: originals, Bottom: clean recons
+                    clean_grid = make_grid(
+                        torch.cat([x1_sample, x_rec_clean], dim=0),
+                        nrow=n_viz, normalize=True, value_range=(-1, 1)
                     )
-                    wandb.log({"eval/reconstructions": wandb_image}, step=global_step)
+                    wandb.log({
+                        "eval/clean_recon": wandb.Image(
+                            clean_grid,
+                            caption=f"Step {global_step} | Clean PSNR: {psnr_clean_viz:.2f} dB | Top: Orig, Bottom: Recon"
+                        )
+                    }, step=global_step)
+
+                    # Masked reconstruction (force training mode briefly for masking)
+                    model.train()
+                    x_rec_masked, _, masked_viz_ids = model(x1_sample)
+                    model.eval()
+
+                    if masked_viz_ids is not None and len(masked_viz_ids) > 0:
+                        # Show only the masked samples
+                        masked_orig = x1_sample[masked_viz_ids]
+                        masked_recon = x_rec_masked[masked_viz_ids]
+                        psnr_masked_viz = compute_psnr(masked_recon, masked_orig)
+
+                        masked_grid = make_grid(
+                            torch.cat([masked_orig, masked_recon], dim=0),
+                            nrow=masked_orig.shape[0], normalize=True, value_range=(-1, 1)
+                        )
+                        wandb.log({
+                            "eval/masked_recon": wandb.Image(
+                                masked_grid,
+                                caption=f"Step {global_step} | Masked PSNR: {psnr_masked_viz:.2f} dB | Top: Orig, Bottom: Recon"
+                            )
+                        }, step=global_step)
 
                 model.train()
                 print("Checkpoint and sampling complete.\n")

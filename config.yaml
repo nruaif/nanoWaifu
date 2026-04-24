@@ -31,7 +31,7 @@ model:
   depths: [3, 3, 9, 3]
   latent_discrete: 256
   latent_continuous: 32
-  num_transformer_blocks: 8
+  num_transformer_blocks: 12
   num_cls_tokens: 4
 
 data:

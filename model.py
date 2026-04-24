@@ -267,9 +267,10 @@ class BinaryAutoencoder(nn.Module):
     # MAE-style masking (applied to half the batch)
     # ======================================================
     def apply_masking(self, tokens, B, C, H, W):
-        """Block-wise masking on spatial tokens. CLS tokens are never masked."""
+        """Block-wise masking on spatial tokens. CLS tokens are never masked.
+        Returns (tokens, masked_ids) where masked_ids is the batch indices that were masked."""
         if (not self.training) or B < 2 or (not self.use_masking):
-            return tokens
+            return tokens, None
 
         num_masked = B // 2
 
@@ -302,7 +303,7 @@ class BinaryAutoencoder(nn.Module):
         fmap[masked_ids] = target
 
         spatial = fmap.flatten(2).transpose(1, 2)
-        return torch.cat([cls_part, spatial], dim=1)
+        return torch.cat([cls_part, spatial], dim=1), masked_ids
 
     # ======================================================
     # forward
@@ -342,7 +343,7 @@ class BinaryAutoencoder(nn.Module):
         tokens = torch.cat([enc_cls, spatial], dim=1)
 
         # Apply MAE masking on decoder input (after bottleneck)
-        tokens = self.apply_masking(tokens, B, C, H, W)
+        tokens, masked_ids = self.apply_masking(tokens, B, C, H, W)
 
         for block in self.decoder_transformers:
             tokens = block(tokens)
@@ -355,7 +356,7 @@ class BinaryAutoencoder(nn.Module):
         img = self.decoder_cnn(features)
         img = torch.clamp(img, -1, 1)
 
-        return img, z_discrete
+        return img, z_discrete, masked_ids
 
     def anneal_temperature(self, factor=0.98, min_temp=0.01):
         self.quant.anneal_temp(factor=factor, min_temp=min_temp)
@@ -370,11 +371,12 @@ if __name__ == "__main__":
 
     x = torch.randn(4, 3, 256, 256).cuda()
 
-    y, latent = model(x)
+    y, latent, masked_ids = model(x)
 
     print("input :", x.shape)
     print("recon :", y.shape)
     print("latent:", latent.shape)
+    print(f"masked_ids: {masked_ids}")
     print(f"latent nonzero ratio: {(latent != 0).float().mean().item():.3f}")
     print(f"latent unique values: {latent.unique().tolist()}")
 
