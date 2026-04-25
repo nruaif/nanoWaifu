@@ -22,13 +22,31 @@ class GatherLayer(torch.autograd.Function):
         grad_out[:] = grads[dist.get_rank()]
         return grad_out
 
-def uniformity_loss(features):
+def uniformity_loss(x, sketch_dim=64):
+    """
+    Forces Covariance(x) ~ Identity.
+    Matches the 2nd Moment (Spherical Cloud).
+    """
     if dist.is_initialized():
-        features = torch.cat(GatherLayer.apply(features), dim=0)
-    features = torch.nn.functional.normalize(features, dim=-1)
-    sim = features @ features.T 
-    loss = sim.pow(2).mean()
-    return loss
+        x = torch.cat(GatherLayer.apply(x), dim=0)
+
+    N, C = x.size()
+    # 1. Sketching (Optional for C=512, but good for consistency)
+    if C > sketch_dim:
+        S = torch.randn(sketch_dim, C, device=x.device) / (C ** 0.5)
+        x = x @ S.T  # [N, sketch_dim]
+    else:
+        sketch_dim = C
+
+    # 2. Centering & Covariance
+    x = x - x.mean(dim=0, keepdim=True)
+    cov = (x.T @ x) / (N - 1 + 1e-6)
+
+    # 3. Target Identity
+    target = torch.eye(sketch_dim, device=x.device)
+
+    # 4. Off-diagonal suppression + Diagonal maintenance
+    return torch.norm(cov - target, p='fro')
 
 
 class MeanPoolingEmbedder(nn.Module):
@@ -307,7 +325,7 @@ class TokenformerDiT(nn.Module):
         denom = (k * t + (1 - k) * (1 - t)).clamp(min=0.05)
         return -((1 - 2 * k) * z + u_pred) / denom
 
-    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0, force_path_drop=False, return_uniformity=False):
+    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0, force_path_drop=False, return_uniformity=False, force_drop=False):
         B, C, H, W = x_in.shape
         N = H * W
         x = x_in.flatten(2).transpose(1, 2)
@@ -328,7 +346,16 @@ class TokenformerDiT(nn.Module):
         f_t = x
         
         # 2. Token dropping
-        if self.drop_ratio > 0.0 and self.training:
+        do_drop = False
+        if self.drop_ratio > 0.0:
+            if force_drop:
+                do_drop = True
+            elif self.training:
+                # 0.2 chance to NOT drop (use full seq)
+                if torch.rand(1).item() > 0.2:
+                    do_drop = True
+
+        if do_drop:
             num_keep = int(N * (1 - self.drop_ratio))
             noise = torch.rand(B, N, device=x.device)
             ids_shuffle = torch.argsort(noise, dim=1)
@@ -472,11 +499,11 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
         u_cond = model(x, t_vec, y_indices, y_offsets)
         v_cond = model.get_velocity(x, u_cond, t_vec)
 
-        # Unconditional u-prediction via PDG (drop middle path) -> velocity
+        # Unconditional u-prediction via token dropping (drop seq) -> velocity
         u_uncond = model(
             x, t_vec,
             y_null_indices, y_null_offsets,
-            force_path_drop=True
+            force_drop=True
         )
         v_uncond = model.get_velocity(x, u_uncond, t_vec)
 

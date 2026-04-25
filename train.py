@@ -409,7 +409,7 @@ def train(config_path):
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
-            uniformity_weight = config['model'].get('uniformity_weight', 0.0)
+            uniformity_weight = config['model'].get('uniformity_weight', 0.1)
             path_drop_prob = config['model'].get('path_drop_prob', 0.0)
 
             # Model outputs raw u-prediction
