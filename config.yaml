@@ -1,6 +1,6 @@
 training:
-  batch_size: 32
-  learning_rate: 1.0e-4
+  batch_size: 64
+  learning_rate: 2.0e-4
   warmup_steps: 1000
   num_epochs: 100
   max_train_steps: 1000000
@@ -11,7 +11,7 @@ training:
   num_workers: 4
   output_dir: "outputs"
   wandb_project: "nanoWaifu-ae"
-  resume_from: ""
+  resume_from: "outputs/ckpt_step_80000.pth"
   max_checkpoints: 3
 
   # Ternary quantization temperature annealing

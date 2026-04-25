@@ -363,22 +363,120 @@ class BinaryAutoencoder(nn.Module):
 
 
 # ==========================================================
+# PatchGAN Discriminator
+# ==========================================================
+
+class PatchDiscriminator(nn.Module):
+    """Multi-scale PatchGAN discriminator with spectral normalization.
+
+    Tricks used:
+    - Spectral normalization on all conv layers for Lipschitz constraint
+    - No BatchNorm (spectral norm replaces it for stability)
+    - LeakyReLU(0.2) following DCGAN/pix2pix convention
+    - Multi-scale: runs at original + downsampled resolution
+    - Outputs spatial grid of logits (not single scalar)
+    """
+    def __init__(self, in_channels=3, ndf=64, n_layers=3, num_scales=2):
+        super().__init__()
+        self.num_scales = num_scales
+        self.discriminators = nn.ModuleList()
+
+        for _ in range(num_scales):
+            self.discriminators.append(self._make_disc(in_channels, ndf, n_layers))
+
+        # Learnable downsampler for multi-scale
+        self.downsample = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+    def _make_disc(self, in_channels, ndf, n_layers):
+        layers = []
+
+        # First layer (no normalization on input layer per DCGAN convention)
+        layers.append(nn.utils.spectral_norm(
+            nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1)
+        ))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        # Intermediate layers with increasing channels
+        nf = ndf
+        for i in range(1, n_layers):
+            nf_prev = nf
+            nf = min(nf * 2, 512)
+            stride = 2 if i < n_layers - 1 else 1
+
+            layers.append(nn.utils.spectral_norm(
+                nn.Conv2d(nf_prev, nf, kernel_size=4, stride=stride, padding=1)
+            ))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        # Final 1-channel prediction layer
+        layers.append(nn.utils.spectral_norm(
+            nn.Conv2d(nf, 1, kernel_size=4, stride=1, padding=1)
+        ))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        """Returns list of patch logit maps, one per scale."""
+        outputs = []
+        for i, disc in enumerate(self.discriminators):
+            outputs.append(disc(x))
+            if i < self.num_scales - 1:
+                x = self.downsample(x)
+        return outputs
+
+
+def disc_hinge_loss(real_preds, fake_preds):
+    """Hinge loss for discriminator. Pushes real > 1, fake < -1."""
+    loss = 0
+    for rp, fp in zip(real_preds, fake_preds):
+        loss += F.relu(1.0 - rp).mean() + F.relu(1.0 + fp).mean()
+    return loss / len(real_preds)
+
+
+def gen_hinge_loss(fake_preds):
+    """Hinge loss for generator. Pushes fake predictions higher."""
+    loss = 0
+    for fp in fake_preds:
+        loss += -fp.mean()
+    return loss / len(fake_preds)
+
+
+def r1_gradient_penalty(real_images, real_preds):
+    """R1 gradient penalty for regularization (Mescheder et al. 2018).
+    Penalizes the gradient of D on real images to prevent mode collapse."""
+    total_pred = sum(rp.sum() for rp in real_preds)
+
+    grads = torch.autograd.grad(
+        outputs=total_pred,
+        inputs=real_images,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    penalty = grads.pow(2).reshape(grads.shape[0], -1).sum(1).mean()
+    return penalty
+
+
+# ==========================================================
 # test
 # ==========================================================
 if __name__ == "__main__":
     model = BinaryAutoencoder().cuda()
+    disc = PatchDiscriminator().cuda()
     model.train()
 
     x = torch.randn(4, 3, 256, 256).cuda()
-
     y, latent, masked_ids = model(x)
 
     print("input :", x.shape)
     print("recon :", y.shape)
     print("latent:", latent.shape)
     print(f"masked_ids: {masked_ids}")
-    print(f"latent nonzero ratio: {(latent != 0).float().mean().item():.3f}")
-    print(f"latent unique values: {latent.unique().tolist()}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total params: {total_params / 1e6:.1f}M")
+    preds = disc(y)
+    print(f"disc scales: {len(preds)}, shapes: {[p.shape for p in preds]}")
+
+    total_ae = sum(p.numel() for p in model.parameters())
+    total_disc = sum(p.numel() for p in disc.parameters())
+    print(f"AE params: {total_ae / 1e6:.1f}M, Disc params: {total_disc / 1e6:.1f}M")
