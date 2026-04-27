@@ -17,8 +17,8 @@ training:
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
-  noise_inject_ratio: 0.1
-  cross_ratio: 0.1
+  noise_inject_ratio: 0
+  cross_ratio: 0
 
 model:
   type: "dit"      # Use TokenformerDiT
@@ -30,7 +30,7 @@ model:
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
   drop_ratio: 0.75 # Token drop ratio (0.0 to 1.0)
-  path_drop_prob: 0.1 # Probability of dropping the middle layers (0.0 to 1.0)
+  path_drop_prob: 0 # Probability of dropping the middle layers (0.0 to 1.0)
   uniformity_weight: 0.1 # Weight for the uniformity loss
 
 data:
