@@ -14,7 +14,7 @@ training:
   resume_from: "outputs/ckpt_step_80000.pth"
   max_checkpoints: 3
 
-  # Ternary quantization temperature annealing
+  # Binary quantization temperature annealing
   temp_anneal_factor: 0.98
   temp_anneal_min: 0.95
 
@@ -27,10 +27,10 @@ training:
   mask_patch: 2          # Block size for masking
 
 model:
-  dims: [96, 192, 384, 768]
-  depths: [3, 3, 9, 3]
-  latent_discrete: 256
-  latent_continuous: 32
+  dims: [96, 192, 384]
+  depths: [3, 3, 9]
+  latent_discrete: 12
+  latent_continuous: 48
   num_transformer_blocks: 12
   num_cls_tokens: 4
 

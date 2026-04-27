@@ -4,39 +4,33 @@ import torch.nn.functional as F
 
 
 # ==========================================================
-# Ternary quantization with temperature annealing
+# Binary quantization with temperature annealing
 # ==========================================================
 
-class TernarySTE(torch.autograd.Function):
-    """Ternary Straight-Through Estimator with sigmoid surrogate gradient.
-    Produces {-1, 0, +1} values with smooth backward pass."""
+class BinarySTE(torch.autograd.Function):
+    """Binary Straight-Through Estimator with tanh surrogate gradient.
+    Produces {-1, +1} values with smooth backward pass."""
     @staticmethod
     def forward(ctx, x, temp):
         ctx.save_for_backward(x, temp)
-        return torch.sign(x) * (x.abs() > 1).to(x.dtype)
+        return torch.sign(x)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, temp = ctx.saved_tensors
-
-        def sigmoid_derivative(z):
-            s = torch.sigmoid(z)
-            return s * (1.0 - s)
-
-        surrogate_grad = (sigmoid_derivative((x - 1.0) / temp) +
-                          sigmoid_derivative((x + 1.0) / temp)) / temp
-
+        tanh_val = torch.tanh(x / temp)
+        surrogate_grad = (1.0 - tanh_val.pow(2)) / temp
         return grad_output * surrogate_grad, None
 
 
 class AdaptiveBitwiseSign(nn.Module):
-    """Ternary quantizer with annealing temperature for gradual sharpening."""
+    """Binary quantizer with annealing temperature for gradual sharpening."""
     def __init__(self, initial_temp=1.0):
         super().__init__()
         self.register_buffer('temp', torch.tensor(initial_temp, dtype=torch.float32))
 
     def forward(self, x):
-        return TernarySTE.apply(x, self.temp)
+        return BinarySTE.apply(x, self.temp)
 
     def anneal_temp(self, factor=0.98, min_temp=0.01):
         """Call each epoch to gradually sharpen quantization."""
@@ -330,10 +324,13 @@ class BinaryAutoencoder(nn.Module):
         z_discrete = self.quant(self.to_latent_discrete(features))
         z_continuous = self.to_latent_continuous(features)
 
-        # Residual dropout on continuous channels
+        # Residual dropout on continuous and discrete channels
         if self.training and self.residual_dropout_prob > 0:
-            mask = torch.rand(B, 1, 1, 1, device=z_continuous.device) > self.residual_dropout_prob
-            z_continuous = z_continuous * mask.float()
+            mask_cont = torch.rand(B, 1, 1, 1, device=z_continuous.device) > self.residual_dropout_prob
+            z_continuous = z_continuous * mask_cont.float()
+            
+            mask_disc = torch.rand(B, 1, 1, 1, device=z_discrete.device) > self.residual_dropout_prob
+            z_discrete = z_discrete * mask_disc.float()
 
         z = torch.cat([z_discrete, z_continuous], dim=1)
         features = self.from_latent(z)  # [B, C, H, W]
