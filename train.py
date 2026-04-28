@@ -379,16 +379,32 @@ def train(config_path):
 
             B, C, H, W = inputs.shape
 
+            def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
+                eps = torch.randn(bs, device=device, dtype=dtype)
+                return torch.sigmoid(m_loc + s_scale * eps)
+
+            def sample_ltg(m_loc, s_scale, std_param, bs, N, device, dtype):
+                t_max = sample_logit_normal(m_loc, s_scale, bs, device, dtype)
+                std = torch.clamp(t_max / 2, max=std_param)
+                t_max = t_max.unsqueeze(1)
+                std = std.unsqueeze(1)
+                eps = torch.randn(bs, N, device=device, dtype=dtype)
+                t = t_max - torch.abs(eps) * std
+                mask = t < 0
+                if mask.any():
+                    t[mask] = torch.rand_like(t[mask]) * t_max.expand_as(t)[mask]
+                return t
+
+            # Logit-Normal Truncated Gaussian Timestep Sampler
+            t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H*W, device=device, dtype=torch.bfloat16)
+
             # Dimension-Dependent Shift timestep sampling
             m = C * H * W
             n = 32768.0
             alpha = (m / n) ** 0.5
-
-            # FIX: sample t in bfloat16 immediately — no late cast
-            t_base = torch.rand((B,), device=device, dtype=torch.bfloat16)
             t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
 
-            t_reshaped = t.view(-1, 1, 1, 1)
+            t_reshaped = t.view(B, 1, H, W)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
@@ -412,15 +428,28 @@ def train(config_path):
             uniformity_weight = config['model'].get('uniformity_weight', 0.1)
             path_drop_prob = config['model'].get('path_drop_prob', 0.0)
 
-            # Model outputs raw u-prediction
-            u_pred, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
+            # Model outputs raw u-prediction, logvar, and uniformity loss
+            u_pred, logvar_theta, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
 
             # Compute velocity-space loss for uniform weighting (k-diff)
             k = torch.sigmoid(model_raw.w_k)
             u_target = k * inputs - (1 - k) * noise
             v_pred = model_raw.get_velocity(xt, u_pred, t_reshaped)
             v_target = model_raw.get_velocity(xt, u_target, t_reshaped)
-            loss = F.mse_loss(v_pred, v_target)
+            
+            # Difficulty-aware NLL loss
+            mse_loss_raw = F.mse_loss(v_pred, v_target, reduction='none') # (B, C, H, W)
+            mse_loss_mean = mse_loss_raw.mean()
+            
+            sg_v_pred = v_pred.detach()
+            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True) # (B, 1, H, W)
+            
+            nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
+            nll_loss_mean = nll_loss.mean()
+            
+            lambda_nll = config['model'].get('lambda_nll', 0.01)
+            loss = mse_loss_mean + lambda_nll * nll_loss_mean
+            
             if u_loss is not None:
                 loss = loss + (uniformity_weight * u_loss)
 
@@ -498,6 +527,11 @@ def train(config_path):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config.yaml")
+    args = parser.parse_args()
+    train(args.config)
+    cleanup_ddp()_name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()

@@ -31,42 +31,28 @@ def uniformity_loss(x, sketch_dim=64):
         x = torch.cat(GatherLayer.apply(x), dim=0)
 
     N, C = x.size()
-    # 1. Sketching (Optional for C=512, but good for consistency)
     if C > sketch_dim:
         S = torch.randn(sketch_dim, C, device=x.device) / (C ** 0.5)
-        x = x @ S.T  # [N, sketch_dim]
+        x = x @ S.T
     else:
         sketch_dim = C
 
-    # 2. Centering & Covariance
     x = x - x.mean(dim=0, keepdim=True)
     cov = (x.T @ x) / (N - 1 + 1e-6)
 
-    # 3. Target Identity
     target = torch.eye(sketch_dim, device=x.device)
 
-    # 4. Off-diagonal suppression + Diagonal maintenance
     return torch.norm(cov - target, p='fro')
 
 
 class MeanPoolingEmbedder(nn.Module):
     def __init__(self, num_classes: int, dim: int):
         super().__init__()
-        # Projects to dim * 4 so we can reshape into 4 distinct tokens
         self.embed = nn.EmbeddingBag(num_classes + 1, dim * 4, mode='mean')
-        self.mlp = nn.Sequential(
-            nn.Linear(dim * 4, dim * 16),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(dim * 16, dim * 4),
-        )
+
     def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
-        """
-        y_indices: (N,) concatenated indices
-        y_offsets: (B,) start offsets into y_indices
-        """
-        x = self.embed(y_indices, y_offsets)  # (B, dim * 4)
-        x = x + self.mlp(x)
-        return x.view(x.shape[0], 4, -1)  # (B, 4, dim)
+        x = self.embed(y_indices, y_offsets)
+        return x.view(x.shape[0], 4, -1)
 
 
 class GGRoPE2d(nn.Module):
@@ -105,7 +91,6 @@ class GGRoPE2d(nn.Module):
     def forward(self, x: torch.Tensor, H: int, W: int, seq_indices: torch.Tensor = None) -> torch.Tensor:
         B, h, N, d = x.shape
 
-        # Compute RoPE frequencies (no cache to avoid graph breaks with torch.compile)
         xlim, ylim = math.sqrt(W / H), math.sqrt(H / W)
         x_grid = torch.linspace(-xlim, xlim, W, device=x.device, dtype=x.dtype)
         y_grid = torch.linspace(-ylim, ylim, H, device=x.device, dtype=x.dtype)
@@ -119,8 +104,6 @@ class GGRoPE2d(nn.Module):
         sin = torch.sin(theta).permute(1, 0, 2).unsqueeze(0)
 
         if seq_indices is not None:
-            # seq_indices is (B, N)
-            # Gather along the spatial dimension (dim=2)
             cos = torch.gather(cos.expand(B, -1, -1, -1), 2, seq_indices.unsqueeze(1).unsqueeze(-1).expand(-1, h, -1, cos.shape[-1]))
             sin = torch.gather(sin.expand(B, -1, -1, -1), 2, seq_indices.unsqueeze(1).unsqueeze(-1).expand(-1, h, -1, sin.shape[-1]))
 
@@ -154,7 +137,7 @@ class Mlp(nn.Module):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
-        
+
         self.fc1 = nn.Linear(in_features, hidden_features * 2)
         self.act = nn.GELU(approximate="tanh")
         self.fc2 = nn.Linear(hidden_features, out_features)
@@ -183,7 +166,7 @@ class SelfAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        
+
         if num_context_tokens > 0:
             c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
             c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
@@ -210,32 +193,26 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, H, W, rope, context=None, seq_indices=None):
         B, N, C = x.shape
-        
+
         num_context_tokens = 0
         if context is not None:
-            # Concatenate context tokens before spatial tokens
-            x_seq = torch.cat([context, x], dim=1)  # (B, M + N, C)
+            x_seq = torch.cat([context, x], dim=1)
             num_context_tokens = context.shape[1]
         else:
             x_seq = x
-            
-        # Self attention
+
         x_norm1 = self.norm1(x_seq)
         attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens, seq_indices)
-        
-        # Residual connection
+
         x_seq = x_seq + attn_out
-        
-        # MLP (On both context and spatial tokens)
         x_seq = x_seq + self.mlp(self.norm3(x_seq))
-        
-        # Split context/spatial back
+
         if context is not None:
             context = x_seq[:, :num_context_tokens, :]
             x = x_seq[:, num_context_tokens:, :]
         else:
             x = x_seq
-        
+
         return x, context
 
 
@@ -254,9 +231,14 @@ class TimestepEmbedder(nn.Module):
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-        emb = t.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
-        return self.mlp(emb)
+        if t.dim() == 1:
+            emb = t.float()[:, None] * emb[None, :]
+            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
+            return self.mlp(emb)
+        elif t.dim() == 2:
+            emb = t.float().unsqueeze(-1) * emb.view(1, 1, -1)
+            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1).to(self.mlp[0].weight.dtype)
+            return self.mlp(emb)
 
 
 class TokenformerDiT(nn.Module):
@@ -271,9 +253,10 @@ class TokenformerDiT(nn.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
         self.drop_ratio = drop_ratio
+        self.in_channels = in_channels
 
         self.patch_embed = nn.Linear(in_channels, dim)
-        
+
         self.t_embedder = TimestepEmbedder(dim)
         self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
 
@@ -284,7 +267,6 @@ class TokenformerDiT(nn.Module):
             max_freq=100.0
         )
 
-        # SPRINT division: 2 encoder blocks, depth-4 middle blocks, 2 decoder blocks
         self.num_encoder_blocks = 2
         self.num_decoder_blocks = 2
         self.num_middle_blocks = depth - self.num_encoder_blocks - self.num_decoder_blocks
@@ -292,36 +274,31 @@ class TokenformerDiT(nn.Module):
         self.encoder_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(self.num_encoder_blocks)
         ])
-        
+
         self.middle_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(self.num_middle_blocks)
         ])
-        
+
         self.decoder_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(self.num_decoder_blocks)
         ])
 
-        # SPRINT fusion
         self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.fusion = nn.Linear(dim * 2, dim)
 
         self.final_norm = RMSNorm(dim)
-        self.final_proj = nn.Linear(dim, in_channels)
-        
-        # k-Diff learnable target parameter
+        self.final_proj = nn.Linear(dim, in_channels + 1)
+
         self.w_k = nn.Parameter(torch.tensor(0.0))
 
     def get_velocity(self, z, u_pred, t):
-        """Convert u-prediction to velocity for the ODE.
-        Adapted for convention z = (1-t)*x + t*eps (t=0 clean, t=1 noise).
-
-        z: noisy input (B, C, H, W)
-        u_pred: model output (B, C, H, W)
-        t: timestep (B,) or (B, 1, 1, 1)
-        """
         k = torch.sigmoid(self.w_k)
         if t.dim() == 1:
             t = t.view(-1, 1, 1, 1)
+        elif t.dim() == 2:
+            B, N = t.shape
+            _, _, H, W = z.shape
+            t = t.view(B, 1, H, W)
         denom = (k * t + (1 - k) * (1 - t)).clamp(min=0.05)
         return -((1 - 2 * k) * z + u_pred) / denom
 
@@ -330,28 +307,28 @@ class TokenformerDiT(nn.Module):
         N = H * W
         x = x_in.flatten(2).transpose(1, 2)
         x = self.patch_embed(x)
-        
-        # Prefix tokens for context (t + 4*y = 5 tokens)
-        t_token = self.t_embedder(t).unsqueeze(1)
+
+        if t.dim() == 1:
+            t = t.unsqueeze(1).expand(-1, N)
+        t_embeds = self.t_embedder(t)
+        x = x + t_embeds
+
         y_tokens = self.y_embedder(y_indices, y_offsets)
-        context = torch.cat([t_token, y_tokens], dim=1)
-        
-        # 1. Encoder blocks (f_theta)
+        context = y_tokens
+
         for block in self.encoder_blocks:
             if self.use_checkpoint and self.training:
                 x, context = checkpoint(block, x, H, W, self.rope, context, None, use_reentrant=False)
             else:
                 x, context = block(x, H, W, self.rope, context, None)
-                
+
         f_t = x
-        
-        # 2. Token dropping
+
         do_drop = False
         if self.drop_ratio > 0.0:
             if force_drop:
                 do_drop = True
             elif self.training:
-                # 0.2 chance to NOT drop (use full seq)
                 if torch.rand(1).item() > 0.2:
                     do_drop = True
 
@@ -369,23 +346,19 @@ class TokenformerDiT(nn.Module):
             g_pad_t = self.mask_token.expand(B, N, -1)
             u_loss = torch.tensor(0.0, device=x.device) if return_uniformity else None
         else:
-            # 3. Middle blocks (g_theta)
             for block in self.middle_blocks:
                 if self.use_checkpoint and self.training:
                     x_middle, context = checkpoint(block, x_middle, H, W, self.rope, context, seq_indices, use_reentrant=False)
                 else:
                     x_middle, context = block(x_middle, H, W, self.rope, context, seq_indices)
-                    
-            # Compute uniformity loss on middle layer before reconstructing the full sequence
+
             u_loss = None
             if return_uniformity and self.training:
-                # We pool the sparse tokens to get a single vector per image for the loss
                 x_mid_pooled = x_middle.mean(dim=1)
                 u_loss = uniformity_loss(x_mid_pooled)
             elif return_uniformity:
                 u_loss = torch.tensor(0.0, device=x.device)
 
-            # 4. Path-drop learning / Fusion (tensor ops to avoid graph breaks)
             g_full = self.mask_token.expand(B, N, -1).clone()
             if seq_indices is not None:
                 g_full.scatter_(1, seq_indices.unsqueeze(-1).expand(-1, -1, self.dim), x_middle)
@@ -397,34 +370,33 @@ class TokenformerDiT(nn.Module):
                 g_pad_t = torch.where(drop_mask, self.mask_token.expand(B, N, -1), g_full)
             else:
                 g_pad_t = g_full
-                    
-        # Sparse-dense residual fusion
+
         h_t = self.fusion(torch.cat([f_t, g_pad_t], dim=-1))
-        
-        # 5. Decoder blocks (h_theta)
+
         for block in self.decoder_blocks:
             if self.use_checkpoint and self.training:
                 h_t, context = checkpoint(block, h_t, H, W, self.rope, context, None, use_reentrant=False)
             else:
                 h_t, context = block(h_t, H, W, self.rope, context, None)
-                
+
         feat = h_t
-        
+
         x_norm = self.final_norm(h_t)
         x_out = self.final_proj(x_norm)
-        x_out = x_out.transpose(1, 2).reshape(B, C, H, W)
+        x_out = x_out.transpose(1, 2).reshape(B, self.in_channels + 1, H, W)
+        
+        u_pred = x_out[:, :self.in_channels, :, :]
+        logvar_theta = x_out[:, self.in_channels:, :, :]
 
-        # Return raw u-prediction (velocity conversion happens outside)
+        res = [u_pred, logvar_theta]
+        if return_features:
+            res.append(feat)
         if return_uniformity:
-            if not return_features:
-                return x_out, u_loss
-            else:
-                return x_out, feat, u_loss
-        else:
-            if not return_features:
-                return x_out
-            else:
-                return x_out, feat
+            res.append(u_loss)
+
+        if len(res) == 2:
+            return res[0], res[1]
+        return tuple(res)
 
 
 import random
@@ -437,12 +409,11 @@ class TagProcessor:
         self.num_classes = len(self.tags)
 
     def process_prompts(self, prompts, device, dropout_prob=0.0):
-        # prompts is a list of strings
         indices = []
         offsets = [0]
         for p in prompts:
             if random.random() < dropout_prob:
-                indices.append(self.num_classes) # Null tag
+                indices.append(self.num_classes)
             else:
                 tags = p.split()
                 count = 0
@@ -451,7 +422,7 @@ class TagProcessor:
                         indices.append(self.tag_to_idx[t])
                         count += 1
                 if count == 0:
-                    indices.append(self.num_classes) # Null tag if no match
+                    indices.append(self.num_classes)
             offsets.append(len(indices))
 
         indices = torch.tensor(indices, dtype=torch.long, device=device)
@@ -460,19 +431,15 @@ class TagProcessor:
 
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                    steps=50, guidance_scale=1.5, noise=None, cfg_scale=0):
-    """
-    PF-ODE sampling with Path-Drop Guidance (PDG).
-    Uses u-prediction -> velocity conversion for the ODE step.
-    """
-    in_channels = model.final_proj.out_features
+                    steps=50, guidance_scale=1.5, noise=None, cfg_scale=0,
+                    sampler_type="look-ahead", p_percentile=0.4, alpha=2.0):
+    in_channels = model.in_channels if hasattr(model, 'in_channels') else (model.module.in_channels if hasattr(model, 'module') else 32)
     model.eval()
     if isinstance(latent_size, (tuple, list)):
         H, W = latent_size
     else:
         H = W = latent_size
 
-    # Init noise
     if noise is not None:
         if isinstance(noise, list):
             x = torch.stack([n.to(device) for n in noise[:batch_size]])
@@ -480,38 +447,64 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
             x = noise.clone().to(device)
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
-    # Conditional tags
+    
     y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
-
-    # "Null" tags (unconditional)
     null_prompts = [""] * batch_size
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-
+    x = x.to(torch.bfloat16)
     for i in tqdm(range(steps)):
         t_curr = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_curr
-        t_vec = torch.full((batch_size,), t_curr.item(), device=device)
+        
+        t_vec = torch.full((batch_size, H * W), t_curr.item(), device=device, dtype=x.dtype)
 
-        # Conditional u-prediction (full path) -> velocity
-        u_cond = model(x, t_vec, y_indices, y_offsets)
-        v_cond = model.get_velocity(x, u_cond, t_vec)
+        if sampler_type == "euler":
+            u_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
+            v_cond = model.get_velocity(x, u_cond, t_vec)
 
-        # Unconditional u-prediction via token dropping (drop seq) -> velocity
-        u_uncond = model(
-            x, t_vec,
-            y_null_indices, y_null_offsets,
-            force_drop=True
-        )
-        v_uncond = model.get_velocity(x, u_uncond, t_vec)
+            u_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets, force_drop=True)
+            v_uncond = model.get_velocity(x, u_uncond, t_vec)
 
-        # PDG combination (same form as CFG)
-        v = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-        # ODE step
-        x = x + dt * v
+            v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            x = x + dt * v
+            
+        elif sampler_type == "look-ahead":
+            u_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
+            v_cond = model.get_velocity(x, u_cond, t_vec)
+            
+            u_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets, force_drop=True)
+            v_uncond = model.get_velocity(x, u_uncond, t_vec)
+            
+            v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            
+            uc = logvar_cond
+            uc_flat = uc.view(batch_size, -1)
+            tau_p = torch.quantile(uc_flat.float(), p_percentile, dim=1, keepdim=True).to(x.dtype)
+            tau_p = tau_p.view(batch_size, 1, 1, 1)
+            
+            M_conf = (uc <= tau_p).to(x.dtype)
+            M_unc = 1.0 - M_conf
+            
+            t_ctx_val = max(t_curr.item() + alpha * dt.item(), 0.0)
+            
+            x_ctx = x + (t_ctx_val - t_curr.item()) * v
+            x_tilde = M_conf * x_ctx + M_unc * x
+            
+            t_tilde_vec = M_conf.view(batch_size, -1) * t_ctx_val + M_unc.view(batch_size, -1) * t_curr.item()
+            
+            u_ctx_cond, _ = model(x_tilde, t_tilde_vec, y_indices, y_offsets)
+            v_ctx_cond = model.get_velocity(x_tilde, u_ctx_cond, t_tilde_vec)
+            
+            u_ctx_uncond, _ = model(x_tilde, t_tilde_vec, y_null_indices, y_null_offsets, force_drop=True)
+            v_ctx_uncond = model.get_velocity(x_tilde, u_ctx_uncond, t_tilde_vec)
+            
+            v_ctx = v_ctx_uncond + guidance_scale * (v_ctx_cond - v_ctx_uncond)
+            
+            v_final = M_unc * v_ctx + M_conf * v
+            x = x + dt * v_final
 
     model.train()
     return x
@@ -523,7 +516,7 @@ if __name__ == "__main__":
     model = TokenformerDiT(
         in_channels=32,
         dim=768,
-        depth=12,
+        depth=16,
         num_heads=12,
         num_classes=12476,
         drop_ratio=0.75
@@ -533,7 +526,7 @@ if __name__ == "__main__":
     print(f"Model Parameters: {num_params / 1e6:.2f} M")
 
     batch_size = 2
-    latent_size = 16  # Represents H and W
+    latent_size = 16
 
     x_in = torch.randn(batch_size, 32, latent_size, latent_size, device=device)
     t = torch.rand(batch_size, device=device)
@@ -543,21 +536,10 @@ if __name__ == "__main__":
 
     print("\nRunning forward pass (training)...")
     model.train()
-    output = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1)
+    u_pred, logvar, u_loss = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1, return_uniformity=True)
 
     print(f"Input shape:  {x_in.shape}")
-    print(f"Output shape: {output.shape}")
+    print(f"Output u_pred shape: {u_pred.shape}")
+    print(f"Output logvar shape: {logvar.shape}")
 
-    print("\nRunning forward pass (inference / eval)...")
-    model.eval()
-    with torch.no_grad():
-        output_eval = model(x_in, t, y_indices, y_offsets)
-        print(f"Eval Output shape: {output_eval.shape}")
-        
-    print("\nRunning forward pass (inference / PDG force_path_drop)...")
-    with torch.no_grad():
-        output_pdg = model(x_in, t, y_indices, y_offsets, force_path_drop=True)
-        print(f"PDG Output shape: {output_pdg.shape}")
-
-    assert x_in.shape == output.shape, "Error: Output shape does not match input shape!"
     print("✅ Forward pass completed successfully!")

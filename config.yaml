@@ -19,6 +19,9 @@ training:
   max_checkpoints: 3
   noise_inject_ratio: 0.1
   cross_ratio: 0.1
+  sampler_type: "look-ahead"
+  p_percentile: 0.4
+  alpha: 2.0
 
 model:
   type: "dit"      # Use TokenformerDiT
@@ -32,7 +35,9 @@ model:
   drop_ratio: 0.75 # Token drop ratio (0.0 to 1.0)
   path_drop_prob: 0.1 # Probability of dropping the middle layers (0.0 to 1.0)
   uniformity_weight: 0.1 # Weight for the uniformity loss
+  lambda_nll: 0.01 # Weight for the difficulty-aware NLL loss
 
 data:
   webdataset_url: '/root/data/train/00{049..080}.tar'
   use_advanced_captions: true
+
