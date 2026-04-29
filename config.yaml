@@ -25,9 +25,9 @@ model:
   type: "dit"
   use_vae: false
   use_tiny_vae: false
-  fcdm_dim: 768
-  fcdm_depth: 12
-  num_heads: 12
+  fcdm_dim: 1024
+  fcdm_depth: 16
+  num_heads: 16
   in_channels: 3
   encoder_depth: 2
   decoder_depth: 2
@@ -36,5 +36,5 @@ model:
   patch_size: 16
 
 data:
-  webdataset_url: '/root/data/train/00{049..080}.tar'
+  webdataset_url: '/workspace/data/train/00{001..020}.tar'
   use_advanced_captions: true

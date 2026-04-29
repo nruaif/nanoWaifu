@@ -267,8 +267,8 @@ class WDSLoader:
             h = int(math.sqrt(target_area / ar))
             w = int(h * ar)
             # Round to nearest multiple of 16 for FCDM/MAR/Patching compatibility
-            h = (h // 16) * 16
-            w = (w // 16) * 16
+            h = (h // 32) * 32
+            w = (w // 32) * 32
             if h > 0 and w > 0:
                 self.buckets.append((h, w))
 
