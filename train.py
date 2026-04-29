@@ -192,10 +192,10 @@ def train(config_path):
         depth=config['model'].get('fcdm_depth', 12),
         num_heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
-        latent_size=latent_size,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
-        drop_ratio=config['model'].get('drop_ratio', 0.0),
-        path_drop_prob=config['model'].get('path_drop_prob', 0.0)
+        encoder_depth=config['model'].get('encoder_depth', 2),
+        decoder_depth=config['model'].get('decoder_depth', 2),
+        unet_base_dim=config['model'].get('unet_base_dim', 64),
     ).to(device=device, dtype=torch.bfloat16)
 
     # Resume Logic
@@ -244,8 +244,6 @@ def train(config_path):
         print(">>> Compiling Model...")
         model = torch.compile(model, mode="max-autotune")
 
-    # Reference to the unwrapped model for accessing k-diff parameters
-    model_raw = model.module if hasattr(model, 'module') else model
 
     from adv_optm import Muon_adv as  NorMuon
     from adv_optm import AdamW_adv as DionAdamW
@@ -379,44 +377,26 @@ def train(config_path):
 
             B, C, H, W = inputs.shape
 
-            def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
-                eps = torch.randn(bs, device=device, dtype=dtype)
-                return torch.sigmoid(m_loc + s_scale * eps)
+            # Logit-normal timestep sampling (scalar per sample)
+            eps_t = torch.randn(B, device=device, dtype=torch.bfloat16)
+            t = torch.sigmoid(eps_t)  # (B,)
 
-            def sample_ltg(m_loc, s_scale, std_param, bs, N, device, dtype):
-                t_max = sample_logit_normal(m_loc, s_scale, bs, device, dtype)
-                std = torch.clamp(t_max / 2, max=std_param)
-                t_max = t_max.unsqueeze(1)
-                std = std.unsqueeze(1)
-                eps = torch.randn(bs, N, device=device, dtype=dtype)
-                t = t_max - torch.abs(eps) * std
-                mask = t < 0
-                if mask.any():
-                    t[mask] = torch.rand_like(t[mask]) * t_max.expand_as(t)[mask]
-                return t
-
-            # Logit-Normal Truncated Gaussian Timestep Sampler
-            t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H*W, device=device, dtype=torch.bfloat16)
-
-            # Dimension-Dependent Shift timestep sampling
+            # Dimension-Dependent Shift
             m = C * H * W
             n = 32768.0
             alpha = (m / n) ** 0.5
-            t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
+            t = (alpha * t) / (1.0 + (alpha - 1.0) * t)
 
-            t_reshaped = t.view(B, 1, H, W)
+            t_reshaped = t.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
-            # --- Training Augmentations (each applied independently w/ 50% chance) ---
-            # 1. Gaussian noise injection to xt to simulate drift during inference
+            # --- Training Augmentations ---
             noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
             if noise_inject_ratio > 0:
                 noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
                 xt = xt + noise_mask * noise_inject_ratio * torch.randn_like(xt)
 
-            # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
-            #    from a different clean sample to simulate mean-seeking drift
             cross_ratio = config['training'].get('cross_ratio', 0.1)
             if cross_ratio > 0:
                 cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
@@ -425,33 +405,26 @@ def train(config_path):
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
-            uniformity_weight = config['model'].get('uniformity_weight', 0.1)
-            path_drop_prob = config['model'].get('path_drop_prob', 0.0)
+            # Model predicts x0 + logvar
+            x0_pred, logvar_theta = model(xt, t, y_indices, y_offsets)
 
-            # Model outputs raw u-prediction, logvar, and uniformity loss
-            u_pred, logvar_theta, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
+            # Convert to v-prediction space, clip t >= 0.05 to avoid explosion
+            t_safe = t_reshaped.clamp(min=0.05)
+            v_pred = (xt - x0_pred) / t_safe
+            v_target = (xt - inputs) / t_safe
 
-            # Compute velocity-space loss for uniform weighting (k-diff)
-            k = torch.sigmoid(model_raw.w_k)
-            u_target = k * inputs - (1 - k) * noise
-            v_pred = model_raw.get_velocity(xt, u_pred, t_reshaped)
-            v_target = model_raw.get_velocity(xt, u_target, t_reshaped)
-            
-            # Difficulty-aware NLL loss
-            mse_loss_raw = F.mse_loss(v_pred, v_target, reduction='none') # (B, C, H, W)
-            mse_loss_mean = mse_loss_raw.mean()
-            
+            # MSE loss in v-pred space
+            mse_loss = F.mse_loss(v_pred, v_target, reduction='none')  # (B, C, H, W)
+            mse_loss_mean = mse_loss.mean()
+
+            # Difficulty-aware NLL loss via logvar
             sg_v_pred = v_pred.detach()
-            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True) # (B, 1, H, W)
-            
+            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True)  # (B, 1, H, W)
             nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
             nll_loss_mean = nll_loss.mean()
-            
+
             lambda_nll = config['model'].get('lambda_nll', 0.01)
             loss = mse_loss_mean + lambda_nll * nll_loss_mean
-            
-            if u_loss is not None:
-                loss = loss + (uniformity_weight * u_loss)
 
             loss = loss / accum_steps
             loss.backward()
@@ -468,13 +441,10 @@ def train(config_path):
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
-                k_val = torch.sigmoid(model_raw.w_k).item()
                 wandb.log({
                     "train/loss": avg_loss,
-                    "train/k_value": k_val,
-                    "train/uniformity_weighted": u_loss.item()
                 }, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "k": f"{k_val:.3f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
                 running_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
