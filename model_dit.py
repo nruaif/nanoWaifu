@@ -11,7 +11,7 @@ import random
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6, elementwise_affine=True):
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
         super().__init__()
         self.eps = eps
         self.dim = dim
@@ -46,13 +46,15 @@ class TimestepEmbedder(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, t):
-        """t: (B,) scalar timesteps."""
+        """t: N-D spatial map or scalar timesteps (e.g. (B,) or (B, N))."""
         t = t * 1000.0
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-        emb = t.float()[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
+
+        # Changed to unsqueeze(-1) to smoothly support both 1D and N-D spatial timesteps
+        emb = t.float().unsqueeze(-1) * emb
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1).to(self.mlp[0].weight.dtype)
         return self.mlp(emb)
 
 
@@ -60,19 +62,17 @@ class TimestepEmbedder(nn.Module):
 
 
 class DWConvMlp(nn.Module):
-    """Gated MLP with depthwise conv2d for local spatial mixing.
-    Only spatial tokens pass through this; class tokens are excluded."""
+    """Gated MLP with depthwise conv2d for local spatial mixing."""
 
     def __init__(self, dim, hidden_dim=None):
         super().__init__()
         hidden_dim = hidden_dim or dim * 4
-        self.fc1 = nn.Linear(dim, hidden_dim * 2)
+        self.fc1 = nn.Linear(dim, hidden_dim * 2, bias=False)
         self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, groups=hidden_dim)
         self.act = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x, H, W):
-        # x: (B, H*W, C) — spatial tokens only
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
         B, N, D = x.shape
@@ -84,16 +84,16 @@ class DWConvMlp(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    """Multi-head self-attention with QK-norm, no positional encoding."""
+    """Multi-head self-attention with QK-norm."""
 
     def __init__(self, dim, num_heads):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=False)
+        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=False)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -107,9 +107,6 @@ class SelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Transformer block where class tokens attend but skip MLP.
-    Only spatial tokens pass through the DWConv MLP."""
-
     def __init__(self, dim, num_heads):
         super().__init__()
         self.norm1 = RMSNorm(dim)
@@ -118,11 +115,6 @@ class TransformerBlock(nn.Module):
         self.mlp = DWConvMlp(dim, dim * 4)
 
     def forward(self, x, H, W, context=None):
-        """
-        x: (B, H*W, dim) spatial tokens
-        context: (B, K, dim) class tokens or None
-        Returns: (x, context)
-        """
         n_ctx = 0
         if context is not None:
             x_seq = torch.cat([context, x], dim=1)
@@ -130,35 +122,52 @@ class TransformerBlock(nn.Module):
         else:
             x_seq = x
 
-        # Self-attention over all tokens (class + spatial)
         x_seq = x_seq + self.self_attn(self.norm1(x_seq))
 
-        # Split: class tokens skip MLP
         if n_ctx > 0:
             context = x_seq[:, :n_ctx]
             x = x_seq[:, n_ctx:]
         else:
             x = x_seq
 
-        # MLP with DWConv (spatial tokens only)
         x = x + self.mlp(self.norm2(x), H, W)
-
         return x, context
+
+
+class REPAProjector(nn.Module):
+    """Projects mid-block features (32x downsample) to DINOv3 ViT-L space (16x, dim=1024)."""
+
+    def __init__(self, in_dim=768, out_dim=1024):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim * 4, bias=False)
+        self.dw_conv = nn.Conv2d(out_dim, out_dim, 3, 1, 1, groups=out_dim)
+        self.norm = RMSNorm(out_dim)
+        self.out_dim = out_dim
+
+    def forward(self, x, Hm, Wm):
+        """
+        x: (B, Hm*Wm, in_dim) — mid-block tokens at 32x resolution
+        Returns: (B, Hp*Wp, out_dim) — projected tokens at 16x resolution
+        """
+        x = self.proj(x)  # (B, Hm*Wm, out_dim*4)
+        B = x.shape[0]
+        x = x.transpose(1, 2).view(B, self.out_dim * 4, Hm, Wm)
+        x = F.pixel_shuffle(x, 2)  # (B, out_dim, Hp, Wp)
+        x = self.dw_conv(x)
+        x = x.flatten(2).transpose(1, 2)  # (B, Hp*Wp, out_dim)
+        x = self.norm(x)
+        return x
 
 
 # ─── Small UNet (Pixel Predictor) ───────────────────────────────────────────
 
 
 class UNetBlock(nn.Module):
-    """Residual block: 1×1 projection → 3×3 depthwise conv, ×2, with GroupNorm."""
-
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        # Block 1: proj + DW
         self.proj1 = nn.Conv2d(in_ch, out_ch, 1)
         self.dw1 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, groups=out_ch)
         self.gn1 = nn.GroupNorm(8, out_ch)
-        # Block 2: proj + DW
         self.proj2 = nn.Conv2d(out_ch, out_ch, 1)
         self.dw2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, groups=out_ch)
         self.gn2 = nn.GroupNorm(8, out_ch)
@@ -172,80 +181,63 @@ class UNetBlock(nn.Module):
 
 
 class SmallUNet(nn.Module):
-    """Convolutional UNet (f16) conditioned by transformer features.
-    Global feature vector is concatenated channel-wise at the bottleneck.
-    Uses subpixel (pixel_unshuffle/shuffle) for down/upsampling."""
+    """
+    Convolutional UNet predicting clean image x0.
+    Transformer features are concatenated at the H/16 bottleneck directly.
+    """
 
     def __init__(self, in_channels, cond_dim, base_dim=64):
         super().__init__()
-        out_channels = in_channels + 1  # x0 + logvar
-        dims = [base_dim, base_dim * 2, base_dim * 4, base_dim * 8]  # 64,128,256,512
+        out_channels = in_channels  # x0 only; logvar is predicted by transformer
+        dims = [base_dim, base_dim * 2, base_dim * 4, base_dim * 8]
 
-        # Inject spatial cond at input resolution
-        self.cond_to_input = nn.Conv2d(cond_dim, in_channels, 1)
+        # Encoder (4 stages → f16)
+        self.enc0 = nn.Conv2d(in_channels, dims[0], 3, 1, 1)  # H
+        self.down0 = nn.Conv2d(dims[0] * 4, dims[0], 1)  # H/2
+        self.enc1 = UNetBlock(dims[0], dims[1])
+        self.down1 = nn.Conv2d(dims[1] * 4, dims[1], 1)  # H/4
+        self.enc2 = UNetBlock(dims[1], dims[2])
+        self.down2 = nn.Conv2d(dims[2] * 4, dims[2], 1)  # H/8
+        self.enc3 = UNetBlock(dims[2], dims[3])
+        self.down3 = nn.Conv2d(dims[3] * 4, dims[3], 1)  # H/16
 
-        # Project global cond for bottleneck injection
-        self.cond_to_bottleneck = nn.Sequential(
-            nn.Linear(cond_dim, dims[3]),
-            nn.SiLU(),
-            nn.Linear(dims[3], dims[3])
-        )
+        # Bottleneck @ H/16: Combines UNet enc features with Transformer features
+        self.mid = UNetBlock(dims[3] + cond_dim, dims[3])
 
-        # Encoder  (4 stages → f16)
-        self.enc0 = nn.Conv2d(in_channels, dims[0], 3, 1, 1)        # H — simple conv
-        self.down0 = nn.Conv2d(dims[0] * 4, dims[0], 1)             # pixel_unshuffle → proj
-        self.enc1 = UNetBlock(dims[0], dims[1])                      # H/2
-        self.down1 = nn.Conv2d(dims[1] * 4, dims[1], 1)
-        self.enc2 = UNetBlock(dims[1], dims[2])                      # H/4
-        self.down2 = nn.Conv2d(dims[2] * 4, dims[2], 1)
-        self.enc3 = UNetBlock(dims[2], dims[3])                      # H/8
-        self.down3 = nn.Conv2d(dims[3] * 4, dims[3], 1)
-
-        # Bottleneck @ H/16 (enc output + global cond concat)
-        self.mid = UNetBlock(dims[3] * 2, dims[3])
-
-        # Decoder  (4 stages → back to H)
-        self.up3 = nn.Conv2d(dims[3], dims[3] * 4, 1)               # proj → pixel_shuffle
-        self.dec3 = UNetBlock(dims[3] * 2, dims[3])                  # skip from enc3
+        # Decoder (4 stages → back to H)
+        self.up3 = nn.Conv2d(dims[3], dims[3] * 4, 1)
+        self.dec3 = UNetBlock(dims[3] * 2, dims[3])
         self.up2 = nn.Conv2d(dims[3], dims[2] * 4, 1)
-        self.dec2 = UNetBlock(dims[2] * 2, dims[2])                  # skip from enc2
+        self.dec2 = UNetBlock(dims[2] * 2, dims[2])
         self.up1 = nn.Conv2d(dims[2], dims[1] * 4, 1)
-        self.dec1 = UNetBlock(dims[1] * 2, dims[1])                  # skip from enc1
+        self.dec1 = UNetBlock(dims[1] * 2, dims[1])
         self.up0 = nn.Conv2d(dims[1], dims[0] * 4, 1)
-        self.dec0 = nn.Conv2d(dims[0] * 2, dims[0], 3, 1, 1)        # H — simple conv
+        self.dec0 = nn.Conv2d(dims[0] * 2, dims[0], 3, 1, 1)
 
         self.out_conv = nn.Conv2d(dims[0], out_channels, 1)
 
-    def forward(self, x, cond_spatial):
-        """
-        x: (B, in_channels, H, W) noisy input
-        cond_spatial: (B, cond_dim, H, W) transformer features
-        Returns: (B, in_channels + 1, H, W)
-        """
-        # Global conditioning vector
-        cond_global = cond_spatial.mean(dim=(2, 3))                  # (B, cond_dim)
-        cond_bottleneck = self.cond_to_bottleneck(cond_global)       # (B, 512)
+    def forward(self, x, cond_bottleneck):
+        # Encoder
+        h0 = self.enc0(x)
+        h1 = self.enc1(self.down0(F.pixel_unshuffle(h0, 2)))
+        h2 = self.enc2(self.down1(F.pixel_unshuffle(h1, 2)))
+        h3 = self.enc3(self.down2(F.pixel_unshuffle(h2, 2)))
 
-        # Add spatial cond at input
-        x = x + self.cond_to_input(cond_spatial)
+        # Bottleneck @ H/16
+        hb = self.down3(F.pixel_unshuffle(h3, 2))
 
-        # Encoder (subpixel downsampling)
-        h0 = self.enc0(x)                                            # H
-        h1 = self.enc1(self.down0(F.pixel_unshuffle(h0, 2)))         # H/2
-        h2 = self.enc2(self.down1(F.pixel_unshuffle(h1, 2)))         # H/4
-        h3 = self.enc3(self.down2(F.pixel_unshuffle(h2, 2)))         # H/8
+        # Safety catch: Ensure transformer condition matches UNet bottleneck resolution
+        if hb.shape[2:] != cond_bottleneck.shape[2:]:
+            cond_bottleneck = F.interpolate(cond_bottleneck, size=hb.shape[2:], mode='nearest')
 
-        # Bottleneck: concat global cond channel-wise @ H/16
-        hb = self.down3(F.pixel_unshuffle(h3, 2))                   # H/16
-        B, _, Hb, Wb = hb.shape
-        cond_expand = cond_bottleneck[:, :, None, None].expand(B, -1, Hb, Wb)
-        h = self.mid(torch.cat([hb, cond_expand], dim=1))
+        # Efficient Concat
+        h = self.mid(torch.cat([hb, cond_bottleneck], dim=1))
 
-        # Decoder (subpixel upsampling)
-        h = self.dec3(torch.cat([F.pixel_shuffle(self.up3(h), 2), h3], dim=1))   # H/8
-        h = self.dec2(torch.cat([F.pixel_shuffle(self.up2(h), 2), h2], dim=1))   # H/4
-        h = self.dec1(torch.cat([F.pixel_shuffle(self.up1(h), 2), h1], dim=1))   # H/2
-        h = self.dec0(torch.cat([F.pixel_shuffle(self.up0(h), 2), h0], dim=1))   # H
+        # Decoder
+        h = self.dec3(torch.cat([F.pixel_shuffle(self.up3(h), 2), h3], dim=1))
+        h = self.dec2(torch.cat([F.pixel_shuffle(self.up2(h), 2), h2], dim=1))
+        h = self.dec1(torch.cat([F.pixel_shuffle(self.up1(h), 2), h1], dim=1))
+        h = self.dec0(torch.cat([F.pixel_shuffle(self.up0(h), 2), h0], dim=1))
 
         return self.out_conv(h)
 
@@ -254,19 +246,7 @@ class SmallUNet(nn.Module):
 
 
 class TokenformerDiT(nn.Module):
-    """
-    3-stage Transformer (Encoder → Mid → Decoder) with PixelShuffle 2x
-    between stages, feeding a small UNet that predicts clean x0.
-
-    - patch_size controls spatial patchification (pixel_unshuffle) before
-      the transformer; the UNet still operates at full resolution
-    - No positional encoding
-    - Class tokens attend in self-attention but skip MLP
-    - DWConv2D in MLP for spatial locality
-    - Timestep conditioning via additive embedding
-    """
-
-    def __init__(self, in_channels=128, dim=768, depth=12, num_heads=12,
+    def __init__(self, in_channels=3, dim=768, depth=12, num_heads=12,
                  num_classes=12476, use_checkpoint=False,
                  encoder_depth=2, decoder_depth=2,
                  unet_base_dim=64, patch_size=16, **kwargs):
@@ -276,43 +256,42 @@ class TokenformerDiT(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.patch_size = patch_size
 
-        # Input projection (channels ×p² after pixel_unshuffle)
         self.patch_embed = nn.Linear(in_channels * patch_size ** 2, dim)
-
-        # Conditioning
         self.t_embedder = TimestepEmbedder(dim)
         self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
 
-        # Stage 1: Encoder (at Hp×Wp, dim)
+        # Stage 1: Encoder
         self.encoder_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(encoder_depth)
         ])
 
-        # PixelShuffle Down: (B, Hp*Wp, dim) → (B, Hp/2*Wp/2, dim)
-        self.down_proj = nn.Linear(dim * 4, dim)
-
-        # Stage 2: Mid (at Hp/2×Wp/2, dim)
+        # Stage 2: Mid
+        self.down_proj = nn.Linear(dim * 4, dim, bias=False)
         mid_depth = depth - encoder_depth - decoder_depth
         self.mid_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(mid_depth)
         ])
 
-        # PixelShuffle Up: (B, Hp/2*Wp/2, dim) → (B, Hp*Wp, dim)
-        self.up_proj = nn.Linear(dim, dim * 4)
-
-        # Skip fusion: concat(skip, upsampled) → Linear → dim
-        self.skip_fusion = nn.Linear(dim * 2, dim)
-
-        # Stage 3: Decoder (at Hp×Wp, dim)
+        # Stage 3: Decoder
+        self.up_proj = nn.Linear(dim, dim * 4, bias=False)
+        self.skip_fusion = nn.Linear(dim * 2, dim, bias=False)
         self.decoder_blocks = nn.ModuleList([
             TransformerBlock(dim, num_heads) for _ in range(decoder_depth)
         ])
 
-        # Final norm → project back to spatial cond channels, then pixel_shuffle
         self.final_norm = RMSNorm(dim)
-        self.cond_proj = nn.Linear(dim, dim * patch_size ** 2)
 
-        # Small UNet pixel predictor (full resolution)
+        # Logvar head: 1 scalar per transformer token (= per 16x16 patch block)
+        self.logvar_head = nn.Linear(dim, 1, bias=True)
+
+        # CLS denoising projections (DINOv3 ViT-L dim = 1024)
+        self.cls_in_proj = nn.Linear(1024, dim, bias=False)
+        self.cls_out_proj = nn.Linear(dim, 1024, bias=False)
+
+        # REPA projection head (mid-block features → DINO patch token space)
+        self.repa_projector = REPAProjector(dim, 1024)
+
+        # UNet predicts x0 only (no logvar)
         self.unet = SmallUNet(in_channels, dim, unet_base_dim)
 
     def _run_block(self, block, x, H, W, context):
@@ -320,82 +299,88 @@ class TokenformerDiT(nn.Module):
             return checkpoint(block, x, H, W, context, use_reentrant=False)
         return block(x, H, W, context)
 
-    def forward(self, x_in, t, y_indices, y_offsets=None):
-        """
-        Args:
-            x_in: (B, C, H, W) noisy input (full resolution)
-            t: (B,) scalar timesteps
-            y_indices, y_offsets: class tag indices/offsets
-        Returns:
-            x0_pred: (B, C, H, W) predicted clean image
-            logvar: (B, 1, H, W) log-variance for NLL
-        """
+    def forward(self, x_in, t, y_indices, y_offsets=None, cls_embed=None):
         B, C, H, W = x_in.shape
         p = self.patch_size
 
-        # 1. Patchify via pixel_unshuffle → (B, C*p², H/p, W/p)
         if p > 1:
             x_patch = F.pixel_unshuffle(x_in, p)
         else:
             x_patch = x_in
         Hp, Wp = H // p, W // p
 
-        # 2. Flatten + embed + add timestep
-        x = x_patch.flatten(2).transpose(1, 2)         # (B, Hp*Wp, C*p²)
-        x = self.patch_embed(x)                         # (B, Hp*Wp, dim)
-        t_emb = self.t_embedder(t)                      # (B, dim)
-        x = x + t_emb.unsqueeze(1)
+        x = x_patch.flatten(2).transpose(1, 2)
+        x = self.patch_embed(x)
 
-        # 3. Class tokens (attend only, skip MLP)
-        context = self.y_embedder(y_indices, y_offsets)  # (B, 4, dim)
+        # --- Handle Spatial Maps vs Global Timesteps cleanly ---
+        if t.ndim == 4:
+            # Expect block-level spatial timestep map at patch resolution (B, 1, Hp, Wp)
+            # Flatten to match the patched sequence shape (B, N)
+            t = t.flatten(2).transpose(1, 2).squeeze(-1)
+            t_emb = self.t_embedder(t)  # Shape: (B, N, dim)
+            x = x + t_emb  # Directly add spatial embeddings
+        else:
+            # Standard Global Scalar Timesteps (B,)
+            t = t.reshape(B)
+            t_emb = self.t_embedder(t)  # Shape: (B, dim)
+            x = x + t_emb.unsqueeze(1)  # Broadcast to (B, N, dim)
+        # -------------------------------------------------------
 
-        # 4. Encoder blocks at Hp×Wp
+        context = self.y_embedder(y_indices, y_offsets)
+
+        # Prepend CLS token to context for denoising
+        if cls_embed is not None:
+            cls_tok = self.cls_in_proj(cls_embed).unsqueeze(1)  # (B, 1, dim)
+            context = torch.cat([cls_tok, context], dim=1)      # (B, 5, dim)
+
         for block in self.encoder_blocks:
             x, context = self._run_block(block, x, Hp, Wp, context)
         skip = x
 
-        # 5. PixelShuffle Down: Hp×Wp → Hp/2×Wp/2
         x = x.transpose(1, 2).view(B, self.dim, Hp, Wp)
         x = F.pixel_unshuffle(x, 2)
         Hm, Wm = Hp // 2, Wp // 2
         x = x.flatten(2).transpose(1, 2)
         x = self.down_proj(x)
 
-        # 6. Mid blocks at Hp/2×Wp/2
-        for block in self.mid_blocks:
+        mid_point = len(self.mid_blocks) // 2
+        repa_hidden = None
+        for i, block in enumerate(self.mid_blocks):
             x, context = self._run_block(block, x, Hm, Wm, context)
+            if self.training and i == mid_point:
+                repa_hidden = x
 
-        # 7. PixelShuffle Up: Hp/2×Wp/2 → Hp×Wp
         x = self.up_proj(x)
         x = x.transpose(1, 2).view(B, self.dim * 4, Hm, Wm)
         x = F.pixel_shuffle(x, 2)
         x = x.flatten(2).transpose(1, 2)
 
-        # 8. Skip fusion
         x = self.skip_fusion(torch.cat([x, skip], dim=-1))
 
-        # 9. Decoder blocks at Hp×Wp
         for block in self.decoder_blocks:
             x, context = self._run_block(block, x, Hp, Wp, context)
 
-        # 10. Produce spatial conditioning features at full resolution
+        # Reshape to 2D at the patched resolution to feed UNet Bottleneck
         x = self.final_norm(x)
-        x = self.cond_proj(x)                           # (B, Hp*Wp, dim*p²)
-        x = x.transpose(1, 2).view(B, self.dim * p ** 2, Hp, Wp)
-        if p > 1:
-            cond_features = F.pixel_shuffle(x, p)       # (B, dim, H, W)
-        else:
-            cond_features = x
 
-        # 11. Small UNet predicts x0 + logvar (full resolution)
-        out = self.unet(x_in, cond_features)
-        x0_pred = out[:, :self.in_channels]
-        logvar = out[:, self.in_channels:]
+        # Logvar: 1 value per 16x16 block, predicted directly from transformer tokens
+        logvar_tokens = self.logvar_head(x)  # (B, N, 1)
+        logvar = logvar_tokens.transpose(1, 2).view(B, 1, Hp, Wp)  # (B, 1, Hp, Wp)
 
-        return x0_pred, logvar
+        cond_features = x.transpose(1, 2).view(B, self.dim, Hp, Wp)
 
+        # UNet predicts x0 only
+        x0_pred = self.unet(x_in, cond_features)
 
-# ─── Tag Processor ──────────────────────────────────────────────────────────
+        # REPA + CLS outputs
+        cls_pred = None
+        repa_feat = None
+        if cls_embed is not None:
+            cls_pred = self.cls_out_proj(context[:, 0])  # (B, 1024)
+        if self.training and repa_hidden is not None:
+            repa_feat = self.repa_projector(repa_hidden, Hm, Wm)
+
+        return x0_pred, logvar, repa_feat, cls_pred
 
 
 class TagProcessor:
@@ -427,14 +412,10 @@ class TagProcessor:
         return indices, offsets
 
 
-# ─── Sampling ────────────────────────────────────────────────────────────────
-
-
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                steps=50, guidance_scale=1.5, noise=None, cfg_scale=0,
-                sampler_type="euler", **kwargs):
-    """Flow matching sampling with direct x0 prediction."""
+                steps=50, guidance_scale=1.5, noise=None, cfg_scale=0, **kwargs):
+    """Standard global-timestep Flow Matching sampling."""
     in_channels = model.in_channels if hasattr(model, 'in_channels') else (
         model.module.in_channels if hasattr(model, 'module') else 128)
     model.eval()
@@ -458,76 +439,130 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
     x = x.to(torch.bfloat16)
+    cls_state = torch.randn(batch_size, 1024, device=device, dtype=x.dtype)
 
-    for i in tqdm(range(steps)):
+    for i in tqdm(range(steps), desc="Euler Sampling"):
         t_curr = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_curr
 
         t_vec = torch.full((batch_size,), t_curr.item(), device=device, dtype=x.dtype)
 
-        # Predict x0 (conditioned)
-        x0_cond, _ = model(x, t_vec, y_indices, y_offsets)
+        x0_cond, _, _, cls_pred_cond = model(x, t_vec, y_indices, y_offsets, cls_embed=cls_state)
+        x0_uncond, _, _, cls_pred_uncond = model(x, t_vec, y_null_indices, y_null_offsets, cls_embed=cls_state)
 
-        # Predict x0 (unconditioned)
-        x0_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets)
-
-        # CFG in x0 space
         x0_guided = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
 
-        # Convert to velocity: v = (x0 - xt) / (1 - t), then step
-        # x_t = (1-t)*x0 + t*noise => v = dx/dt = noise - x0 = (xt - x0) / t ... 
-        # Actually for flow: v = x0 - noise, and xt = (1-t)*x0 + t*noise
-        # So noise = (xt - (1-t)*x0) / t, and v_flow = noise - x0
-        # Step: x_{t+dt} = x_t + dt * v
-        # v = (xt - x0) / t  (when t > 0)
         t_safe = t_curr.clamp(min=0.05)
         v = (x - x0_guided) / t_safe
         x = x + dt * v
+
+        # Denoise CLS token alongside
+        cls_pred_guided = cls_pred_uncond + guidance_scale * (cls_pred_cond - cls_pred_uncond)
+        v_cls = (cls_state - cls_pred_guided) / t_safe
+        cls_state = cls_state + dt * v_cls
 
     model.train()
     return x
 
 
-# ─── Smoke Test ──────────────────────────────────────────────────────────────
+@torch.no_grad()
+def sample_lookahead(model, tag_processor, latent_size, batch_size, prompts, device,
+                     steps=250, guidance_scale=1.5, alpha=1.5, percentile=0.4,
+                     noise=None, **kwargs):
+    """
+    Look-ahead Sampling (Algorithm S1 from Patch Forcing).
+    Advances confident patches to provide context for uncertain patches.
+    Operates with block-level (patch_size x patch_size) timestep maps.
+    """
+    in_channels = model.in_channels if hasattr(model, 'in_channels') else (
+        model.module.in_channels if hasattr(model, 'module') else 128)
+    p = model.patch_size if hasattr(model, 'patch_size') else (
+        model.module.patch_size if hasattr(model, 'module') else 16)
+    model.eval()
 
+    if isinstance(latent_size, (tuple, list)):
+        H, W = latent_size
+    else:
+        H = W = latent_size
+    Hp, Wp = H // p, W // p
 
-if __name__ == "__main__":
-    print("Initializing DiT on CPU...")
-    device = torch.device("cpu")
+    if noise is not None:
+        if isinstance(noise, list):
+            x = torch.stack([n.to(device) for n in noise[:batch_size]])
+        else:
+            x = noise.clone().to(device)
+    else:
+        x = torch.randn(batch_size, in_channels, H, W, device=device)
 
-    model = TokenformerDiT(
-        in_channels=3,
-        dim=1024,
-        depth=24,
-        num_heads=16,
-        num_classes=12476,
-        encoder_depth=2,
-        decoder_depth=2,
-        unet_base_dim=64,
-    ).to(device)
+    y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
+    null_prompts = [""] * batch_size
+    y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
-    num_params = sum(p.numel() for p in model.unet.parameters() if p.requires_grad)
-    print(f"Model Parameters: {num_params / 1e6:.2f} M")
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    x = x.to(torch.bfloat16)
+    cls_state = torch.randn(batch_size, 1024, device=device, dtype=x.dtype)
 
-    batch_size = 2
-    latent_size = 256
+    for i in tqdm(range(steps), desc="Look-ahead Sampling"):
+        t_curr = ts[i]
+        t_next = ts[i + 1]
+        dt = t_next - t_curr  # dt is negative
 
-    x_in = torch.randn(batch_size, 3, latent_size, latent_size, device=device)
-    t = torch.rand(batch_size, device=device)
+        # Block-level uniform timestep map (B, 1, Hp, Wp)
+        t_vec = torch.full((batch_size, 1, Hp, Wp), t_curr.item(), device=device, dtype=x.dtype)
 
-    y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
-    y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
+        # 1. Predict x0 and uncertainty (logvar) at current step
+        x0_cond, logvar, _, cls_pred_cond = model(x, t_vec, y_indices, y_offsets, cls_embed=cls_state)
+        x0_uncond, _, _, cls_pred_uncond = model(x, t_vec, y_null_indices, y_null_offsets, cls_embed=cls_state)
 
-    print("\nRunning forward pass (training)...")
+        x0_guided = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+
+        t_safe = t_curr.clamp(min=0.05)
+        v_t = (x - x0_guided) / t_safe
+
+        # 2. Adaptive thresholding at block level
+        # logvar is already (B, 1, Hp, Wp) at block resolution
+        uc_flat = logvar.view(batch_size, -1)
+        tau_p = torch.quantile(uc_flat.float(), percentile, dim=1).view(batch_size, 1, 1, 1).to(x.dtype)
+
+        # 3. Create block-level confidence masks and expand to pixel level
+        M_conf_block = (logvar <= tau_p).to(x.dtype)  # (B, 1, Hp, Wp)
+        M_unc_block = 1.0 - M_conf_block
+        M_conf_pixel = M_conf_block.repeat_interleave(p, dim=2).repeat_interleave(p, dim=3)
+        M_unc_pixel = 1.0 - M_conf_pixel
+
+        # 4. Context Look-ahead time (stepping closer to data/0.0)
+        t_ctx = t_curr / alpha
+
+        # 5. One-step look-ahead for confident patches
+        x_ctx = x + (t_ctx - t_curr) * v_t
+
+        # 6. Combine states (pixel level)
+        x_tilde = M_conf_pixel * x_ctx + M_unc_pixel * x
+
+        # 7. Block-level spatially mixed timestep for re-evaluation
+        t_tilde_block = M_conf_block * t_ctx + M_unc_block * t_curr  # (B, 1, Hp, Wp)
+
+        x0_cond_ctx, _, _, _ = model(x_tilde, t_tilde_block, y_indices, y_offsets, cls_embed=cls_state)
+        x0_uncond_ctx, _, _, _ = model(x_tilde, t_tilde_block, y_null_indices, y_null_offsets, cls_embed=cls_state)
+
+        x0_guided_ctx = x0_uncond_ctx + guidance_scale * (x0_cond_ctx - x0_uncond_ctx)
+
+        # Expand block timestep to pixel level for velocity division
+        t_tilde_pixel = t_tilde_block.repeat_interleave(p, dim=2).repeat_interleave(p, dim=3)
+        t_tilde_safe = t_tilde_pixel.clamp(min=0.05)
+        v_ctx = (x_tilde - x0_guided_ctx) / t_tilde_safe
+
+        # 8. Combine final velocity (pixel level)
+        v_final = M_unc_pixel * v_ctx + M_conf_pixel * v_t
+
+        # 9. Step forward
+        x = x + dt * v_final
+
+        # Denoise CLS token alongside (global timestep, not spatial)
+        cls_pred_guided = cls_pred_uncond + guidance_scale * (cls_pred_cond - cls_pred_uncond)
+        v_cls = (cls_state - cls_pred_guided) / t_safe
+        cls_state = cls_state + dt * v_cls
+
     model.train()
-    x0_pred, logvar = model(x_in, t, y_indices, y_offsets)
-
-    print(f"Input shape:  {x_in.shape}")
-    print(f"Output x0_pred shape: {x0_pred.shape}")
-    print(f"Output logvar shape:  {logvar.shape}")
-
-    # Quick backward test
-    loss = x0_pred.mean() + logvar.mean()
-    loss.backward()
-    print("✅ Forward + backward pass completed successfully!")
+    return x
