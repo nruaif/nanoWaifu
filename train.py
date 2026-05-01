@@ -282,7 +282,7 @@ def train(config_path):
 
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
-        model.compile(model, mode="max-autotune")
+        model.compile()
 
     # Mock Optimizers for safety if file is missing locally
     try:
