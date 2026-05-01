@@ -15,8 +15,7 @@ from huggingface_hub import upload_file
 import threading
 
 # Using Look-ahead by default for eval
-from model_dit import TokenformerDiT as ModelClass, sample_lookahead as sample_fn, TagProcessor
-import timm
+from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
 
 
 def _async_upload(ckpt_path, repo_id, step):
@@ -236,26 +235,10 @@ def train(config_path):
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
         encoder_depth=config['model'].get('encoder_depth', 2),
         decoder_depth=config['model'].get('decoder_depth', 2),
-        unet_base_dim=config['model'].get('unet_base_dim', 64),
         patch_size=patch_size,
     ).to(device=device, dtype=torch.bfloat16)
 
-    # --- REPA: Frozen DINOv3 ViT-L ---
-    lambda_repa = config['model'].get('lambda_repa', 0)
-    repa_enabled = lambda_repa > 0
-    if repa_enabled:
-        print(">>> Loading DINOv3 ViT-L for REPA...")
-        dino_model = timm.create_model(
-            'vit_large_patch16_dinov3_qkvb.lvd1689m',
-            pretrained=True,
-            num_classes=0,
-            dynamic_img_size=True
-        ).to(device=device, dtype=torch.bfloat16).eval()
-        for p_dino in dino_model.parameters():
-            p_dino.requires_grad = False
-        dino_mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=torch.bfloat16).view(1, 3, 1, 1)
-        dino_std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=torch.bfloat16).view(1, 3, 1, 1)
-        print(">>> DINOv3 ViT-L loaded and frozen.")
+
 
     # Resume Logic
     global_step = 0
@@ -418,75 +401,35 @@ def train(config_path):
 
             t_block = t_block
 
-            # Expand to pixel level for flow interpolation
-            t_pixel = t_block.repeat_interleave(patch_size, dim=2).repeat_interleave(patch_size, dim=3)
+            # ─── Pre-patchify inputs ────────────────────────────────────
+            inputs_patched = F.pixel_unshuffle(inputs, patch_size)  # (B, C*p^2, Hp, Wp)
 
-            noise = torch.randn_like(inputs)
-            xt = (1 - t_pixel) * inputs + t_pixel * noise
+            # Expand timestep to patchified spatial level for flow interpolation
+            # t_block is (B, 1, Hp, Wp), inputs_patched is (B, C*p^2, Hp, Wp)
+            noise = torch.randn_like(inputs_patched)
+            xt = (1 - t_block) * inputs_patched + t_block * noise
 
-            # ─── Training Augmentations ─────────────────────────────────────
-            noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
-            if noise_inject_ratio > 0:
-                noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                xt = xt + noise_mask * noise_inject_ratio * torch.randn_like(xt)
+            # Model receives block-level timesteps, predicts x0 + logvar in patchified space
+            x0_pred, logvar_theta = model(xt, t_block, y_indices, y_offsets)
 
-            cross_ratio = config['training'].get('cross_ratio', 0.1)
-            if cross_ratio > 0:
-                cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                inputs_neg = inputs.roll(shifts=1, dims=0)
-                noise_neg = torch.randn_like(inputs)
-                xt_neg = (1 - t_pixel) * inputs_neg + t_pixel * noise_neg
-                xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
-
-            # Model receives block-level timesteps, predicts x0 + logvar
-            # --- REPA: Extract DINO features and noise CLS ---
-            cls_noised = None
-            if repa_enabled:
-                with torch.no_grad():
-                    rgb = images.to(device=device, dtype=torch.bfloat16)
-                    rgb_norm = (rgb - dino_mean) / dino_std
-                    dino_out = dino_model.forward_features(rgb_norm)
-                    dino_cls = dino_out[:, 0]     # (B, 1024)
-                    dino_patch = dino_out[:, 5:]   # (B, N_patches, 1024)
-
-                # Noise CLS with mean timestep (flow matching schedule)
-                t_global = t_block.mean(dim=[1, 2, 3])  # (B,)
-                noise_cls = torch.randn_like(dino_cls)
-                cls_noised = (1 - t_global.unsqueeze(1)) * dino_cls + t_global.unsqueeze(1) * noise_cls
-
-            x0_pred, logvar_theta, repa_feat, cls_pred = model(xt, t_block, y_indices, y_offsets, cls_embed=cls_noised)
-
-            # Loss uses pixel-level timesteps for velocity formulation
-            t_safe = t_pixel.clamp(min=0.05)
+            # Velocity loss in patchified space
+            t_safe = t_block.clamp(min=0.05)
             v_pred = (xt - x0_pred) / t_safe
-            v_target = (xt - inputs) / t_safe
+            v_target = (xt - inputs_patched) / t_safe
 
             mse_loss = F.mse_loss(v_pred, v_target, reduction='none')
             mse_loss_mean = mse_loss.mean()
 
-            # Difficulty-aware NLL loss via logvar (expand block-level logvar to pixel for broadcast)
-            logvar_pixel = logvar_theta.repeat_interleave(patch_size, dim=2).repeat_interleave(patch_size, dim=3)
+            # Difficulty-aware NLL loss via logvar (block-level, same resolution)
             sg_v_pred = v_pred.detach()
             mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True)
-            nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_pixel) + logvar_pixel)
+            nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
             nll_loss_mean = nll_loss.mean()
 
             lambda_nll = config['model'].get('lambda_nll', 0.01)
             loss = mse_loss_mean + lambda_nll * nll_loss_mean
 
-            # --- REPA + CLS losses ---
-            if repa_enabled and repa_feat is not None and cls_pred is not None:
-                # Patch-level cosine similarity (REPA)
-                repa_feat_n = F.normalize(repa_feat, dim=-1)
-                dino_patch_n = F.normalize(dino_patch.detach(), dim=-1)
-                repa_loss = (1 - (repa_feat_n * dino_patch_n).sum(dim=-1)).mean()
 
-                # CLS cosine similarity
-                cls_pred_n = F.normalize(cls_pred, dim=-1)
-                dino_cls_n = F.normalize(dino_cls.detach(), dim=-1)
-                cls_loss = (1 - (cls_pred_n * dino_cls_n).sum(dim=-1)).mean()
-
-                loss = loss + lambda_repa * (repa_loss + cls_loss)
 
             loss = loss / accum_steps
             loss.backward()
@@ -504,9 +447,7 @@ def train(config_path):
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
                 log_dict = {"train/loss": avg_loss}
-                if repa_enabled:
-                    log_dict["train/repa_loss"] = repa_loss.item() if repa_feat is not None else 0
-                    log_dict["train/cls_loss"] = cls_loss.item() if cls_pred is not None else 0
+
                 wandb.log(log_dict, step=global_step)
                 pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
                 running_loss = 0.0
@@ -515,37 +456,39 @@ def train(config_path):
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
                                 global_step, config, fixed_prompts, fixed_noise)
 
-                print(f"\n[Step {global_step}] Generating validation samples (Look-ahead)...")
                 model.eval()
                 with torch.no_grad():
-                    samples = sample_fn(
-                        model.module if hasattr(model, 'module') else model,
-                        tag_processor,
-                        (256, 256),
-                        16,
-                        fixed_prompts,
-                        device,
-                        guidance_scale=1.4,
-                        # noise=fixed_noise
-                    )
+                    for stype in ("euler", "look-ahead"):
+                        print(f"\n[Step {global_step}] Generating validation samples ({stype})...")
+                        samples = sample_fn(
+                            model.module if hasattr(model, 'module') else model,
+                            tag_processor,
+                            (256, 256),
+                            16,
+                            fixed_prompts,
+                            device,
+                            guidance_scale=1.4,
+                            sampler_type=stype,
+                        )
 
-                    if use_tiny_vae or use_vae:
-                        samples = samples.to(dtype=torch.bfloat16)
-                        samples = (samples * latents_std) + latents_mean
-                        if not use_tiny_vae:
-                            samples = F.pixel_shuffle(samples, 2)
-                            recon = vae.decode(samples).sample
+                        if use_tiny_vae or use_vae:
+                            samples = samples.to(dtype=torch.bfloat16)
+                            samples = (samples * latents_std) + latents_mean
+                            if not use_tiny_vae:
+                                samples = F.pixel_shuffle(samples, 2)
+                                recon = vae.decode(samples).sample
+                            else:
+                                out = vae.decode(samples, return_dict=False)
+                                recon = out[0] if isinstance(out, tuple) else out
+
+                            samples = recon.clamp(-1, 1) / 2.0 + 0.5
+                            samples = samples.to(dtype=torch.float32)
                         else:
-                            out = vae.decode(samples, return_dict=False)
-                            recon = out[0] if isinstance(out, tuple) else out
-
-                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                        samples = samples.to(dtype=torch.float32)
-                    else:
-                        samples = samples.clamp(-1, 1) / 2.0 + 0.5
-                        samples = samples.to(dtype=torch.float32)
-                    grid = make_grid(samples, nrow=4)
-                    wandb.log({"val/samples": wandb.Image(grid, caption=f"Step {global_step}")}, step=global_step)
+                            samples = samples.clamp(-1, 1) / 2.0 + 0.5
+                            samples = samples.to(dtype=torch.float32)
+                        grid = make_grid(samples, nrow=4)
+                        tag = stype.replace("-", "_")
+                        wandb.log({f"val/samples_{tag}": wandb.Image(grid, caption=f"{stype} @ Step {global_step}")}, step=global_step)
                 model.train()
 
     if rank == 0:

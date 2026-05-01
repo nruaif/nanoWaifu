@@ -17,8 +17,6 @@ training:
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
-  noise_inject_ratio: 0
-  cross_ratio: 0
   sampler_type: "euler"
 
 model:
@@ -29,12 +27,9 @@ model:
   fcdm_depth: 16
   num_heads: 12
   in_channels: 3
-  encoder_depth: 2
-  decoder_depth: 2
-  unet_base_dim: 64
+  encoder_depth: 4
+  decoder_depth: 4
   lambda_nll: 0.01
-  lambda_repa: 0.5
-  repa_dino_dim: 1024
   patch_size: 16
 
 data:
