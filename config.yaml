@@ -33,5 +33,5 @@ model:
   patch_size: 16
 
 data:
-  webdataset_url: '/workspace/data/train/00{001..030}.tar'
+  webdataset_url: '/root/nanoWaifu/data/train/00{001..030}.tar'
   use_advanced_captions: true
