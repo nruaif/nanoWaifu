@@ -270,7 +270,7 @@ def train(config_path):
                 del state_dict[k]
 
             model_to_load.load_state_dict(state_dict, strict=False)
-            global_step = checkpoint["global_step"] - 10
+            global_step = checkpoint["global_step"]
 
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
@@ -282,7 +282,7 @@ def train(config_path):
 
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
-        model = torch.compile(model, mode="max-autotune")
+        model.compile(model, mode="max-autotune")
 
     # Mock Optimizers for safety if file is missing locally
     try:
