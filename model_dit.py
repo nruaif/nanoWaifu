@@ -32,7 +32,7 @@ def uniformity_loss(x, sketch_dim=64):
 
     N, C = x.size()
     if C > sketch_dim:
-        S = torch.randn(sketch_dim, C, device=x.device) / (C ** 0.5)
+        S = torch.randn(sketch_dim, C, device=x.device, dtype=x.dtype) / (C ** 0.5)
         x = x @ S.T
     else:
         sketch_dim = C
