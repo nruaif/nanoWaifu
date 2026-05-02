@@ -28,7 +28,7 @@ model:
   use_vae: true    # Recommended for 256x256
   use_tiny_vae: false
   fcdm_dim: 768    # Hidden dimension (Transformer)
-  fcdm_depth: 12   # Number of layers
+  fcdm_depth: 16   # Number of layers
   num_heads: 12    # Number of attention heads
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
