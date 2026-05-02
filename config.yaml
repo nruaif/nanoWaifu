@@ -1,5 +1,5 @@
 training:
-  batch_size: 64
+  batch_size: 128
   grad_accum_steps: 1
   learning_rate: 8.0e-4
   num_epochs: 100
