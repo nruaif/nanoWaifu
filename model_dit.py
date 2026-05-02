@@ -178,8 +178,9 @@ class SelfAttention(nn.Module):
             q = rope(q, H, W, seq_indices)
             k = rope(k, H, W, seq_indices)
 
-        x_att = F.scaled_dot_product_attention(q, k, v)
-        x_att = x_att.transpose(1, 2).reshape(B, N_seq, C)
+        dtype = q.dtype
+        x_att = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        x_att = x_att.to(dtype).transpose(1, 2).reshape(B, N_seq, C)
         return self.proj(x_att)
 
 
