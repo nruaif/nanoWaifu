@@ -399,10 +399,7 @@ def train(config_path):
             t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H*W, device=device, dtype=torch.bfloat16)
 
             # Dimension-Dependent Shift timestep sampling
-            m = C * H * W
-            n = 32768.0
-            alpha = (m / n) ** 0.5
-            t = (alpha * t_base) / (1.0 + (alpha - 1.0) * t_base)
+            t = t_base
 
             t_reshaped = t.view(B, 1, H, W)
             noise = torch.randn_like(inputs)

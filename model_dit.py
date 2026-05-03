@@ -1,11 +1,10 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 import math
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
-
+from torch.utils.flop_counter import FlopCounterMode
 class GatherLayer(torch.autograd.Function):
     """Gather tensors from all processes, supporting backward propagation."""
     @staticmethod
@@ -44,6 +43,73 @@ def uniformity_loss(x, sketch_dim=64):
 
     return torch.norm(cov - target, p='fro')
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SlotCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim=768,
+        num_heads=16,
+        num_slots=8192,
+        use_nonlinear_attn=True
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.use_nonlinear_attn = use_nonlinear_attn
+
+        # Query projection (keep)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+
+        # Learnable KV slots (NO projection)
+        self.k_slots = nn.Parameter(torch.randn(num_slots, dim) * 0.02)
+        self.v_slots = nn.Parameter(torch.randn(num_slots, dim) * 0.02)
+
+        # Output projection
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        nn.init.zeros_(self.out_proj.weight)
+    def forward(self, x):
+        """
+        x: (B, N, D)
+        """
+        B, N, D = x.shape
+        H = self.num_heads
+
+        # ---- Query ----
+        q = self.q_proj(x)  # (B, N, D)
+        q = q.view(B, N, H, self.head_dim).transpose(1, 2)  # (B, H, N, d)
+
+        # ---- Slots ----
+        k = self.k_slots.view(1, self.k_slots.shape[0], H, self.head_dim)
+        v = self.v_slots.view(1, self.v_slots.shape[0], H, self.head_dim)
+
+        k = k.transpose(1, 2)  # (1, H, S, d)
+        v = v.transpose(1, 2)  # (1, H, S, d)
+
+        # ---- Attention scores ----
+        attn_scores = torch.matmul(q, k.transpose(-2, -1))  # (B, H, N, S)
+
+        if self.use_nonlinear_attn:
+            # L2 normalization + GeLU (Tokenformer-style)
+            norm = torch.norm(attn_scores, dim=-1, keepdim=True) + 1e-6
+            attn_scores = attn_scores / norm
+            attn = F.gelu(attn_scores)
+        else:
+            attn = F.softmax(attn_scores * self.scale, dim=-1)
+
+        # ---- Weighted sum ----
+        out = torch.matmul(attn, v)  # (B, H, N, d)
+
+        # ---- Merge heads ----
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
+
+        return self.out_proj(out)
 
 class MeanPoolingEmbedder(nn.Module):
     def __init__(self, num_classes: int, dim: int):
@@ -185,12 +251,23 @@ class SelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, num_slots=8192):
         super().__init__()
+
         self.norm1 = RMSNorm(dim)
         self.self_attn = SelfAttention(dim, num_heads)
+
         self.norm3 = RMSNorm(dim)
         self.mlp = Mlp(dim, dim * 4, dim)
+
+        # NEW
+        self.norm_slot = RMSNorm(dim)
+        self.slot_attn = SlotCrossAttention(
+            dim=dim,
+            num_heads=num_heads,
+            num_slots=num_slots,
+            use_nonlinear_attn=True
+        )
 
     def forward(self, x, H, W, rope, context=None, seq_indices=None):
         B, N, C = x.shape
@@ -202,12 +279,20 @@ class TransformerBlock(nn.Module):
         else:
             x_seq = x
 
+        # ---- Self-attention ----
         x_norm1 = self.norm1(x_seq)
-        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens, seq_indices)
-
+        attn_out = self.self_attn(
+            x_norm1, H, W, rope, num_context_tokens, seq_indices
+        )
         x_seq = x_seq + attn_out
+
+        # ---- MLP ----
         x_seq = x_seq + self.mlp(self.norm3(x_seq))
 
+        # ---- NEW: Slot cross-attention ----
+        x_seq = x_seq + self.slot_attn(self.norm_slot(x_seq))
+
+        # ---- Split back context ----
         if context is not None:
             context = x_seq[:, :num_context_tokens, :]
             x = x_seq[:, num_context_tokens:, :]
@@ -536,11 +621,13 @@ if __name__ == "__main__":
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
 
     print("\nRunning forward pass (training)...")
-    model.train()
-    u_pred, logvar, u_loss = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1, return_uniformity=True)
+    model.eval()
+    with FlopCounterMode(model) as flop_counter:
+        u_pred, logvar, u_loss = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1, return_uniformity=True)
+        total_flops = flop_counter.get_total_flops()
 
     print(f"Input shape:  {x_in.shape}")
     print(f"Output u_pred shape: {u_pred.shape}")
     print(f"Output logvar shape: {logvar.shape}")
-
+    print(total_flops)
     print("✅ Forward pass completed successfully!")
