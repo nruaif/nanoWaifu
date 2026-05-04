@@ -481,17 +481,14 @@ def train(config_path):
                 print(f"\n[Step {global_step}] Generating validation samples...")
                 model.eval()
                 with torch.no_grad():
-                    # FIX: sample_mar accepts **kwargs so `noise` is safely ignored for MAR;
-                    #      non-MAR models receive it normally
                     samples = sample_fn(
                         model.module if hasattr(model, 'module') else model,
                         tag_processor,
-                        (inputs.shape[2], inputs.shape[3]),
+                        (16, 16),
                         16,
                         fixed_prompts,
                         device,
                         cfg_scale=config['training'].get('cfg_scale', 1.4),
-                        noise=fixed_noise
                     )
 
                     if use_tiny_vae:
