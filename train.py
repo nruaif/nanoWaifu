@@ -31,7 +31,6 @@ def _async_upload(ckpt_path, repo_id, step):
 
 torch.backends.cuda.enable_flash_sdp(True)
 
-
 # FIX: removed unused disp_loss function
 
 
@@ -127,6 +126,7 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
+
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -184,7 +184,8 @@ def train(config_path):
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size', 16)
+    latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size',
+                                                                                                         16)
 
     model = ModelClass(
         in_channels=in_channels,
@@ -247,79 +248,20 @@ def train(config_path):
     # Reference to the unwrapped model for accessing k-diff parameters
     model_raw = model.module if hasattr(model, 'module') else model
 
-    from adv_optm import Muon_adv as  NorMuon
-    from adv_optm import AdamW_adv as DionAdamW
-
-    adamw_params = []
-    normuon_params = []
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        is_1d = p.ndim <= 1
-        is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
-        is_embedding = ('embed' in name
-                        or isinstance(p, torch.nn.Embedding)
-                        or isinstance(p, torch.nn.EmbeddingBag)
-                        or 'token_embed' in name)
-        if is_1d or is_dwconv or is_embedding:
-            adamw_params.append(p)
-        else:
-            normuon_params.append(p)
-
-    opt_adamw = DionAdamW(
-        adamw_params,
-        cautious_wd = True,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        # cautious_wd = True,
         lr=config['training']['learning_rate'],
         weight_decay=0.1,
         betas=(0.9, 0.95)
     )
-
-    try:
-        opt_normuon = NorMuon(
-            normuon_params,
-            lr=config['training']['learning_rate'],
-            weight_decay=0.1,
-            cautious_wd = True,
-            normuon_variant = True
-        )
-    except TypeError:
-        opt_normuon = NorMuon(
-            normuon_params,
-            lr=config['training']['learning_rate'],
-            weight_decay=0.1,
-            normuon_variant = True  ,
-            cautious_wd = True,
-        )
-
-    class DualOptimizer:
-        def __init__(self, opt1, opt2):
-            self.opt1 = opt1
-            self.opt2 = opt2
-
-        def step(self):
-            self.opt1.step()
-            self.opt2.step()
-
-        def zero_grad(self, set_to_none=True):
-            self.opt1.zero_grad(set_to_none=set_to_none)
-            self.opt2.zero_grad(set_to_none=set_to_none)
-
-        def state_dict(self):
-            return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
-
-        def load_state_dict(self, state):
-            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
-            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
-
-    optimizer = DualOptimizer(opt_adamw, opt_normuon)
 
     # FIX: restore optimizer state after it's constructed
     if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                #optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
@@ -396,7 +338,8 @@ def train(config_path):
                 return t
 
             # Logit-Normal Truncated Gaussian Timestep Sampler
-            t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H*W, device=device, dtype=torch.bfloat16)
+            t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H * W, device=device,
+                                dtype=torch.bfloat16)
 
             # Dimension-Dependent Shift timestep sampling
             t = t_base
@@ -426,27 +369,28 @@ def train(config_path):
             path_drop_prob = config['model'].get('path_drop_prob', 0.0)
 
             # Model outputs raw u-prediction, logvar, and uniformity loss
-            u_pred, logvar_theta, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True, path_drop_prob=path_drop_prob)
+            u_pred, logvar_theta, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True,
+                                                 path_drop_prob=path_drop_prob)
 
             # Compute velocity-space loss for uniform weighting (k-diff)
             k = torch.sigmoid(model_raw.w_k)
             u_target = k * inputs - (1 - k) * noise
             v_pred = model_raw.get_velocity(xt, u_pred, t_reshaped)
             v_target = model_raw.get_velocity(xt, u_target, t_reshaped)
-            
+
             # Difficulty-aware NLL loss
-            mse_loss_raw = F.mse_loss(v_pred, v_target, reduction='none') # (B, C, H, W)
+            mse_loss_raw = F.mse_loss(v_pred, v_target, reduction='none')  # (B, C, H, W)
             mse_loss_mean = mse_loss_raw.mean()
-            
+
             sg_v_pred = v_pred.detach()
-            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True) # (B, 1, H, W)
-            
+            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True)  # (B, 1, H, W)
+
             nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
             nll_loss_mean = nll_loss.mean()
-            
+
             lambda_nll = config['model'].get('lambda_nll', 0.01)
             loss = mse_loss_mean + lambda_nll * nll_loss_mean
-            
+
             if u_loss is not None:
                 loss = loss + (uniformity_weight * u_loss)
 

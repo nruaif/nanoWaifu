@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 import math
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy, create_selective_checkpoint_contexts
@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from torch.utils.flop_counter import FlopCounterMode
 import functools
 
+torch._dynamo.config.recompile_limit = 128
 aten = torch.ops.aten
 compute_intensive_ops = [
     aten.mm.default,
@@ -177,7 +178,7 @@ class Mlp(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, use_value_residual=False):
+    def __init__(self, dim, num_heads):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -185,23 +186,19 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
         self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-
-        self.use_value_residual = use_value_residual
-        if self.use_value_residual:
-            self.lambda_1 = nn.Parameter(torch.tensor(0.5))
-            self.lambda_2 = nn.Parameter(torch.tensor(0.5))
-
         nn.init.zeros_(self.proj.weight)
         if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None, v1=None):
+    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None, return_v=False):
         B, N_seq, C = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+
+        raw_v = v  # captured before any rope / mixing
 
         if num_context_tokens > 0:
             c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
@@ -214,33 +211,108 @@ class SelfAttention(nn.Module):
             q = rope(q, H, W, seq_indices)
             k = rope(k, H, W, seq_indices)
 
-        # Value Residual Learning (ResFormer pattern)
-        if self.use_value_residual and v1 is not None:
-            v = self.lambda_1 * v1 + self.lambda_2 * v
-
         dtype = q.dtype
-        x_att = F.scaled_dot_product_attention(q, k, v)
+        x_att = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
         x_att = x_att.to(dtype).transpose(1, 2).reshape(B, N_seq, C)
-
         out = self.proj(x_att)
-
-        # If this is the layer designated to produce v1, return it
-        if not self.use_value_residual and v1 is None:
-            return out, v
-
-        return out, None
+        if return_v:
+            return out, raw_v
+        return out
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, use_value_residual=False):
+    def __init__(self, dim, num_heads, num_slots=2048):
         super().__init__()
 
         self.norm1 = RMSNorm(dim)
-        self.self_attn = SelfAttention(dim, num_heads, use_value_residual=use_value_residual)
+        self.self_attn = SelfAttention(dim, num_heads)
 
         self.norm3 = RMSNorm(dim)
         self.mlp = Mlp(dim, dim * 4, dim)
 
+    @torch.compile
+    def forward(self, x, H, W, rope, context=None, seq_indices=None, return_v=False):
+        B, N, C = x.shape
+
+        num_context_tokens = 0
+        if context is not None:
+            x_seq = torch.cat([context, x], dim=1)
+            num_context_tokens = context.shape[1]
+        else:
+            x_seq = x
+
+        x_norm1 = self.norm1(x_seq)
+        if return_v:
+            attn_out, raw_v = self.self_attn(
+                x_norm1, H, W, rope, num_context_tokens, seq_indices, return_v=True
+            )
+        else:
+            attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens, seq_indices)
+
+        x_seq = x_seq + attn_out
+        x_seq = x_seq + self.mlp(self.norm3(x_seq))
+
+        if context is not None:
+            context = x_seq[:, :num_context_tokens, :]
+            x = x_seq[:, num_context_tokens:, :]
+        else:
+            x = x_seq
+
+        if return_v:
+            return x, context, raw_v
+        return x, context
+
+
+class ValueResSelfAttention(SelfAttention):
+    """SelfAttention with learnable value residual: v' = λ1·v1 + λ2·v"""
+
+    def __init__(self, dim, num_heads):
+        super().__init__(dim, num_heads)
+        self.lambda1 = nn.Parameter(torch.tensor(0.5))  # weight on v1 (first mid block)
+        self.lambda2 = nn.Parameter(torch.tensor(0.5))  # weight on current v
+
+    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None,
+                v1=None, return_v=False):
+        B, N_seq, C = x.shape
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if v1 is not None:
+            v = self.lambda1 * v1 + self.lambda2 * v
+
+        raw_v = v
+
+        if num_context_tokens > 0:
+            c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
+            c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
+            s_q = rope(s_q, H, W, seq_indices)
+            s_k = rope(s_k, H, W, seq_indices)
+            q = torch.cat([c_q, s_q], dim=2)
+            k = torch.cat([c_k, s_k], dim=2)
+        else:
+            q = rope(q, H, W, seq_indices)
+            k = rope(k, H, W, seq_indices)
+
+        dtype = q.dtype
+        x_att = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        x_att = x_att.to(dtype).transpose(1, 2).reshape(B, N_seq, C)
+        out = self.proj(x_att)
+        if return_v:
+            return out, raw_v
+        return out
+
+
+class ValueResTransformerBlock(TransformerBlock):
+    """TransformerBlock whose attention uses value residual from v1."""
+
+    def __init__(self, dim, num_heads):
+        super().__init__(dim, num_heads)
+        self.self_attn = ValueResSelfAttention(dim, num_heads)  # replaces base attn
+
+    @torch.compile
     def forward(self, x, H, W, rope, context=None, seq_indices=None, v1=None):
         B, N, C = x.shape
 
@@ -251,24 +323,20 @@ class TransformerBlock(nn.Module):
         else:
             x_seq = x
 
-        # ---- Self-attention ----
         x_norm1 = self.norm1(x_seq)
-        attn_out, new_v1 = self.self_attn(
+        attn_out = self.self_attn(
             x_norm1, H, W, rope, num_context_tokens, seq_indices, v1=v1
         )
         x_seq = x_seq + attn_out
-
-        # ---- MLP ----
         x_seq = x_seq + self.mlp(self.norm3(x_seq))
 
-        # ---- Split back context ----
         if context is not None:
             context = x_seq[:, :num_context_tokens, :]
             x = x_seq[:, num_context_tokens:, :]
         else:
             x = x_seq
 
-        return x, context, new_v1
+        return x, context
 
 
 class TimestepEmbedder(nn.Module):
@@ -300,7 +368,6 @@ class TokenformerDiT(nn.Module):
     """
     Pure DiT architecture with SPRINT (Sparse-Dense Residual Fusion).
     Conditions via concatenated tokens in self-attention.
-    Includes ResFormer Value Residual Learning for the second half of middle blocks.
     """
 
     def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
@@ -328,21 +395,18 @@ class TokenformerDiT(nn.Module):
         self.num_decoder_blocks = 2
         self.num_middle_blocks = depth - self.num_encoder_blocks - self.num_decoder_blocks
 
-        # U-Net style value residual application
-        self.mid_block_halfway = self.num_middle_blocks // 2
-
         self.encoder_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_value_residual=False) for _ in range(self.num_encoder_blocks)
+            TransformerBlock(dim, num_heads) for _ in range(self.num_encoder_blocks)
         ])
-
-        # Apply value residual only to the second half of the middle blocks
-        self.middle_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_value_residual=(i >= self.mid_block_halfway))
-            for i in range(self.num_middle_blocks)
-        ])
+        self.mid_split = self.num_middle_blocks // 2
+        self.middle_blocks = nn.ModuleList(
+            [TransformerBlock(dim, num_heads) for _ in range(self.mid_split)]
+            + [ValueResTransformerBlock(dim, num_heads)
+               for _ in range(self.num_middle_blocks - self.mid_split)]
+        )
 
         self.decoder_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, use_value_residual=False) for _ in range(self.num_decoder_blocks)
+            TransformerBlock(dim, num_heads) for _ in range(self.num_decoder_blocks)
         ])
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
@@ -352,7 +416,6 @@ class TokenformerDiT(nn.Module):
         self.final_proj = nn.Linear(dim, in_channels + 1)
 
         self.w_k = nn.Parameter(torch.tensor(0.0))
-        self.refiner = nn.Conv2d(in_channels + 1, in_channels + 1, 3, 1, 1)
 
     def get_velocity(self, z, u_pred, t):
         k = torch.sigmoid(self.w_k)
@@ -380,20 +443,12 @@ class TokenformerDiT(nn.Module):
         y_tokens = self.y_embedder(y_indices, y_offsets)
         context = y_tokens
 
-        # Variables for Value Residual Tracking
-        v_first_mid = None
-        v_current = None
-
         for block in self.encoder_blocks:
             if self.use_checkpoint and self.training:
-                # Modifying checkpointing signature to handle v1 parameter passing
-                def block_wrapper(b, x_in, ctx_in):
-                    x_out, ctx_out, _ = b(x_in, H, W, self.rope, ctx_in, None, v1=None)
-                    return x_out, ctx_out
-
-                x, context = checkpoint(block_wrapper, block, x, context, use_reentrant=False, context_fn=context_fn)
+                x, context = checkpoint(block, x, H, W, self.rope, context, None, use_reentrant=False,
+                                        context_fn=context_fn)
             else:
-                x, context, _ = block(x, H, W, self.rope, context, None, v1=None)
+                x, context = block(x, H, W, self.rope, context, None)
 
         f_t = x
 
@@ -419,39 +474,37 @@ class TokenformerDiT(nn.Module):
             g_pad_t = self.mask_token.expand(B, N, -1)
             u_loss = torch.tensor(0.0, device=x.device) if return_uniformity else None
         else:
-            for idx, block in enumerate(self.middle_blocks):
-
-                # First middle block creates the base V_1 for ResFormer
-                if idx == 0:
-                    if self.use_checkpoint and self.training:
-                        x_middle, context, v_current = block(x_middle, H, W, self.rope, context, seq_indices, v1=None)
+            v1 = None
+            for i, block in enumerate(self.middle_blocks):
+                is_value_res = i >= self.mid_split
+                if self.use_checkpoint and self.training:
+                    if i == 0:
+                        x_middle, context, v1 = block(
+                            x_middle, H, W, self.rope, context, seq_indices, return_v=True
+                        )
+                    elif is_value_res:
+                        x_middle, context = checkpoint(
+                            block, x_middle, H, W, self.rope, context, seq_indices, v1,
+                            use_reentrant=False, context_fn=context_fn
+                        )
                     else:
-                        x_middle, context, v_current = block(x_middle, H, W, self.rope, context, seq_indices, v1=None)
-                    v_first_mid = v_current
-
-                # Second half of middle blocks applies ResFormer
-                elif idx >= self.mid_block_halfway:
-                    if self.use_checkpoint and self.training:
-                        def block_wrapper_v1(b, x_in, ctx_in, seq_in, v_in):
-                            x_out, ctx_out, _ = b(x_in, H, W, self.rope, ctx_in, seq_in, v1=v_in)
-                            return x_out, ctx_out
-
-                        x_middle, context = checkpoint(block_wrapper_v1, block, x_middle, context, seq_indices,
-                                                       v_first_mid, use_reentrant=False, context_fn=context_fn)
-                    else:
-                        x_middle, context, _ = block(x_middle, H, W, self.rope, context, seq_indices, v1=v_first_mid)
-
-                # Normal processing for first half of middle blocks
+                        x_middle, context = checkpoint(
+                            block, x_middle, H, W, self.rope, context, seq_indices,
+                            use_reentrant=False, context_fn=context_fn
+                        )
                 else:
-                    if self.use_checkpoint and self.training:
-                        def block_wrapper_norm(b, x_in, ctx_in, seq_in):
-                            x_out, ctx_out, _ = b(x_in, H, W, self.rope, ctx_in, seq_in, v1=None)
-                            return x_out, ctx_out
-
-                        x_middle, context = checkpoint(block_wrapper_norm, block, x_middle, context, seq_indices,
-                                                       use_reentrant=False, context_fn=context_fn)
+                    if i == 0:
+                        x_middle, context, v1 = block(
+                            x_middle, H, W, self.rope, context, seq_indices, return_v=True
+                        )
+                    elif is_value_res:
+                        x_middle, context = block(
+                            x_middle, H, W, self.rope, context, seq_indices, v1=v1
+                        )
                     else:
-                        x_middle, context, _ = block(x_middle, H, W, self.rope, context, seq_indices, v1=None)
+                        x_middle, context = block(
+                            x_middle, H, W, self.rope, context, seq_indices
+                        )
 
             u_loss = None
             if return_uniformity and self.training:
@@ -476,14 +529,10 @@ class TokenformerDiT(nn.Module):
 
         for block in self.decoder_blocks:
             if self.use_checkpoint and self.training:
-                def block_wrapper_dec(b, x_in, ctx_in):
-                    x_out, ctx_out, _ = b(x_in, H, W, self.rope, ctx_in, None, v1=None)
-                    return x_out, ctx_out
-
-                h_t, context = checkpoint(block_wrapper_dec, block, h_t, context, use_reentrant=False,
+                h_t, context = checkpoint(block, h_t, H, W, self.rope, context, None, use_reentrant=False,
                                           context_fn=context_fn)
             else:
-                h_t, context, _ = block(h_t, H, W, self.rope, context, None, v1=None)
+                h_t, context = block(h_t, H, W, self.rope, context, None)
 
         feat = h_t
         x_norm = self.final_norm(h_t)
@@ -491,7 +540,6 @@ class TokenformerDiT(nn.Module):
         x_out = self.final_proj(x_norm)
 
         x_out = x_out.transpose(1, 2).reshape(B, self.in_channels + 1, H, W)
-        x_out = self.refiner(x_out)
         u_pred = x_out[:, :self.in_channels, :, :]
         logvar_theta = x_out[:, self.in_channels:, :, :]
 
@@ -627,7 +675,7 @@ if __name__ == "__main__":
     model = TokenformerDiT(
         in_channels=32,
         dim=768,
-        depth=24,  # 24 total layers. 2 enc, 2 dec, 20 mid blocks. Value res applied to mid blocks 10-19.
+        depth=24,
         num_heads=12,
         num_classes=12476,
         drop_ratio=0.75
