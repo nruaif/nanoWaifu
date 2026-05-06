@@ -220,6 +220,7 @@ class DeCoPixelDecoder(nn.Module):
     def __init__(self, in_channels, depth=3, cond_dim=1024):
         super().__init__()
         self.dim = in_channels
+        self.gradient_checkpointing = False
         self.w_in = NerfEmbedder(in_channels, self.dim)
         self.blocks = nn.ModuleList([DeCoDecoderBlock(self.dim, cond_dim) for _ in range(depth)])
         self.out_proj = nn.Linear(self.dim, in_channels)
@@ -230,7 +231,10 @@ class DeCoPixelDecoder(nn.Module):
             c_aligned = c_aligned + t_emb.unsqueeze(1)
         h = self.w_in(x_raw, height, width)
         for block in self.blocks:
-            h = block(h, c_aligned)
+            if self.gradient_checkpointing and self.training:
+                h = torch.utils.checkpoint.checkpoint(block, h, c_aligned, use_reentrant=False)
+            else:
+                h = block(h, c_aligned)
         return self.out_proj(h)
 
 
@@ -294,6 +298,12 @@ class MAE_TokenformerDiT(nn.Module):
             self.out_proj = nn.Conv2d(self.decoder_dim, self.patchified_channels, 1)
 
         self.precompute_pos = {}
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+        if self.use_deco_decoder:
+            self.pixel_decoder.gradient_checkpointing = True
 
     def fetch_pos(self, height, width, device):
         if (height, width) not in self.precompute_pos:
@@ -370,7 +380,10 @@ class MAE_TokenformerDiT(nn.Module):
         # ---------------------------------------------------------
         x_enc = x_vis
         for blk in self.encoder_blocks:
-            x_enc = blk(x_enc, c_enc, pos_vis, attn_mask=attn_mask)
+            if self.gradient_checkpointing and self.training:
+                x_enc = torch.utils.checkpoint.checkpoint(blk, x_enc, c_enc, pos_vis, attn_mask, use_reentrant=False)
+            else:
+                x_enc = blk(x_enc, c_enc, pos_vis, attn_mask=attn_mask)
         x_enc = self.encoder_norm(x_enc)
 
         # Break off y tokens so we can properly unshuffle the image grid
@@ -414,7 +427,10 @@ class MAE_TokenformerDiT(nn.Module):
         # MAE STEP 4: Decode Full Output
         # ---------------------------------------------------------
         for blk in self.decoder_blocks:
-            x_dec = blk(x_dec, c_dec, pos_dec, attn_mask=None)  # No padding needed here
+            if self.gradient_checkpointing and self.training:
+                x_dec = torch.utils.checkpoint.checkpoint(blk, x_dec, c_dec, pos_dec, None, use_reentrant=False)
+            else:
+                x_dec = blk(x_dec, c_dec, pos_dec, attn_mask=None)
 
         c_low_freq = self.decoder_norm(x_dec)
 

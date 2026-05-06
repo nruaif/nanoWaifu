@@ -226,6 +226,10 @@ def train(config_path):
         use_deco_decoder=config['model'].get('use_deco_decoder', True)
     ).to(device=device)
 
+    if config['training'].get('gradient_checkpointing', False):
+        model.enable_gradient_checkpointing()
+        print(">>> Gradient Checkpointing Enabled")
+
 
 
     # Resume Logic
