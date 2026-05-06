@@ -224,7 +224,7 @@ def train(config_path):
         num_classes=num_classes,
         patch_size=patch_size,
         use_deco_decoder=config['model'].get('use_deco_decoder', True)
-    ).to(device=device, dtype=torch.bfloat16)
+    ).to(device=device)
 
 
 
@@ -364,15 +364,15 @@ def train(config_path):
                     out = vae.encode(v_images, return_dict=False)
                     latents = out[0] if isinstance(out, tuple) else out
                     latents = (latents - latents_mean) / latents_std
-                    inputs = latents.to(dtype=torch.bfloat16)
+                    inputs = latents.to(dtype=torch.float32)
             elif use_vae:
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     latents = vae.encode(v_images).latent_dist.mode()
-                    latents = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
-                    inputs = (latents - latents_mean) / latents_std
+                    latents = F.pixel_unshuffle(latents, 2)
+                    inputs = ((latents - latents_mean) / latents_std).to(dtype=torch.float32)
             else:
-                inputs = images.to(dtype=torch.bfloat16)
+                inputs = images.to(dtype=torch.float32)
 
             if rank == 0 and fixed_prompts is None:
                 fixed_prompts = prompts[:16]
@@ -381,52 +381,53 @@ def train(config_path):
             B, C, H, W = inputs.shape
             Hp, Wp = H // patch_size, W // patch_size
 
-            # ─── Pre-patchify inputs ────────────────────────────────────
-            inputs_patched = F.pixel_unshuffle(inputs, patch_size)  # (B, C*p^2, Hp, Wp)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # ─── Pre-patchify inputs ────────────────────────────────────
+                inputs_patched = F.pixel_unshuffle(inputs, patch_size)  # (B, C*p^2, Hp, Wp)
 
-            # Generate timestep
-            t = torch.empty((B,), device=device).uniform_(0, 1.0)
-            t_condition = t * 1000
+                # Generate timestep
+                t = torch.empty((B,), device=device).uniform_(0, 1.0)
+                t_condition = t * 1000
 
-            x0_noise = torch.randn_like(inputs_patched)
+                x0_noise = torch.randn_like(inputs_patched)
 
-            t_expand = t.view(B, 1, 1, 1)
-            xt = t_expand * inputs_patched + (1 - t_expand) * x0_noise
+                t_expand = t.view(B, 1, 1, 1)
+                xt = t_expand * inputs_patched + (1 - t_expand) * x0_noise
 
-            seq_len = Hp * Wp
-            mask_ratio = torch.normal(mean=0.75, std=0.25, size=(B,), device=device)
-            mask_ratio = torch.clamp(mask_ratio, min=0.0, max=1.0)
-            n_masked = (mask_ratio * seq_len).long()
-            mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
-            for b in range(B):
-                if n_masked[b] > 0:
-                    perm = torch.randperm(seq_len, device=device)
-                    mask[b, perm[:n_masked[b]]] = True
+                seq_len = Hp * Wp
+                mask_ratio = torch.normal(mean=0.75, std=0.25, size=(B,), device=device)
+                mask_ratio = torch.clamp(mask_ratio, min=0.0, max=1.0)
+                n_masked = (mask_ratio * seq_len).long()
+                mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+                for b in range(B):
+                    if n_masked[b] > 0:
+                        perm = torch.randperm(seq_len, device=device)
+                        mask[b, perm[:n_masked[b]]] = True
 
-            # Forward DiT on the CLEAN image (inputs_patched) to extract global context
-            t_dit = torch.zeros((B,), device=device)
+                # Forward DiT on the CLEAN image (inputs_patched) to extract global context
+                t_dit = torch.zeros((B,), device=device)
 
-            # CFG Dropout Mask
-            drop_prob = config['training'].get('class_dropout_prob', 0.1)
-            drop_mask = torch.rand(B, device=device) < drop_prob
+                # CFG Dropout Mask
+                drop_prob = config['training'].get('class_dropout_prob', 0.1)
+                drop_mask = torch.rand(B, device=device) < drop_prob
 
-            # Pass through DDP wrapper using x_noisy and t_noisy
-            x1_pred, logvar_theta = model(inputs_patched, t_dit, y=y_indices, mask=mask, drop_mask=drop_mask, x_noisy=xt, t_noisy=t_condition)
+                # Pass through DDP wrapper using x_noisy and t_noisy
+                x1_pred, logvar_theta = model(inputs_patched, t_dit, y=y_indices, mask=mask, drop_mask=drop_mask, x_noisy=xt, t_noisy=t_condition)
 
-            # Loss Calculation (in v-space / predicting x1)
-            mse_loss_raw = F.mse_loss(x1_pred, inputs_patched, reduction='none')
-            mse_loss_spatial = mse_loss_raw.mean(dim=1)
+                # Loss Calculation (in v-space / predicting x1)
+                mse_loss_raw = F.mse_loss(x1_pred, inputs_patched, reduction='none')
+                mse_loss_spatial = mse_loss_raw.mean(dim=1)
 
-            mse_loss_sg = mse_loss_spatial.detach()
-            nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
+                mse_loss_sg = mse_loss_spatial.detach()
+                nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
 
-            mse_loss_mean = mse_loss_spatial.mean()
-            nll_loss_mean = nll_loss.mean()
+                mse_loss_mean = mse_loss_spatial.mean()
+                nll_loss_mean = nll_loss.mean()
 
-            lambda_nll = config['model'].get('lambda_nll', 0.01)
-            loss = mse_loss_mean + lambda_nll * nll_loss_mean
+                lambda_nll = config['model'].get('lambda_nll', 0.01)
+                loss = mse_loss_mean + lambda_nll * nll_loss_mean
 
-            loss = loss / accum_steps
+                loss = loss / accum_steps
             loss.backward()
             loss_accum += mse_loss_mean.item()
 
@@ -456,11 +457,12 @@ def train(config_path):
                     print(f"\n[Step {global_step}] Generating validation samples (cascaded)...")
                     base_model = model.module if hasattr(model, 'module') else model
                     val_y = tag_processor.process_prompts(fixed_prompts, device)
-                    samples = base_model.sample(
-                        B=val_y.shape[0], H=256//patch_size, W=256//patch_size,
-                        device=device, maskgit_steps=4, deco_steps=20, y=val_y, cfg_scale=4.0
-                    )
-                    samples = F.pixel_shuffle(samples, patch_size)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        samples = base_model.sample(
+                            B=val_y.shape[0], H=256//patch_size, W=256//patch_size,
+                            device=device, maskgit_steps=4, deco_steps=20, y=val_y, cfg_scale=4.0
+                        )
+                    samples = F.pixel_shuffle(samples.to(dtype=torch.float32), patch_size)
 
                     if use_tiny_vae or use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
