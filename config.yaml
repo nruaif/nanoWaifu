@@ -27,10 +27,9 @@ model:
   fcdm_depth: 16
   num_heads: 12
   in_channels: 3
-  encoder_depth: 4
-  decoder_depth: 4
   lambda_nll: 0.01
   patch_size: 16
+  use_deco_decoder: true
 
 data:
   webdataset_url: '/root/nanoWaifu/data/train/00{041..080}.tar'

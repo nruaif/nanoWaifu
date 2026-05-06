@@ -1,474 +1,561 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
+from PIL import Image
 import math
-from torch.utils.checkpoint import checkpoint
-from tqdm.auto import tqdm
-import random
+import os
+from typing import Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.io as tv_io
+
+# ==========================================================
+# 1. Positional Encoding & Standard Blocks
+# ==========================================================
+def modulate(x, shift, scale):
+    return x * (1 + scale) + shift
 
 
-class MeanPoolingEmbedder(nn.Module):
-    def __init__(self, num_classes: int, dim: int, num_context_tokens: int = 4):
-        super().__init__()
-        self.num_context_tokens = num_context_tokens
-        self.embed = nn.EmbeddingBag(num_classes + 1, dim * num_context_tokens, mode='mean')
+def precompute_freqs_cis_2d(dim: int, height: int, width: int, theta: float = 10000.0):
+    y_pos = torch.arange(height, dtype=torch.float32)
+    x_pos = torch.arange(width, dtype=torch.float32)
+    y_pos, x_pos = torch.meshgrid(y_pos, x_pos, indexing="ij")
+    y_pos = y_pos.reshape(-1)
+    x_pos = x_pos.reshape(-1)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+    x_freqs = torch.outer(x_pos, freqs).float()
+    y_freqs = torch.outer(y_pos, freqs).float()
+    x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)
+    y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)
+    freqs_cis = torch.cat([x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1)
+    return freqs_cis.reshape(height * width, -1)
 
-    def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
-        x = self.embed(y_indices, y_offsets)
-        return x.view(x.shape[0], self.num_context_tokens, -1)
+
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if freqs_cis.ndim == 2:
+        freqs_cis = freqs_cis[None, :, None, :]
+    elif freqs_cis.ndim == 3:
+        freqs_cis = freqs_cis[:, :, None, :]
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6, elementwise_affine=True):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.dim = dim
-        self.elementwise_affine = elementwise_affine
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter('weight', None)
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.rms_norm(x, (self.dim,), weight=self.weight, eps=self.eps)
+        return F.rms_norm(x, (x.shape[-1],), weight=self.weight, eps=self.eps)
 
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None):
+class SwiGLU(nn.Module):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
-        hidden_features = hidden_features or in_features
-        out_features = out_features or in_features
-
-        self.fc1 = nn.Linear(in_features, hidden_features * 2)
-        self.act = nn.GELU(approximate="tanh")
-        self.dwconv = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, padding=1, groups=hidden_features)
-        self.fc2 = nn.Linear(hidden_features, out_features)
-
-        # Zero init output projection
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, x, H=None, W=None):
-        x = self.fc1(x)
-        x, gate = x.chunk(2, dim=-1)
-        x = x * self.act(gate)
-        if H is not None and W is not None:
-            B, N, C = x.shape
-            x = x.transpose(1, 2).reshape(B, C, H, W)
-            x = self.dwconv(x)
-            x = x.flatten(2).transpose(1, 2)
-        return self.fc2(x)
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-
-        # Zero init output projection
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x):
-        B, N_seq, C = x.shape
-        qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        x_att = F.scaled_dot_product_attention(q, k, v)
-        x_att = x_att.transpose(1, 2).reshape(B, N_seq, C)
-        return self.proj(x_att)
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads):
+class Attention(nn.Module):
+    def __init__(self, dim, heads):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.self_attn = SelfAttention(dim, num_heads)
-        self.norm3 = RMSNorm(dim)
-        self.mlp = Mlp(dim, dim * 4, dim)
+        self.heads = heads
+        self.head_dim = dim // heads
 
-        # Norm for context tokens before they hit the shared MLP
-        self.context_norm = RMSNorm(dim)
+        # Q is 2x size, K and V are 1x size
+        self.qkv = nn.Linear(dim, dim * 4, bias=False)
+        self.lambda_proj = nn.Linear(dim, heads, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x, H, W, context=None, shared_context_mlp=None):
+    def forward(self, x, pos, attn_mask=None):
         B, N, C = x.shape
 
-        # 1. Sequence Assembly for Attention
-        num_context_tokens = 0
-        if context is not None:
-            x_seq = torch.cat([context, x], dim=1)
-            num_context_tokens = context.shape[1]
-        else:
-            x_seq = x
+        # 1. Project to Q, K, V
+        qkv = self.qkv(x)
+        q, k, v = qkv.split([C * 2, C, C], dim=-1)
 
-        # 2. Joint Self-Attention
-        x_norm1 = self.norm1(x_seq)
-        attn_out = self.self_attn(x_norm1)
-        x_seq = x_seq + attn_out
+        # q has 2 * heads
+        q = q.reshape(B, N, 2 * self.heads, self.head_dim)
+        k = k.reshape(B, N, self.heads, self.head_dim)
+        v = v.reshape(B, N, self.heads, self.head_dim)
 
-        # 3. SPLIT the sequence BEFORE the small MLP
-        if context is not None:
-            context_attn = x_seq[:, :num_context_tokens, :]
-            x_attn = x_seq[:, num_context_tokens:, :]
-        else:
-            x_attn = x_seq
-            context_attn = None
+        # 2. Apply RoPE
+        q, k = apply_rotary_emb(q, k, freqs_cis=pos)
 
-        # 4. Image tokens process through block's small MLP (with DW conv)
-        x_out = x_attn + self.mlp(self.norm3(x_attn), H, W)
+        # Transpose for attention: (Batch, Heads, SeqLen, HeadDim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # 5. Context tokens bypass small MLP, process through Shared Large MLP
-        if context_attn is not None and shared_context_mlp is not None:
-            c_normed = self.context_norm(context_attn)
-            c_flat = c_normed.view(B, -1)  # (B, num_context_tokens * dim)
-            c_processed = shared_context_mlp(c_flat)  # (B, num_context_tokens * dim)
-            c_reshaped = c_processed.view(B, num_context_tokens, C)
-            context_out = context_attn + c_reshaped
-        else:
-            context_out = context_attn
+        # 3. Handle GQA broadcasting for PyTorch SDPA
+        # (If using the official `flash_attn_func` from Dao-AILab, you don't need this repeat,
+        # but PyTorch's native F.scaled_dot_product_attention requires broadcastable shapes).
+        # We interleave K and V so head 0 and 1 of Q share head 0 of K/V.
+        k = k.repeat_interleave(2, dim=1)
+        v = v.repeat_interleave(2, dim=1)
 
-        return x_out, context_out
+        # 4. A SINGLE ATTENTION CALL
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
+        # 5. Split post-attention (Even heads = attn1, Odd heads = attn2)
+        attn1 = attn[:, 0::2]
+        attn2 = attn[:, 1::2]
+
+        # 6. Calculate Differential Scalar λ
+        lambda_ = torch.sigmoid(self.lambda_proj(x))  # (B, N, heads)
+        lambda_ = lambda_.transpose(1, 2).unsqueeze(-1)  # (B, heads, N, 1)
+
+        # 7. Differential Subtraction
+        diff_out = attn1 - lambda_ * attn2
+
+        # 8. Final Output Projection
+        diff_out = diff_out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(diff_out)
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.norm1 = RMSNorm(dim)
+        self.attn = Attention(dim, heads)
+        self.norm2 = RMSNorm(dim)
+        hidden_dim = int(2 * (dim * 4) / 3)
+        self.mlp = SwiGLU(dim, hidden_dim)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+
+    def forward(self, x, c, pos, attn_mask=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa.unsqueeze(1), scale_msa.unsqueeze(1)), pos, attn_mask=attn_mask)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp.unsqueeze(1), scale_mlp.unsqueeze(1)))
+        return x
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        self.hidden_dim = hidden_dim
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
+        args = t[..., None].float() * freqs[None, ...]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2: embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
 
     def forward(self, t):
-        t = t * 1000.0
-        half_dim = self.hidden_dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-        if t.dim() == 1:
-            emb = t.float()[:, None] * emb[None, :]
-            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
-            return self.mlp(emb)
-        elif t.dim() == 2:
-            emb = t.float().unsqueeze(-1) * emb.view(1, 1, -1)
-            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1).to(self.mlp[0].weight.dtype)
-            return self.mlp(emb)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
 
 
-class TokenformerDiT(nn.Module):
-    """
-    DiT architecture with pixel-shuffle downsampling in the middle blocks.
-    Takes pre-patchified input (B, C*p^2, Hp, Wp).
-    Conditions via concatenated tokens in self-attention.
-    Utilizes a Shared MLP for context tokens to build global representations.
-    """
-
-    def __init__(self, in_channels=3, dim=768, depth=12, num_heads=12,
-                 num_classes=12476, use_checkpoint=False, num_context_tokens=6,
-                 encoder_depth=2, decoder_depth=2, patch_size=16, **kwargs):
+# ==========================================================
+# 2. DeCo Pixel Decoder (Predicts x1)
+# ==========================================================
+class DeCoDecoderBlock(nn.Module):
+    def __init__(self, dim, cond_dim):
         super().__init__()
-        self.dim = dim
-        self.use_checkpoint = use_checkpoint
-        self.in_channels = in_channels
-        self.patch_size = patch_size
-        self.num_context_tokens = num_context_tokens
-
-        # Input: pre-patchified (B, C*p^2, Hp, Wp)
-        patchified_channels = in_channels * patch_size * patch_size
-        self.patchified_channels = patchified_channels
-
-        self.patch_embed_conv = nn.Conv2d(patchified_channels, dim, kernel_size=3, padding=1)
-
-        self.t_embedder = TimestepEmbedder(dim)
-        self.y_embedder = MeanPoolingEmbedder(num_classes, dim, num_context_tokens)
-
-        # Global shared MLP for context tokens across all layers
-        self.shared_context_mlp = Mlp(
-            in_features=dim * num_context_tokens,
-            hidden_features=dim * num_context_tokens * 3,
-            out_features=dim * num_context_tokens
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.Linear(cond_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, 3 * dim, bias=True)
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 4 * dim, bias=True), nn.SiLU(), nn.Linear(4 * dim, dim, bias=True)
         )
 
-        self.num_encoder_blocks = encoder_depth
-        self.num_decoder_blocks = decoder_depth
-        self.num_middle_blocks = depth - self.num_encoder_blocks - self.num_decoder_blocks
-
-        self.encoder_blocks = nn.ModuleList([TransformerBlock(dim, num_heads) for _ in range(self.num_encoder_blocks)])
-        self.middle_blocks = nn.ModuleList([TransformerBlock(dim, num_heads) for _ in range(self.num_middle_blocks)])
-        self.decoder_blocks = nn.ModuleList([TransformerBlock(dim, num_heads) for _ in range(self.num_decoder_blocks)])
-
-        # Pixel-shuffle downsampling/upsampling (factor 2) around middle blocks
-        self.downsample_proj = nn.Linear(dim * 4, dim)
-        self.upsample_proj = nn.Linear(dim, dim * 4)
-
-        # Skip connection fusion (encoder → decoder)
-        self.fusion = nn.Linear(dim * 2, dim)
-
-        self.final_norm = RMSNorm(dim)
-        # Conv2d with kernel 3 to project back to patchified pixel space + logvar
-        self.final_proj = nn.Conv2d(dim, patchified_channels + 1, kernel_size=3, padding=1)
+    def forward(self, h, c_aligned):
+        alpha, beta, gamma = self.adaLN_modulation(F.silu(c_aligned)).chunk(3, dim=-1)
+        h_norm = self.norm(h)
+        h_modulated = h_norm * gamma + beta
+        h_out = self.mlp(h_modulated)
+        return h + alpha * h_out
 
 
-    def forward(self, x_in, t, y_indices, y_offsets=None):
-        """
-        Args:
-            x_in: Pre-patchified input (B, C*p^2, Hp, Wp)
-            t: Timesteps - scalar (B,) or block-level (B, 1, Hp, Wp)
-            y_indices: Tag indices for conditioning
-            y_offsets: Offsets for EmbeddingBag
-        Returns:
-            u_pred: Predicted x0 in patchified space (B, C*p^2, Hp, Wp)
-            logvar_theta: Log-variance at block level (B, 1, Hp, Wp)
-        """
-        B, _, Hp, Wp = x_in.shape
-        N = Hp * Wp
+class NerfEmbedder(nn.Module):
+    def __init__(self, in_channels, hidden_size_input, max_freqs=8):
+        super().__init__()
+        self.max_freqs = max_freqs
+        self.embedder = nn.Sequential(nn.Linear(in_channels + max_freqs ** 2, hidden_size_input, bias=True))
+        self.precompute_pos = {}
 
-        x_in = self.patch_embed_conv(x_in)
-        x = x_in.flatten(2).transpose(1, 2)  # (B, N, dim)
+    def fetch_pos(self, height, width, device, dtype):
+        if (height, width) not in self.precompute_pos:
+            pos_y = torch.linspace(0, 1, height, device=device, dtype=dtype)
+            pos_x = torch.linspace(0, 1, width, device=device, dtype=dtype)
+            pos_y, pos_x = torch.meshgrid(pos_y, pos_x, indexing="ij")
+            pos_x, pos_y = pos_x.reshape(-1, 1, 1), pos_y.reshape(-1, 1, 1)
+            freqs = torch.linspace(0, self.max_freqs, self.max_freqs, dtype=dtype, device=device)
+            freqs_x, freqs_y = freqs[None, :, None], freqs[None, None, :]
+            coeffs = (1 + freqs_x * freqs_y) ** -1
+            dct_x, dct_y = torch.cos(pos_x * freqs_x * torch.pi), torch.cos(pos_y * freqs_y * torch.pi)
+            dct = (dct_x * dct_y * coeffs).view(1, -1, self.max_freqs ** 2)
+            self.precompute_pos[(height, width)] = dct
+        return self.precompute_pos[(height, width)].to(device)
 
-        # Timestep embedding
-        if t.dim() == 1:
-            t_flat = t.unsqueeze(1).expand(-1, N)
-        elif t.dim() == 4:
-            # (B, 1, Hp, Wp) → (B, Hp*Wp)
-            t_flat = t.flatten(1)
+    def forward(self, inputs, height, width):
+        B, L, C = inputs.shape
+        dct = self.fetch_pos(height, width, inputs.device, inputs.dtype).expand(B, -1, -1)
+        return self.embedder(torch.cat([inputs, dct], dim=-1))
+
+
+class DeCoPixelDecoder(nn.Module):
+    def __init__(self, in_channels, depth=3, cond_dim=1024):
+        super().__init__()
+        self.dim = in_channels
+        self.w_in = NerfEmbedder(in_channels, self.dim)
+        self.blocks = nn.ModuleList([DeCoDecoderBlock(self.dim, cond_dim) for _ in range(depth)])
+        self.out_proj = nn.Linear(self.dim, in_channels)
+
+    def forward(self, x_raw, c_low_freq, height, width, t_emb=None):
+        c_aligned = c_low_freq
+        if t_emb is not None:
+            c_aligned = c_aligned + t_emb.unsqueeze(1)
+        h = self.w_in(x_raw, height, width)
+        for block in self.blocks:
+            h = block(h, c_aligned)
+        return self.out_proj(h)
+
+
+# ==========================================================
+# 3. MAE TokenformerDiT Architecture
+# ==========================================================
+class MAE_TokenformerDiT(nn.Module):
+    def __init__(
+            self, in_channels=3, base_channels=1024, num_blocks=24, heads=16,
+            patch_size=16, num_classes=1000, use_deco_decoder=False,
+            cond_drop_prob=0.1, **kwargs
+    ):
+        super().__init__()
+
+        # Architecture parameters (MAE Asymmetric Scaling)
+        self.encoder_dim = kwargs.get('dim', base_channels)
+        self.encoder_depth = kwargs.get('depth', num_blocks)
+
+        self.decoder_dim = self.encoder_dim // 2
+        self.decoder_depth = max(1, self.encoder_depth // 2)
+        dec_heads = max(1, heads // 2)
+
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.patchified_channels = in_channels * patch_size * patch_size
+        self.use_deco_decoder = use_deco_decoder
+        self.cond_drop_prob = cond_drop_prob
+
+        # Embeddings
+        self.input_proj = nn.Conv2d(self.patchified_channels, self.encoder_dim, 1)
+        self.t_embedder = TimestepEmbedder(self.encoder_dim)
+
+        if num_classes > 0:
+            self.num_classes = num_classes
+            self.y_embedder = nn.Embedding(num_classes, self.encoder_dim)
+            self.y_proj = nn.Linear(num_classes, self.encoder_dim)
+            self.null_y_token = nn.Parameter(torch.normal(0, 0.02, size=(1, 1, self.encoder_dim)))
         else:
-            t_flat = t
-        t_embeds = self.t_embedder(t_flat)
-        x = x + t_embeds
+            self.y_embedder = self.y_proj = self.null_y_token = None
 
-        # Class conditioning tokens
-        y_tokens = self.y_embedder(y_indices, y_offsets)
-        context = y_tokens
+        # --- ENCODER --- (Only processes visible tokens)
+        self.encoder_blocks = nn.ModuleList([DiTBlock(self.encoder_dim, heads) for _ in range(self.encoder_depth)])
+        self.encoder_norm = RMSNorm(self.encoder_dim)
 
-        # ─── Encoder blocks (full resolution: Hp × Wp) ─────────────────
-        for block in self.encoder_blocks:
-            if self.use_checkpoint and self.training:
-                x, context = checkpoint(block, x, Hp, Wp, context, self.shared_context_mlp,
-                                        use_reentrant=False)
-            else:
-                x, context = block(x, Hp, Wp, context, self.shared_context_mlp)
+        # --- TRANSITION ---
+        self.enc_to_dec = nn.Linear(self.encoder_dim, self.decoder_dim)
+        self.c_enc_to_dec = nn.Linear(self.encoder_dim, self.decoder_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.decoder_dim))
 
-        f_t = x  # Save encoder output for skip connection
+        # --- DECODER --- (Processes visible + mask tokens)
+        self.decoder_blocks = nn.ModuleList([DiTBlock(self.decoder_dim, dec_heads) for _ in range(self.decoder_depth)])
+        self.decoder_norm = RMSNorm(self.decoder_dim)
 
-        # ─── Downsample via pixel_unshuffle(2) ──────────────────────────
-        # (B, N, dim) → (B, dim, Hp, Wp) → unshuffle → (B, dim*4, Hp/2, Wp/2) → proj → (B, dim, Hp/2, Wp/2)
-        x_spatial = x.transpose(1, 2).reshape(B, self.dim, Hp, Wp)
-        x_down = F.pixel_unshuffle(x_spatial, 2)  # (B, dim*4, Hp/2, Wp/2)
-        Hp_mid, Wp_mid = Hp // 2, Wp // 2
-        x_middle = x_down.flatten(2).transpose(1, 2)  # (B, Hp/2*Wp/2, dim*4)
-        x_middle = self.downsample_proj(x_middle)  # (B, Hp/2*Wp/2, dim)
+        self.conf_proj = nn.Linear(self.decoder_dim, 1) if self.use_deco_decoder else nn.Conv2d(self.decoder_dim, 1, 1)
 
-        # ─── Middle blocks (half resolution: Hp/2 × Wp/2) ──────────────
-        for block in self.middle_blocks:
-            if self.use_checkpoint and self.training:
-                x_middle, context = checkpoint(block, x_middle, Hp_mid, Wp_mid, context, self.shared_context_mlp,
-                                               use_reentrant=False)
-            else:
-                x_middle, context = block(x_middle, Hp_mid, Wp_mid, context, self.shared_context_mlp)
-
-        # ─── Upsample via pixel_shuffle(2) ──────────────────────────────
-        # (B, Hp/2*Wp/2, dim) → proj → (B, Hp/2*Wp/2, dim*4) → (B, dim*4, Hp/2, Wp/2) → shuffle → (B, dim, Hp, Wp)
-        x_up = self.upsample_proj(x_middle)  # (B, Hp/2*Wp/2, dim*4)
-        x_up = x_up.transpose(1, 2).reshape(B, self.dim * 4, Hp_mid, Wp_mid)
-        x_up = F.pixel_shuffle(x_up, 2)  # (B, dim, Hp, Wp)
-        g = x_up.flatten(2).transpose(1, 2)  # (B, N, dim)
-
-        # ─── Fusion (skip connection) ───────────────────────────────────
-        h_t = self.fusion(torch.cat([f_t, g], dim=-1))
-
-        # ─── Decoder blocks (full resolution: Hp × Wp) ─────────────────
-        for block in self.decoder_blocks:
-            if self.use_checkpoint and self.training:
-                h_t, context = checkpoint(block, h_t, Hp, Wp, context, self.shared_context_mlp,
-                                          use_reentrant=False)
-            else:
-                h_t, context = block(h_t, Hp, Wp, context, self.shared_context_mlp)
-
-        # ─── Final projection via Conv2d ────────────────────────────────
-        x_norm = self.final_norm(h_t)
-        x_spatial = x_norm.transpose(1, 2).reshape(B, self.dim, Hp, Wp)
-        x_out = self.final_proj(x_spatial)  # (B, C*p^2 + 1, Hp, Wp)
-
-        x0_pred = x_out[:, :self.patchified_channels, :, :]
-        logvar_theta = x_out[:, self.patchified_channels:, :, :]
-
-        return x0_pred, logvar_theta
-
-
-class TagProcessor:
-    def __init__(self, tags_file):
-        with open(tags_file, 'r', encoding='utf-8') as f:
-            self.tags = [line.strip() for line in f if line.strip()]
-        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
-        self.num_classes = len(self.tags)
-
-    def process_prompts(self, prompts, device, dropout_prob=0.0):
-        indices = []
-        offsets = [0]
-        for p in prompts:
-            if random.random() < dropout_prob:
-                indices.append(self.num_classes)
-            else:
-                tags = p.split()
-                count = 0
-                for t in tags:
-                    if t in self.tag_to_idx:
-                        indices.append(self.tag_to_idx[t])
-                        count += 1
-                if count == 0:
-                    indices.append(self.num_classes)
-            offsets.append(len(indices))
-
-        indices = torch.tensor(indices, dtype=torch.long, device=device)
-        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
-        return indices, offsets
-
-
-@torch.no_grad()
-def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
-                steps=50, guidance_scale=2, noise=None, cfg_scale=0,
-                sampler_type="euler", p_percentile=0.4, alpha=2.0):
-    """
-    Sampling operates in patchified space.
-    latent_size: pixel-level (H, W) or int. Will be converted to patch-level internally.
-    Returns: pixel-level output (B, C, H, W) after pixel_shuffle.
-    """
-    m = model.module if hasattr(model, 'module') else model
-    in_channels = m.in_channels
-    patch_size = m.patch_size
-    patchified_channels = m.patchified_channels
-
-    model.eval()
-    if isinstance(latent_size, (tuple, list)):
-        H, W = latent_size
-    else:
-        H = W = latent_size
-
-    Hp, Wp = H // patch_size, W // patch_size
-
-    # Work in patchified space: (B, C*p^2, Hp, Wp)
-    if noise is not None:
-        if isinstance(noise, list):
-            x = torch.stack([n.to(device) for n in noise[:batch_size]])
+        if self.use_deco_decoder:
+            self.pixel_decoder = DeCoPixelDecoder(in_channels=self.patchified_channels, depth=3,
+                                                  cond_dim=self.decoder_dim)
         else:
-            x = noise.clone().to(device)
-    else:
-        x = torch.randn(batch_size, patchified_channels, Hp, Wp, device=device)
+            self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(self.decoder_dim, 2 * self.decoder_dim, bias=True))
+            self.out_proj = nn.Conv2d(self.decoder_dim, self.patchified_channels, 1)
 
-    y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
-    null_prompts = [""] * batch_size
-    y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
+        self.precompute_pos = {}
 
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-    x = x.to(torch.bfloat16)
-    for i in tqdm(range(steps)):
-        t_curr = ts[i]
-        t_next = ts[i + 1]
-        dt = t_next - t_curr
+    def fetch_pos(self, height, width, device):
+        if (height, width) not in self.precompute_pos:
+            # RoPE head dim is consistent across encoder and decoder
+            # (encoder_dim // heads == decoder_dim // dec_heads)
+            pos = precompute_freqs_cis_2d(self.encoder_dim // self.encoder_blocks[0].attn.heads, height, width).to(
+                device)
+            self.precompute_pos[(height, width)] = pos
+        return self.precompute_pos[(height, width)].to(device)
 
-        t_vec = torch.full((batch_size, Hp * Wp), t_curr.item(), device=device, dtype=x.dtype)
-        t_safe = max(t_curr.item(), 0.05)
+    def forward_dit(self, x, t, y=None, mask=None, drop_mask=None):
+        B, C, H, W = x.shape
+        x = self.input_proj(x).flatten(2).transpose(1, 2)
+        pos = self.fetch_pos(H, W, x.device)
 
-        if sampler_type == "euler":
-            x0_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
-            v_cond = (x - x0_cond) / t_safe
+        t_emb = self.t_embedder(t)
+        c_enc = t_emb
 
-            x0_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets)
-            v_uncond = (x - x0_uncond) / t_safe
+        if mask is None:
+            mask = torch.zeros(B, x.shape[1], dtype=torch.bool, device=x.device)
 
-            v = v_uncond + guidance_scale * (v_cond - v_uncond)
-            x = x + dt * v
+        # ---------------------------------------------------------
+        # MAE STEP 1: Shuffle & Extract Visible Tokens
+        # ---------------------------------------------------------
+        ids_shuffle = torch.argsort(mask.int(), dim=1)  # False(0) comes first, True(1) masked last
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        elif sampler_type == "look-ahead":
-            x0_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
-            v_cond = (x - x0_cond) / t_safe
+        # Gather standard features based on mask sort order
+        x_shuffled = torch.gather(x, dim=1, index=ids_shuffle.unsqueeze(-1).expand(-1, -1, self.encoder_dim))
+        pos_b = pos.unsqueeze(0).expand(B, -1, -1)
+        pos_shuffled = torch.gather(pos_b, dim=1, index=ids_shuffle.unsqueeze(-1).expand(-1, -1, pos.shape[-1]))
+        mask_shuffled = torch.gather(mask, dim=1, index=ids_shuffle)
 
-            x0_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets)
-            v_uncond = (x - x0_uncond) / t_safe
+        # To handle variable masked sequences in a batch, we pad to the max visible length
+        L_vis_max = (~mask).sum(dim=1).max().item()
+        L_vis_max = max(1, L_vis_max)  # Fallback if sequence is entirely masked
 
-            v = v_uncond + guidance_scale * (v_cond - v_uncond)
+        x_vis = x_shuffled[:, :L_vis_max, :]
+        pos_vis = pos_shuffled[:, :L_vis_max, :]
+        enc_pad_mask = mask_shuffled[:, :L_vis_max]  # True means it is padding (was actually a mask token)
 
-            uc = logvar_cond
-            uc_flat = uc.view(batch_size, -1)
-            tau_p = torch.quantile(uc_flat.float(), p_percentile, dim=1, keepdim=True).to(x.dtype)
-            tau_p = tau_p.view(batch_size, 1, 1, 1)
+        # Class Conditioning Handle
+        num_y_tokens = 0
+        if y is not None and self.y_embedder is not None:
+            y_seq = self.y_embedder(y) if y.dtype in [torch.int, torch.int32, torch.long, torch.int64] else self.y_proj(
+                y.float()).unsqueeze(1)
+            if y_seq.ndim == 2: y_seq = y_seq.unsqueeze(1)
+            num_y_tokens = y_seq.shape[1]
 
-            M_conf = (uc <= tau_p).to(x.dtype)
-            M_unc = 1.0 - M_conf
+            if drop_mask is None and self.training and self.cond_drop_prob > 0:
+                drop_mask = torch.rand(B, device=x.device) < self.cond_drop_prob
+            if drop_mask is not None and drop_mask.any():
+                num_dropped = drop_mask.sum().item()
+                y_seq[drop_mask] = self.null_y_token.expand(num_dropped, num_y_tokens, -1)
 
-            t_ctx_val = max(t_curr.item() + alpha * dt.item(), 0.0)
+            # Prepend class tokens and position padding to visible seq
+            x_vis = torch.cat([y_seq, x_vis], dim=1)
+            pos_pad = torch.ones((B, num_y_tokens, pos_vis.shape[-1]), dtype=pos_vis.dtype, device=pos_vis.device)
+            pos_vis = torch.cat([pos_pad, pos_vis], dim=1)
 
-            x_ctx = x + (t_ctx_val - t_curr.item()) * v
-            x_tilde = M_conf * x_ctx + M_unc * x
+            # y tokens are always valid, so padding mask is False
+            y_pad_mask = torch.zeros((B, num_y_tokens), dtype=torch.bool, device=x.device)
+            enc_pad_mask = torch.cat([y_pad_mask, enc_pad_mask], dim=1)
 
-            t_tilde_vec = M_conf.view(batch_size, -1) * t_ctx_val + M_unc.view(batch_size, -1) * t_curr.item()
-            t_tilde_safe = t_tilde_vec.clamp(min=0.05).view(batch_size, 1, Hp, Wp)
+        # Create precise attention mask for F.scaled_dot_product_attention
+        # (SDPA uses True to Allow, False to Block)
+        if enc_pad_mask.any():
+            attn_mask = (~enc_pad_mask).unsqueeze(1).unsqueeze(2)  # Shape: (B, 1, 1, Seq)
+        else:
+            attn_mask = None
 
-            x0_ctx_cond, _ = model(x_tilde, t_tilde_vec, y_indices, y_offsets)
-            v_ctx_cond = (x_tilde - x0_ctx_cond) / t_tilde_safe
+        # ---------------------------------------------------------
+        # MAE STEP 2: Encode Visible
+        # ---------------------------------------------------------
+        x_enc = x_vis
+        for blk in self.encoder_blocks:
+            x_enc = blk(x_enc, c_enc, pos_vis, attn_mask=attn_mask)
+        x_enc = self.encoder_norm(x_enc)
 
-            x0_ctx_uncond, _ = model(x_tilde, t_tilde_vec, y_null_indices, y_null_offsets)
-            v_ctx_uncond = (x_tilde - x0_ctx_uncond) / t_tilde_safe
+        # Break off y tokens so we can properly unshuffle the image grid
+        if num_y_tokens > 0:
+            y_enc = x_enc[:, :num_y_tokens, :]
+            x_enc_patches = x_enc[:, num_y_tokens:, :]
+        else:
+            x_enc_patches = x_enc
 
-            v_ctx = v_ctx_uncond + guidance_scale * (v_ctx_cond - v_ctx_uncond)
+        # ---------------------------------------------------------
+        # MAE STEP 3: Transition & Reconstruct Grid
+        # ---------------------------------------------------------
+        x_dec_vis = self.enc_to_dec(x_enc_patches)
+        c_dec = self.c_enc_to_dec(c_enc)
 
-            v_final = M_unc * v_ctx + M_conf * v
-            x = x + dt * v_final
+        B, L = mask.shape
+        x_dec_full_shuffled = self.mask_token.expand(B, L, -1).clone()
 
-    # Unpatchify back to pixel space
-    x_pixel = F.pixel_shuffle(x, patch_size)  # (B, C, H, W)
+        # Scatter the encoded visible patches into the correct (still sorted) slots
+        valid_vis_mask = (~mask_shuffled[:, :L_vis_max]).unsqueeze(-1)
+        x_dec_full_shuffled[:, :L_vis_max, :] = torch.where(
+            valid_vis_mask,
+            x_dec_vis,
+            x_dec_full_shuffled[:, :L_vis_max, :]
+        )
 
-    model.train()
-    return x_pixel
+        # Unshuffle tokens to their true original layout
+        x_dec = torch.gather(x_dec_full_shuffled, dim=1,
+                             index=ids_restore.unsqueeze(-1).expand(-1, -1, self.decoder_dim))
 
+        # Re-attach y tokens for the decoder and reset full positional embedding
+        if num_y_tokens > 0:
+            y_dec = self.enc_to_dec(y_enc)
+            x_dec = torch.cat([y_dec, x_dec], dim=1)
+            pos_pad_dec = torch.ones((B, num_y_tokens, pos.shape[-1]), dtype=pos.dtype, device=pos.device)
+            pos_dec = torch.cat([pos_pad_dec, pos_b], dim=1)
+        else:
+            pos_dec = pos_b
 
-if __name__ == "__main__":
-    print("Initializing DiT on CPU...")
-    device = torch.device("cpu")
+        # ---------------------------------------------------------
+        # MAE STEP 4: Decode Full Output
+        # ---------------------------------------------------------
+        for blk in self.decoder_blocks:
+            x_dec = blk(x_dec, c_dec, pos_dec, attn_mask=None)  # No padding needed here
 
-    model = TokenformerDiT(
-        in_channels=3,
-        dim=768,
-        depth=16,
-        num_heads=12,
-        num_classes=12476,
-        num_context_tokens=3,
-        patch_size=16
-    ).to(device)
+        c_low_freq = self.decoder_norm(x_dec)
 
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model Parameters: {num_params / 1e6:.2f} M")
+        if num_y_tokens > 0:
+            c_low_freq = c_low_freq[:, num_y_tokens:, :]
 
-    batch_size = 2
-    patch_size = 16
-    Hp, Wp = 16, 16  # 256/16
+        if self.use_deco_decoder:
+            conf = self.conf_proj(c_low_freq).squeeze(-1)
+        else:
+            shift, scale = self.final_adaLN(c_dec).chunk(2, dim=-1)
+            x_mod = modulate(c_low_freq, shift.unsqueeze(1), scale.unsqueeze(1))
+            x_spatial = x_mod.transpose(1, 2).reshape(B, -1, H, W)
+            conf = self.conf_proj(x_spatial).squeeze(1)
 
-    # Pre-patchified input
-    x_in = torch.randn(batch_size, 3 * patch_size * patch_size, Hp, Wp, device=device)
-    t = torch.rand(batch_size, device=device)
+        return c_low_freq, conf, c_dec
 
-    y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
-    y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
+    def forward(self, x, t, y=None, mask=None, drop_mask=None, x_noisy=None, t_noisy=None):
+        B, C, H, W = x.shape
+        
+        if x_noisy is None:
+            x_noisy = x
+        x_raw = x_noisy.flatten(2).transpose(1, 2)
 
-    print("\nRunning forward pass (training)...")
-    model.train()
-    x0_pred, logvar = model(x_in, t, y_indices, y_offsets)
+        c_low_freq, conf, c_dec = self.forward_dit(x, t, y, mask, drop_mask=drop_mask)
 
-    print(f"Input shape:  {x_in.shape}")
-    print(f"Output x0_pred shape: {x0_pred.shape}")
-    print(f"Output logvar shape: {logvar.shape}")
+        if self.use_deco_decoder:
+            if t_noisy is not None:
+                t_emb = self.t_embedder(t_noisy)
+                t_emb_dec = self.c_enc_to_dec(t_emb)
+            else:
+                t_emb_dec = c_dec
+                
+            x1_pred = self.pixel_decoder(x_raw, c_low_freq, H, W, t_emb=t_emb_dec)
+            return x1_pred.transpose(1, 2).reshape(B, -1, H, W), conf.reshape(B, H, W)
+        else:
+            shift, scale = self.final_adaLN(c_dec).chunk(2, dim=-1)
+            x_mod = modulate(c_low_freq, shift.unsqueeze(1), scale.unsqueeze(1)).transpose(1, 2).reshape(B, -1, H, W)
+            return self.out_proj(x_mod), conf
 
-    # Unpatchify
-    x_pixel = F.pixel_shuffle(x0_pred, patch_size)
-    print(f"Unpatchified output: {x_pixel.shape}")
+    def forward_with_cfg(self, x, t, y, cfg_scale, mask=None):
+        x_in = x.repeat(2, 1, 1, 1)
+        t_in = t.repeat(2)
+        y_in = y.repeat(2, 1) if y.ndim > 1 else y.repeat(2)
+        mask_in = mask.repeat(2, 1) if mask else None
 
-    print("✅ Forward pass completed successfully!")
+        B = x.shape[0]
+        drop_mask = torch.cat([
+            torch.zeros(B, dtype=torch.bool, device=x.device),
+            torch.ones(B, dtype=torch.bool, device=x.device)
+        ], dim=0)
+
+        out, conf = self.forward(x_in, t_in, y=y_in, mask=mask_in, drop_mask=drop_mask)
+
+        out_cond, out_uncond = out.chunk(2, dim=0)
+        conf_cond, conf_uncond = conf.chunk(2, dim=0)
+
+        out_cfg = out_uncond + cfg_scale * (out_cond - out_uncond)
+        conf_cfg = conf_uncond + cfg_scale * (conf_cond - conf_uncond)
+
+        return out_cfg, conf_cfg
+
+    @torch.no_grad()
+    def sample(self, B, H, W, device, maskgit_steps=10, deco_steps=50, y=None, cfg_scale=4.0):
+        assert self.use_deco_decoder, "Cascaded sampling requires DeCo Decoder enabled."
+
+        do_cfg = cfg_scale > 1.0 and y is not None
+
+        canvas_flat = torch.zeros(B, H * W, self.patchified_channels, device=device)
+        mask = torch.ones(B, H * W, dtype=torch.bool, device=device)
+        seq_len = H * W
+        t_dit = torch.zeros(B, device=device)
+
+        for i in range(maskgit_steps):
+            canvas_spatial = canvas_flat.transpose(1, 2).reshape(B, -1, H, W)
+
+            if do_cfg:
+                canvas_in = canvas_spatial.repeat(2, 1, 1, 1)
+                t_in = t_dit.repeat(2)
+                mask_in = mask.repeat(2, 1)
+                y_in = y.repeat(2, 1) if y.ndim > 1 else y.repeat(2)
+
+                drop_mask = torch.cat([torch.zeros(B, dtype=torch.bool, device=device),
+                                       torch.ones(B, dtype=torch.bool, device=device)], dim=0)
+
+                c_low_both, conf_both, _ = self.forward_dit(canvas_in, t_in, y=y_in, mask=mask_in, drop_mask=drop_mask)
+                c_low_cond, c_low_uncond = c_low_both.chunk(2, dim=0)
+                conf_cond, conf_uncond = conf_both.chunk(2, dim=0)
+
+                conf = conf_uncond + cfg_scale * (conf_cond - conf_uncond)
+            else:
+                c_low_freq, conf, _ = self.forward_dit(canvas_spatial, t_dit, y=y, mask=mask)
+                c_low_cond = c_low_freq
+
+            ratio = math.cos(((i + 1) / maskgit_steps) * (math.pi / 2))
+            n_masked = int(ratio * seq_len)
+
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(conf) + 1e-9) + 1e-9)
+            scores = conf + 0.1 * gumbel_noise
+
+            scores = torch.where(mask, scores, torch.full_like(scores, -float('inf')))
+            _, sorted_indices = torch.sort(scores, dim=-1, descending=True)
+
+            new_mask = torch.zeros_like(mask)
+            if n_masked > 0:
+                new_mask.scatter_(1, sorted_indices[:, :n_masked], True)
+
+            just_unmasked = mask & (~new_mask)
+
+            if just_unmasked.any():
+                noise = torch.randn_like(canvas_flat)
+                just_unmasked_expanded = just_unmasked.unsqueeze(-1)
+                active_x_raw = torch.where(just_unmasked_expanded, noise, canvas_flat)
+
+                dt = 1.0 / deco_steps
+                for step in range(deco_steps):
+                    t_val = step * dt
+                    t_deco = torch.full((B,), t_val, device=device)
+                    # Project condition embedding to decoder logic
+                    t_emb_deco = self.c_enc_to_dec(self.t_embedder(t_deco * 1000))
+
+                    if do_cfg:
+                        x_in = active_x_raw.repeat(2, 1, 1)
+                        c_in = torch.cat([c_low_cond, c_low_uncond], dim=0)
+                        t_emb_in = t_emb_deco.repeat(2, 1)
+
+                        x1_pred_both = self.pixel_decoder(x_in, c_in, H, W, t_emb=t_emb_in)
+                        x1_cond, x1_uncond = x1_pred_both.chunk(2, dim=0)
+
+                        x1_pred = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
+                    else:
+                        x1_pred = self.pixel_decoder(active_x_raw, c_low_cond, H, W, t_emb=t_emb_deco)
+
+                    denom = max(1.0 - t_val, 1e-5)
+                    v_pred = (x1_pred - active_x_raw) / denom
+
+                    active_x_raw = torch.where(just_unmasked_expanded, active_x_raw + v_pred * dt, active_x_raw)
+
+                canvas_flat = torch.where(just_unmasked_expanded, active_x_raw, canvas_flat)
+
+            mask = new_mask
+            if n_masked == 0:
+                break
+
+        return canvas_flat.transpose(1, 2).reshape(B, -1, H, W)

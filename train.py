@@ -14,8 +14,29 @@ import torch.nn.functional as F
 from huggingface_hub import upload_file
 import threading
 
-# Using Look-ahead by default for eval
-from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
+from model_dit import MAE_TokenformerDiT as ModelClass
+
+class TagProcessor:
+    def __init__(self, tags_file, max_tags=16):
+        with open(tags_file, 'r', encoding='utf-8') as f:
+            self.tags = [line.strip() for line in f if line.strip()]
+        self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
+        self.pad_idx = len(self.tags)
+        self.num_classes = len(self.tags) + 1
+        self.max_tags = max_tags
+
+    def process_prompts(self, prompts, device):
+        batch_indices = []
+        for p in prompts:
+            tags = p.split()
+            indices = []
+            for t in tags:
+                if t in self.tag_to_idx:
+                    indices.append(self.tag_to_idx[t])
+            indices = indices[:self.max_tags]
+            indices += [self.pad_idx] * (self.max_tags - len(indices))
+            batch_indices.append(indices)
+        return torch.tensor(batch_indices, dtype=torch.long, device=device)
 
 
 def _async_upload(ckpt_path, repo_id, step):
@@ -110,38 +131,7 @@ def save_checkpoint(
         thread.start()
 
 
-# ─── Logit-Normal Truncated Gaussian (LTG) Sampler ────────────────────────
 
-def sample_ltg(batch_size, block_h, block_w, device, loc=0.0, scale=1.0, std_base=0.2):
-    """
-    Logit-Normal Truncated Gaussian (LTG) Sampler for Patch Forcing.
-    Algorithm S2 implementation returning a block-level spatial map (B, 1, Hp, Wp)
-    where each value is shared across all pixels in the corresponding patch block.
-    """
-    # 1. Sample global max information content per image in batch
-    eps = torch.randn(batch_size, device=device, dtype=torch.bfloat16)
-    t_max = torch.sigmoid(loc + scale * eps)
-
-    # 2. Prevent the Gaussian from spreading too far into negatives
-    std = torch.minimum(t_max / 2, torch.tensor(std_base, device=device, dtype=t_max.dtype))
-
-    # Broadcast to block-level spatial map
-    t_max = t_max.view(-1, 1, 1, 1)
-    std = std.view(-1, 1, 1, 1)
-
-    # 3. Sample individual block timesteps from the truncated Gaussian
-    eps_patch = torch.randn(batch_size, 1, block_h, block_w, device=device, dtype=torch.bfloat16)
-    t_patches = t_max - torch.abs(eps_patch) * std
-
-    # 4. Correct any values that slipped below 0 with random resampling
-    mask = t_patches < 0
-    if mask.any():
-        t_patches[mask] = (torch.rand_like(t_patches[mask]) * t_max.expand_as(t_patches)[mask])
-
-    return t_patches
-
-
-# ────────────────────────────────────────────────────────────────────────────
 
 
 def train(config_path):
@@ -228,14 +218,12 @@ def train(config_path):
 
     model = ModelClass(
         in_channels=in_channels,
-        dim=config['model'].get('fcdm_dim', 768),
-        depth=config['model'].get('fcdm_depth', 12),
-        num_heads=config['model'].get('num_heads', 12),
+        base_channels=config['model'].get('fcdm_dim', 768),
+        num_blocks=config['model'].get('fcdm_depth', 12),
+        heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
-        use_checkpoint=config['training'].get('gradient_checkpointing', False),
-        encoder_depth=config['model'].get('encoder_depth', 2),
-        decoder_depth=config['model'].get('decoder_depth', 2),
         patch_size=patch_size,
+        use_deco_decoder=config['model'].get('use_deco_decoder', True)
     ).to(device=device, dtype=torch.bfloat16)
 
 
@@ -367,9 +355,7 @@ def train(config_path):
             images, prompts, _ = batch
             if hasattr(images, "to"):
                 images = images.to(device, memory_format=torch.channels_last)
-            y_indices, y_offsets = tag_processor.process_prompts(
-                prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
-            )
+            y_indices = tag_processor.process_prompts(prompts, device)
 
             # VAE Encoding
             if use_tiny_vae:
@@ -395,41 +381,50 @@ def train(config_path):
             B, C, H, W = inputs.shape
             Hp, Wp = H // patch_size, W // patch_size
 
-            # ─── Patch Forcing LTG Timestep at block resolution ────────────
-            # Yields a block-level map of size (B, 1, Hp, Wp)
-            t_block = sample_ltg(B, Hp, Wp, device, loc=0.0, scale=1.0, std_base=0.2)
-
-            t_block = t_block
-
             # ─── Pre-patchify inputs ────────────────────────────────────
             inputs_patched = F.pixel_unshuffle(inputs, patch_size)  # (B, C*p^2, Hp, Wp)
 
-            # Expand timestep to patchified spatial level for flow interpolation
-            # t_block is (B, 1, Hp, Wp), inputs_patched is (B, C*p^2, Hp, Wp)
-            noise = torch.randn_like(inputs_patched)
-            xt = (1 - t_block) * inputs_patched + t_block * noise
+            # Generate timestep
+            t = torch.empty((B,), device=device).uniform_(0, 1.0)
+            t_condition = t * 1000
 
-            # Model receives block-level timesteps, predicts x0 + logvar in patchified space
-            x0_pred, logvar_theta = model(xt, t_block, y_indices, y_offsets)
+            x0_noise = torch.randn_like(inputs_patched)
 
-            # Velocity loss in patchified space
-            t_safe = t_block.clamp(min=0.05)
-            v_pred = (xt - x0_pred) / t_safe
-            v_target = (xt - inputs_patched) / t_safe
+            t_expand = t.view(B, 1, 1, 1)
+            xt = t_expand * inputs_patched + (1 - t_expand) * x0_noise
 
-            mse_loss = F.mse_loss(v_pred, v_target, reduction='none')
-            mse_loss_mean = mse_loss.mean()
+            seq_len = Hp * Wp
+            mask_ratio = torch.normal(mean=0.75, std=0.25, size=(B,), device=device)
+            mask_ratio = torch.clamp(mask_ratio, min=0.0, max=1.0)
+            n_masked = (mask_ratio * seq_len).long()
+            mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+            for b in range(B):
+                if n_masked[b] > 0:
+                    perm = torch.randperm(seq_len, device=device)
+                    mask[b, perm[:n_masked[b]]] = True
 
-            # Difficulty-aware NLL loss via logvar (block-level, same resolution)
-            sg_v_pred = v_pred.detach()
-            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True)
+            # Forward DiT on the CLEAN image (inputs_patched) to extract global context
+            t_dit = torch.zeros((B,), device=device)
+
+            # CFG Dropout Mask
+            drop_prob = config['training'].get('class_dropout_prob', 0.1)
+            drop_mask = torch.rand(B, device=device) < drop_prob
+
+            # Pass through DDP wrapper using x_noisy and t_noisy
+            x1_pred, logvar_theta = model(inputs_patched, t_dit, y=y_indices, mask=mask, drop_mask=drop_mask, x_noisy=xt, t_noisy=t_condition)
+
+            # Loss Calculation (in v-space / predicting x1)
+            mse_loss_raw = F.mse_loss(x1_pred, inputs_patched, reduction='none')
+            mse_loss_spatial = mse_loss_raw.mean(dim=1)
+
+            mse_loss_sg = mse_loss_spatial.detach()
             nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
+
+            mse_loss_mean = mse_loss_spatial.mean()
             nll_loss_mean = nll_loss.mean()
 
             lambda_nll = config['model'].get('lambda_nll', 0.01)
             loss = mse_loss_mean + lambda_nll * nll_loss_mean
-
-
 
             loss = loss / accum_steps
             loss.backward()
@@ -458,37 +453,33 @@ def train(config_path):
 
                 model.eval()
                 with torch.no_grad():
-                    for stype in ("euler", "look-ahead"):
-                        print(f"\n[Step {global_step}] Generating validation samples ({stype})...")
-                        samples = sample_fn(
-                            model.module if hasattr(model, 'module') else model,
-                            tag_processor,
-                            (256, 256),
-                            16,
-                            fixed_prompts,
-                            device,
-                            guidance_scale=1.4,
-                            sampler_type=stype,
-                        )
+                    print(f"\n[Step {global_step}] Generating validation samples (cascaded)...")
+                    base_model = model.module if hasattr(model, 'module') else model
+                    val_y = tag_processor.process_prompts(fixed_prompts, device)
+                    samples = base_model.sample(
+                        B=val_y.shape[0], H=256//patch_size, W=256//patch_size,
+                        device=device, maskgit_steps=4, deco_steps=20, y=val_y, cfg_scale=4.0
+                    )
+                    samples = F.pixel_shuffle(samples, patch_size)
 
-                        if use_tiny_vae or use_vae:
-                            samples = samples.to(dtype=torch.bfloat16)
-                            samples = (samples * latents_std) + latents_mean
-                            if not use_tiny_vae:
-                                samples = F.pixel_shuffle(samples, 2)
-                                recon = vae.decode(samples).sample
-                            else:
-                                out = vae.decode(samples, return_dict=False)
-                                recon = out[0] if isinstance(out, tuple) else out
-
-                            samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                            samples = samples.to(dtype=torch.float32)
+                    if use_tiny_vae or use_vae:
+                        samples = samples.to(dtype=torch.bfloat16)
+                        samples = (samples * latents_std) + latents_mean
+                        if not use_tiny_vae:
+                            samples = F.pixel_shuffle(samples, 2)
+                            recon = vae.decode(samples).sample
                         else:
-                            samples = samples.clamp(-1, 1) / 2.0 + 0.5
-                            samples = samples.to(dtype=torch.float32)
-                        grid = make_grid(samples, nrow=4)
-                        tag = stype.replace("-", "_")
-                        wandb.log({f"val/samples_{tag}": wandb.Image(grid, caption=f"{stype} @ Step {global_step}")}, step=global_step)
+                            out = vae.decode(samples, return_dict=False)
+                            recon = out[0] if isinstance(out, tuple) else out
+
+                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
+                        samples = samples.to(dtype=torch.float32)
+                    else:
+                        samples = samples.clamp(-1, 1) / 2.0 + 0.5
+                        samples = samples.to(dtype=torch.float32)
+
+                    grid = make_grid(samples, nrow=4)
+                    wandb.log({f"val/samples": wandb.Image(grid, caption=f"Cascaded @ Step {global_step}")}, step=global_step)
                 model.train()
 
     if rank == 0:
