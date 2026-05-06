@@ -465,7 +465,7 @@ def train(config_path):
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         samples = base_model.sample(
                             B=val_y.shape[0], H=256//patch_size, W=256//patch_size,
-                            device=device, maskgit_steps=4, deco_steps=20, y=val_y, cfg_scale=4.0
+                            device=device, maskgit_steps=50, deco_steps=50, y=val_y, cfg_scale=1
                         )
                     samples = F.pixel_shuffle(samples.to(dtype=torch.float32), patch_size)
 
