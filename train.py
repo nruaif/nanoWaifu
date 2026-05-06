@@ -223,7 +223,8 @@ def train(config_path):
         heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
         patch_size=patch_size,
-        use_deco_decoder=config['model'].get('use_deco_decoder', True)
+        use_deco_decoder=config['model'].get('use_deco_decoder', True),
+        deco_dim=config['model'].get('deco_dim', 768)
     ).to(device=device)
 
     if config['training'].get('gradient_checkpointing', False):

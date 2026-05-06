@@ -1,15 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
-from torchvision.utils import save_image
-from PIL import Image
 import math
-import os
 from typing import Tuple
-import numpy as np
-import matplotlib.pyplot as plt
-import torchvision.io as tv_io
 
 # ==========================================================
 # 1. Positional Encoding & Standard Blocks
@@ -132,7 +125,7 @@ class DiTBlock(nn.Module):
         hidden_dim = int(2 * (dim * 4) / 3)
         self.mlp = SwiGLU(dim, hidden_dim)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
-
+    @torch.compile
     def forward(self, x, c, pos, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(
@@ -180,7 +173,7 @@ class DeCoDecoderBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(dim, 4 * dim, bias=True), nn.SiLU(), nn.Linear(4 * dim, dim, bias=True)
         )
-
+    @torch.compile
     def forward(self, h, c_aligned):
         alpha, beta, gamma = self.adaLN_modulation(F.silu(c_aligned)).chunk(3, dim=-1)
         h_norm = self.norm(h)
@@ -217,9 +210,9 @@ class NerfEmbedder(nn.Module):
 
 
 class DeCoPixelDecoder(nn.Module):
-    def __init__(self, in_channels, depth=3, cond_dim=1024):
+    def __init__(self, in_channels, dim=1536, depth=3, cond_dim=1024):
         super().__init__()
-        self.dim = in_channels
+        self.dim = dim
         self.gradient_checkpointing = False
         self.w_in = NerfEmbedder(in_channels, self.dim)
         self.blocks = nn.ModuleList([DeCoDecoderBlock(self.dim, cond_dim) for _ in range(depth)])
@@ -291,7 +284,8 @@ class MAE_TokenformerDiT(nn.Module):
         self.conf_proj = nn.Linear(self.decoder_dim, 1) if self.use_deco_decoder else nn.Conv2d(self.decoder_dim, 1, 1)
 
         if self.use_deco_decoder:
-            self.pixel_decoder = DeCoPixelDecoder(in_channels=self.patchified_channels, depth=3,
+            deco_dim = kwargs.get('deco_dim', 768)
+            self.pixel_decoder = DeCoPixelDecoder(in_channels=self.patchified_channels, dim=deco_dim, depth=3,
                                                   cond_dim=self.decoder_dim)
         else:
             self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(self.decoder_dim, 2 * self.decoder_dim, bias=True))
@@ -519,6 +513,7 @@ class MAE_TokenformerDiT(nn.Module):
                 c_low_cond, c_low_uncond = c_low_both.chunk(2, dim=0)
                 conf_cond, conf_uncond = conf_both.chunk(2, dim=0)
 
+                c_low_cfg = c_low_uncond + cfg_scale * (c_low_cond - c_low_uncond)
                 conf = conf_uncond + cfg_scale * (conf_cond - conf_uncond)
             else:
                 c_low_freq, conf, _ = self.forward_dit(canvas_spatial, t_dit, y=y, mask=mask)
@@ -527,8 +522,8 @@ class MAE_TokenformerDiT(nn.Module):
             ratio = math.cos(((i + 1) / maskgit_steps) * (math.pi / 2))
             n_masked = int(ratio * seq_len)
 
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(conf) + 1e-9) + 1e-9)
-            scores = conf + 0.1 * gumbel_noise
+            #gumbel_noise = -torch.log(-torch.log(torch.rand_like(conf) + 1e-9) + 1e-9)
+            scores = conf
 
             scores = torch.where(mask, scores, torch.full_like(scores, -float('inf')))
             _, sorted_indices = torch.sort(scores, dim=-1, descending=True)
@@ -551,18 +546,7 @@ class MAE_TokenformerDiT(nn.Module):
                     # Project condition embedding to decoder logic
                     t_emb_deco = self.c_enc_to_dec(self.t_embedder(t_deco * 1000))
 
-                    if do_cfg:
-                        x_in = active_x_raw.repeat(2, 1, 1)
-                        c_in = torch.cat([c_low_cond, c_low_uncond], dim=0)
-                        t_emb_in = t_emb_deco.repeat(2, 1)
-
-                        x1_pred_both = self.pixel_decoder(x_in, c_in, H, W, t_emb=t_emb_in)
-                        x1_cond, x1_uncond = x1_pred_both.chunk(2, dim=0)
-
-                        x1_pred = x1_uncond + cfg_scale * (x1_cond - x1_uncond)
-                    else:
-                        x1_pred = self.pixel_decoder(active_x_raw, c_low_cond, H, W, t_emb=t_emb_deco)
-
+                    x1_pred = self.pixel_decoder(active_x_raw, c_low_cfg, H, W, t_emb=t_emb_deco)
                     denom = max(1.0 - t_val, 1e-5)
                     v_pred = (x1_pred - active_x_raw) / denom
 
