@@ -35,22 +35,25 @@ class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.rms_norm(x, (x.shape[-1],), weight=self.weight, eps=self.eps)
+        return F.rms_norm(x, (x.shape[-1],), eps=self.eps)
 
 Norm = RMSNorm
+
+class ReLUSquared(nn.Module):
+    def forward(self, x):
+        return F.relu(x) ** 2
 
 class SwiGLU(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-
+        nn.init.constant_(self.w2.weight, 0)
+        self.act = ReLUSquared()
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2((F.relu(self.w1(x)) ** 2))
 
 FeedForward = SwiGLU
 
@@ -58,23 +61,21 @@ class FeedForwardDW(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
+        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False)
+        nn.init.constant_(self.w2.weight, 0)
 
     def forward(self, x, H, W):
         B, L, C = x.shape
         x1 = self.w1(x)
-        x3 = self.w3(x)
-        
         x1_spatial = x1.transpose(1, 2).reshape(B, -1, H, W)
         x1_spatial = self.dwconv(x1_spatial)
         x1 = x1_spatial.flatten(2).transpose(1, 2)
         
-        return self.w2(F.silu(x1) * x3)
+        return self.w2((F.relu(x1) ** 2) )
 
 class Embed(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, norm_layer=None):
+    def __init__(self, in_features, out_features, bias=False, norm_layer=None):
         super().__init__()
         self.proj = nn.Linear(in_features, out_features, bias=bias)
         self.norm = norm_layer(out_features) if norm_layer is not None else nn.Identity()
@@ -85,9 +86,9 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=False),
+            ReLUSquared(),
+            nn.Linear(hidden_size, hidden_size, bias=False),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -116,12 +117,13 @@ class Attention(nn.Module):
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
+        
+        nn.init.constant_(self.proj.weight, 0)
         
         self.alpha = nn.Parameter(torch.ones(1))
         self.beta = nn.Parameter(torch.zeros(1))
-
     def forward(self, x: torch.Tensor, pos, num_txt_tokens: int, v_skip: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -133,7 +135,7 @@ class Attention(nn.Module):
         q_txt, q_img = q[:, :, :num_txt_tokens], q[:, :, num_txt_tokens:]
         k_txt, k_img = k[:, :, :num_txt_tokens], k[:, :, num_txt_tokens:]
         
-        q_img, k_img = apply_rotary_emb(q_img, k_img, freqs_cis=pos)
+        #q_img, k_img = apply_rotary_emb(q_img, k_img, freqs_cis=pos)
         
         q = torch.cat([q_txt, q_img], dim=2)
         k = torch.cat([k_txt, k_img], dim=2)
@@ -158,7 +160,7 @@ class FlattenDiTBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp_txt = FeedForward(hidden_size, mlp_hidden_dim)
         self.mlp_img = FeedForwardDW(hidden_size, mlp_hidden_dim)
-
+    @torch.compile
     def forward(self, x, pos, num_txt_tokens, H, W, v_skip=None):
         attn_out, v_out = self.attn(self.norm1(x), pos, num_txt_tokens, v_skip=v_skip)
         x = x + attn_out
@@ -176,7 +178,7 @@ class PixNerDiT(nn.Module):
             self,
             in_channels=3,
             num_groups=16,
-            hidden_size=1024,
+            hidden_size=1152,
             num_encoder_blocks=16,
             patch_size=16,
             vocab_size=1024,
@@ -232,11 +234,9 @@ class PixNerDiT(nn.Module):
     def initialize_weights(self):
         w = self.s_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.s_embedder.proj.bias, 0)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.constant_(self.final_conv.weight, 0)
-        nn.init.constant_(self.final_conv.bias, 0)
 
     def forward(self, x, t, y):
         B, _, H, W = x.shape
