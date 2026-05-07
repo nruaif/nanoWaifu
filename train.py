@@ -16,6 +16,7 @@ import threading
 
 from model_dit import PixNerDiT as ModelClass
 
+
 class TagProcessor:
     def __init__(self, tags_file, max_tags=32):
         with open(tags_file, 'r', encoding='utf-8') as f:
@@ -96,7 +97,7 @@ def save_checkpoint(
         config,
         fixed_prompts=None,
         fixed_noise=None,
-        push_to_hf=True,
+        push_to_hf=False,
         repo_id="Shio-Koube/ConvNext-Diff"
 ):
     if rank != 0:
@@ -143,6 +144,7 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
+
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -291,8 +293,10 @@ def train(config_path):
             normuon_params.append(p)
 
     try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1, betas=(0.9, 0.95))
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1, betas=(0.9, 0.95),
+                              cautious_wd=True)
+        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1,
+                              cautious_wd=True, normuon_variant=True)
     except Exception:
         opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
         opt_normuon = torch.optim.AdamW(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
@@ -303,10 +307,12 @@ def train(config_path):
             self.opt2 = opt2
 
         def step(self):
-            self.opt1.step(); self.opt2.step()
+            self.opt1.step();
+            self.opt2.step()
 
         def zero_grad(self, set_to_none=True):
-            self.opt1.zero_grad(set_to_none); self.opt2.zero_grad(set_to_none)
+            self.opt1.zero_grad(set_to_none);
+            self.opt2.zero_grad(set_to_none)
 
         def state_dict(self):
             return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
@@ -379,7 +385,10 @@ def train(config_path):
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Generate timestep
-                t = torch.empty((B,), device=device).uniform_(0, 1.0)
+                mu = -0.8
+                sigma = 1.0
+                u = torch.randn((B,), device=device) * sigma + mu
+                t = torch.sigmoid(u)
                 t_condition = t * 1000
 
                 x0_noise = torch.randn_like(inputs)
@@ -390,7 +399,7 @@ def train(config_path):
                 # CFG Dropout Mask
                 drop_prob = config['training'].get('class_dropout_prob', 0.1)
                 drop_mask = torch.rand(B, device=device) < drop_prob
-                
+
                 y_input = y_indices.clone()
                 y_input[drop_mask] = tag_processor.pad_idx
 
@@ -407,7 +416,7 @@ def train(config_path):
                 mse_loss_mean = mse_loss_raw.mean()
 
                 loss = mse_loss_mean / accum_steps
-                
+
             loss.backward()
             loss_accum += mse_loss_mean.item()
 
@@ -437,7 +446,7 @@ def train(config_path):
                     print(f"\n[Step {global_step}] Generating validation samples...")
                     base_model = model.module if hasattr(model, 'module') else model
                     val_y = tag_processor.process_prompts(fixed_prompts, device)
-                    
+
                     H_val, W_val = inputs.shape[2], inputs.shape[3]
 
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -463,7 +472,8 @@ def train(config_path):
                         samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
-                    wandb.log({f"val/samples": wandb.Image(grid, caption=f"Validation @ Step {global_step}")}, step=global_step)
+                    wandb.log({f"val/samples": wandb.Image(grid, caption=f"Validation @ Step {global_step}")},
+                              step=global_step)
                 model.train()
 
     if rank == 0:
