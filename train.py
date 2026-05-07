@@ -213,11 +213,11 @@ def train(config_path):
     patch_size = config['model'].get('patch_size', 2)
 
     model = ModelClass(
-        in_channels=in_channels,
-        hidden_size=config['model'].get('hidden_size', 1152),
-        num_groups=config['model'].get('num_heads', 12),
-        patch_size=patch_size,
-        txt_embed_dim=num_classes,
+        in_channels=3,
+        hidden_size=1024,
+        num_groups=16,
+        patch_size=16,
+        vocab_size=num_classes,
         txt_max_length=tag_processor.max_tags,
     ).to(device=device)
 
@@ -399,7 +399,7 @@ def train(config_path):
                 # calculate v-space target
                 target_v = inputs - x0_noise
 
-                # convert x0_pred to v_pred with clipped t calculation
+                # model predicts x (data), convert to v
                 t_clipped = torch.clamp(t_expand, max=0.95)
                 v_pred = (x0_pred - xt) / (1.0 - t_clipped)
 
