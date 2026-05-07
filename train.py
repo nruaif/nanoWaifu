@@ -14,10 +14,10 @@ import torch.nn.functional as F
 from huggingface_hub import upload_file
 import threading
 
-from model_dit import MAE_TokenformerDiT as ModelClass
+from model_dit import PixNerDiT as ModelClass
 
 class TagProcessor:
-    def __init__(self, tags_file, max_tags=16):
+    def __init__(self, tags_file, max_tags=32):
         with open(tags_file, 'r', encoding='utf-8') as f:
             self.tags = [line.strip() for line in f if line.strip()]
         self.tag_to_idx = {tag: i for i, tag in enumerate(self.tags)}
@@ -131,9 +131,6 @@ def save_checkpoint(
         thread.start()
 
 
-
-
-
 def train(config_path):
     is_ddp, rank, local_rank, world_size, device = setup_ddp()
 
@@ -146,7 +143,6 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
-
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
@@ -214,24 +210,20 @@ def train(config_path):
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    patch_size = config['model'].get('patch_size', 16)
+    patch_size = config['model'].get('patch_size', 2)
 
     model = ModelClass(
         in_channels=in_channels,
-        base_channels=config['model'].get('fcdm_dim', 768),
-        num_blocks=config['model'].get('fcdm_depth', 12),
-        heads=config['model'].get('num_heads', 12),
-        num_classes=num_classes,
+        hidden_size=config['model'].get('hidden_size', 1152),
+        num_groups=config['model'].get('num_heads', 12),
         patch_size=patch_size,
-        use_deco_decoder=config['model'].get('use_deco_decoder', True),
-        deco_dim=config['model'].get('deco_dim', 768)
+        txt_embed_dim=num_classes,
+        txt_max_length=tag_processor.max_tags,
     ).to(device=device)
 
     if config['training'].get('gradient_checkpointing', False):
         model.enable_gradient_checkpointing()
         print(">>> Gradient Checkpointing Enabled")
-
-
 
     # Resume Logic
     global_step = 0
@@ -384,55 +376,38 @@ def train(config_path):
                 fixed_noise = torch.randn_like(inputs[:16])
 
             B, C, H, W = inputs.shape
-            Hp, Wp = H // patch_size, W // patch_size
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # ─── Pre-patchify inputs ────────────────────────────────────
-                inputs_patched = F.pixel_unshuffle(inputs, patch_size)  # (B, C*p^2, Hp, Wp)
-
                 # Generate timestep
                 t = torch.empty((B,), device=device).uniform_(0, 1.0)
                 t_condition = t * 1000
 
-                x0_noise = torch.randn_like(inputs_patched)
+                x0_noise = torch.randn_like(inputs)
 
                 t_expand = t.view(B, 1, 1, 1)
-                xt = t_expand * inputs_patched + (1 - t_expand) * x0_noise
-
-                seq_len = Hp * Wp
-                mask_ratio = torch.normal(mean=0.75, std=0.25, size=(B,), device=device)
-                mask_ratio = torch.clamp(mask_ratio, min=0.0, max=1.0)
-                n_masked = (mask_ratio * seq_len).long()
-                mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
-                for b in range(B):
-                    if n_masked[b] > 0:
-                        perm = torch.randperm(seq_len, device=device)
-                        mask[b, perm[:n_masked[b]]] = True
-
-                # Forward DiT on the CLEAN image (inputs_patched) to extract global context
-                t_dit = torch.zeros((B,), device=device)
+                xt = t_expand * inputs + (1 - t_expand) * x0_noise
 
                 # CFG Dropout Mask
                 drop_prob = config['training'].get('class_dropout_prob', 0.1)
                 drop_mask = torch.rand(B, device=device) < drop_prob
+                
+                y_input = y_indices.clone()
+                y_input[drop_mask] = tag_processor.pad_idx
 
-                # Pass through DDP wrapper using x_noisy and t_noisy
-                x1_pred, logvar_theta = model(inputs_patched, t_dit, y=y_indices, mask=mask, drop_mask=drop_mask, x_noisy=xt, t_noisy=t_condition)
+                x0_pred = model(xt, t_condition, y_input)
 
-                # Loss Calculation (in v-space / predicting x1)
-                mse_loss_raw = F.mse_loss(x1_pred, inputs_patched, reduction='none')
-                mse_loss_spatial = mse_loss_raw.mean(dim=1)
+                # calculate v-space target
+                target_v = inputs - x0_noise
 
-                mse_loss_sg = mse_loss_spatial.detach()
-                nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
+                # convert x0_pred to v_pred with clipped t calculation
+                t_clipped = torch.clamp(t_expand, max=0.95)
+                v_pred = (x0_pred - xt) / (1.0 - t_clipped)
 
-                mse_loss_mean = mse_loss_spatial.mean()
-                nll_loss_mean = nll_loss.mean()
+                mse_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
+                mse_loss_mean = mse_loss_raw.mean()
 
-                lambda_nll = config['model'].get('lambda_nll', 0.01)
-                loss = mse_loss_mean + lambda_nll * nll_loss_mean
-
-                loss = loss / accum_steps
+                loss = mse_loss_mean / accum_steps
+                
             loss.backward()
             loss_accum += mse_loss_mean.item()
 
@@ -459,15 +434,17 @@ def train(config_path):
 
                 model.eval()
                 with torch.no_grad():
-                    print(f"\n[Step {global_step}] Generating validation samples (cascaded)...")
+                    print(f"\n[Step {global_step}] Generating validation samples...")
                     base_model = model.module if hasattr(model, 'module') else model
                     val_y = tag_processor.process_prompts(fixed_prompts, device)
+                    
+                    H_val, W_val = inputs.shape[2], inputs.shape[3]
+
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         samples = base_model.sample(
-                            B=val_y.shape[0], H=256//patch_size, W=256//patch_size,
-                            device=device, maskgit_steps=50, deco_steps=50, y=val_y, cfg_scale=1
+                            B=val_y.shape[0], H=H_val, W=W_val,
+                            device=device, steps=50, y=val_y, cfg_scale=4.0, pad_idx=tag_processor.pad_idx
                         )
-                    samples = F.pixel_shuffle(samples.to(dtype=torch.float32), patch_size)
 
                     if use_tiny_vae or use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
@@ -486,7 +463,7 @@ def train(config_path):
                         samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
-                    wandb.log({f"val/samples": wandb.Image(grid, caption=f"Cascaded @ Step {global_step}")}, step=global_step)
+                    wandb.log({f"val/samples": wandb.Image(grid, caption=f"Validation @ Step {global_step}")}, step=global_step)
                 model.train()
 
     if rank == 0:
