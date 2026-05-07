@@ -80,7 +80,7 @@ class TimestepEmbedder(nn.Module):
         args = t[..., None].float() * freqs[None, ...]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2: embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+        return embedding.to(dtype=t.dtype)
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
@@ -92,8 +92,7 @@ class Attention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv_x = nn.Linear(dim, dim*3, bias=qkv_bias)
-        self.kv_y = nn.Linear(dim, dim*2, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim*3, bias=qkv_bias)
 
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
@@ -101,20 +100,21 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, y, pos) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pos, num_txt_tokens: int) -> torch.Tensor:
         B, N, C = x.shape
-        qkv_x = self.qkv_x(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
-        q = self.q_norm(q.contiguous())
-        kx = self.k_norm(kx.contiguous())
-        q, kx = apply_rotary_emb(q, kx, freqs_cis=pos)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        kv_y = self.kv_y(y).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        ky, vy = kv_y[0], kv_y[1]
-        ky = self.k_norm(ky.contiguous())
-
-        k = torch.cat([kx, ky], dim=2)
-        v = torch.cat([vx, vy], dim=2)
+        q = self.q_norm(q.contiguous())
+        k = self.k_norm(k.contiguous())
+        
+        q_txt, q_img = q[:, :, :num_txt_tokens], q[:, :, num_txt_tokens:]
+        k_txt, k_img = k[:, :, :num_txt_tokens], k[:, :, num_txt_tokens:]
+        
+        q_img, k_img = apply_rotary_emb(q_img, k_img, freqs_cis=pos)
+        
+        q = torch.cat([q_txt, q_img], dim=2)
+        k = torch.cat([k_txt, k_img], dim=2)
 
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N, C)
@@ -134,9 +134,9 @@ class FlattenDiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, y, c, pos):
+    def forward(self, x, c, pos, num_txt_tokens):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), pos, num_txt_tokens)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -214,7 +214,9 @@ class TextRefineAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim*3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim*4, bias=qkv_bias)
+        self.lambda_proj = nn.Linear(dim, num_heads, bias=False)
+        
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -223,11 +225,27 @@ class TextRefineAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv_x = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        x = F.scaled_dot_product_attention(q, k, v)
+        qkv = self.qkv(x)
+        q, k, v = qkv.split([C * 2, C, C], dim=-1)
+        
+        q = q.reshape(B, N, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        q = self.q_norm(q.contiguous())
+        k = self.k_norm(k.contiguous())
+        
+        k = k.repeat_interleave(2, dim=1)
+        v = v.repeat_interleave(2, dim=1)
+        
+        attn = F.scaled_dot_product_attention(q, k, v)
+        
+        attn1, attn2 = attn[:, 0::2], attn[:, 1::2]
+        
+        lam = self.lambda_proj(x)
+        lam_val = torch.sigmoid(lam).transpose(1, 2).unsqueeze(-1)
+        
+        x = attn1 - lam_val * attn2
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -415,7 +433,7 @@ class PixNerDiT(nn.Module):
         B, _, H, W = x.shape
         x_unfolded = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
-        ypos = self.y_pos_embedding
+        ypos = self.y_pos_embedding[:, :y.shape[1], :]
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
         
         y_emb = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(x.dtype)
