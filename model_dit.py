@@ -67,9 +67,11 @@ class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.rms_norm(x, (x.shape[-1],), eps=self.eps)
+        # Pass the weight to the functional call
+        return F.rms_norm(x, (x.shape[-1],), weight=self.weight, eps=self.eps)
 
 
 Norm = RMSNorm
@@ -83,8 +85,8 @@ class ReLUSquared(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=True)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=True)
         nn.init.constant_(self.w2.weight, 0)
         self.act = ReLUSquared()
 
@@ -98,9 +100,9 @@ FeedForward = SwiGLU
 class FeedForwardDW(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=True)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=True)
+        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=True)
         nn.init.constant_(self.w2.weight, 0)
 
     def forward(self, x, H, W):
@@ -114,7 +116,7 @@ class FeedForwardDW(nn.Module):
 
 
 class Embed(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, norm_layer=None):
+    def __init__(self, in_features, out_features, bias=True, norm_layer=None):
         super().__init__()
         self.proj = nn.Linear(in_features, out_features, bias=bias)
         self.norm = norm_layer(out_features) if norm_layer is not None else nn.Identity()
@@ -127,9 +129,9 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=False),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             ReLUSquared(),
-            nn.Linear(hidden_size, hidden_size, bias=False),
+            nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -160,7 +162,7 @@ class Attention(nn.Module):
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=True)
         self.proj_drop = nn.Dropout(proj_drop)
 
         nn.init.constant_(self.proj.weight, 0)
@@ -200,7 +202,7 @@ class FlattenDiTBlock(nn.Module):
     def __init__(self, hidden_size, groups, mlp_ratio=4):
         super().__init__()
         self.norm1 = Norm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=False)
+        self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=True)
         self.norm2_txt = Norm(hidden_size, eps=1e-6)
         self.norm2_img = Norm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -229,7 +231,7 @@ class PixNerDiT(nn.Module):
             hidden_size=1024,
             num_encoder_blocks=16,
             patch_size=16,
-            vocab_size=1024,
+            vocab_size=12477,
             txt_max_length=32,
             weight_path=None,
             load_ema=False,
@@ -295,7 +297,7 @@ class PixNerDiT(nn.Module):
         ypos = self.y_pos_embedding[:, :y.shape[1], :]
         t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
 
-        y_emb = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(x.dtype)
+        y_emb = self.y_embedder(y).view(B, -1, self.hidden_size)
 
         s = self.s_embedder(x_unfolded)
         s = s + t_emb.view(B, 1, self.hidden_size)
@@ -359,6 +361,136 @@ class PixNerDiT(nn.Module):
         return x
 
 
+from collections import defaultdict
+
+
+def load_checkpoint(model, ckpt_path, device="cpu", ema_key=None):
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # Common checkpoint structures
+    if isinstance(ckpt, dict):
+        if ema_key is not None and ema_key in ckpt:
+            state_dict = ckpt[ema_key]
+        elif "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif "model" in ckpt:
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
+
+    # Remove "module." prefix if present
+    cleaned = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            k = k[len("module."):]
+        cleaned[k] = v
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+
+    print(f"Loaded checkpoint: {ckpt_path}")
+
+    if len(missing) > 0:
+        print(f"\nMissing keys ({len(missing)}):")
+        for k in missing:
+            print("  ", k)
+
+    if len(unexpected) > 0:
+        print(f"\nUnexpected keys ({len(unexpected)}):")
+        for k in unexpected:
+            print("  ", k)
+
+    return model
+
+
+def print_weight_statistics(model):
+    print("\n================ WEIGHT STATS ================\n")
+
+    total_nan = 0
+
+    for name, param in model.named_parameters():
+        if param.numel() == 0:
+            continue
+
+        data = param.data.float()
+
+        nan_count = torch.isnan(data).sum().item()
+        total_nan += nan_count
+
+        print(
+            f"{name:60s} "
+            f"shape={str(tuple(data.shape)):20s} "
+            f"mean={data.mean().item():+.5f} "
+            f"std={data.std().item():.5f} "
+            f"absmax={data.abs().max().item():.5f} "
+            f"nan={nan_count}"
+        )
+
+    print(f"\nTotal NaNs in weights: {total_nan}")
+
+
+def register_activation_hooks(model):
+    activation_stats = {}
+
+    def hook_fn(name):
+        def fn(module, inp, out):
+            with torch.no_grad():
+
+                # Some modules return tuples
+                if isinstance(out, tuple):
+                    out = out[0]
+
+                if not torch.is_tensor(out):
+                    return
+
+                out = out.float()
+
+                activation_stats[name] = {
+                    "shape": tuple(out.shape),
+                    "mean": out.mean().item(),
+                    "std": out.std().item(),
+                    "absmax": out.abs().max().item(),
+                    "nan": torch.isnan(out).sum().item(),
+                }
+
+        return fn
+
+    handles = []
+
+    for name, module in model.named_modules():
+
+        # Skip container modules
+        if len(list(module.children())) > 0:
+            continue
+
+        handles.append(
+            module.register_forward_hook(hook_fn(name))
+        )
+
+    return activation_stats, handles
+
+
+def print_activation_statistics(stats):
+    print("\n================ ACTIVATION STATS ================\n")
+
+    total_nan = 0
+
+    for name, s in stats.items():
+        total_nan += s["nan"]
+
+        print(
+            f"{name:60s} "
+            f"shape={str(s['shape']):20s} "
+            f"mean={s['mean']:+.5f} "
+            f"std={s['std']:.5f} "
+            f"absmax={s['absmax']:.5f} "
+            f"nan={s['nan']}"
+        )
+
+    print(f"\nTotal NaNs in activations: {total_nan}")
+
+
 def print_model_params_count(model, trainable_only=False):
     """
     Print the number of parameters in a model.
@@ -378,17 +510,58 @@ def print_model_params_count(model, trainable_only=False):
 
 
 if __name__ == "__main__":
-    from torch.utils.flop_counter import FlopCounterMode
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     model = PixNerDiT().to(device=device, dtype=torch.float32)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total Parameters: {total_params / 1e6:.2f} M")
+    ckpt_path = "ckpt_step_185000.pth"
 
-    x = torch.randn(2, 3, 256, 256, dtype=torch.float32, device=device)
-    t = torch.rand(2, dtype=torch.float32, device=device) * 1000
-    y = torch.randint(0, 1000, (2, 16), dtype=torch.long, device=device)
-    print_model_params_count(model.blocks)
-    with FlopCounterMode(display=True):
+    load_checkpoint(
+        model,
+        ckpt_path,
+        device=device,
+        ema_key=None,  # e.g. "ema" if your checkpoint stores EMA weights
+    )
+
+    model.eval()
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\nTotal Parameters: {total_params / 1e6:.2f} M")
+
+    # Print weight stats
+    print_weight_statistics(model)
+
+    # Register activation hooks
+    activation_stats, handles = register_activation_hooks(model)
+
+    # Single-image forward pass
+    x = torch.randn(1, 3, 256, 256, dtype=torch.float32, device=device)
+
+    t = torch.rand(1, dtype=torch.float32, device=device) * 1000
+
+    y = torch.randint(
+        0,
+        1000,
+        (1, 16),
+        dtype=torch.long,
+        device=device
+    )
+
+    with torch.no_grad():
         out = model(x, t, y)
+
+    print("\nOutput stats:")
+    print(
+        f"shape={tuple(out.shape)} "
+        f"mean={out.mean().item():+.5f} "
+        f"std={out.std().item():.5f} "
+        f"absmax={out.abs().max().item():.5f}"
+    )
+
+    # Print activation stats
+    print_activation_statistics(activation_stats)
+
+    # Cleanup hooks
+    for h in handles:
+        h.remove()

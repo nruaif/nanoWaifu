@@ -293,7 +293,7 @@ def train(config_path):
             normuon_params.append(p)
 
     try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1, betas=(0.9, 0.95),
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1, betas=(0.9, 0.99),
                               cautious_wd=True)
         opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1,
                               cautious_wd=True, normuon_variant=True)
@@ -385,10 +385,7 @@ def train(config_path):
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Generate timestep
-                mu = -0.8
-                sigma = 1.0
-                u = torch.randn((B,), device=device) * sigma + mu
-                t = torch.sigmoid(u)
+                t = torch.rand((B,), device=device)
                 t_condition = t * 1000
 
                 x0_noise = torch.randn_like(inputs)
