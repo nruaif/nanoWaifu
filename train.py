@@ -364,6 +364,7 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
+    running_repa_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
 
     while global_step < config['training'].get('max_train_steps', 1000000):
@@ -371,6 +372,7 @@ def train(config_path):
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
+        repa_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -458,23 +460,27 @@ def train(config_path):
 
             loss.backward()
             loss_accum += (mse_loss_mean.item() + sim_loss.item())
+            repa_loss_accum += sim_loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
+        running_repa_loss += repa_loss_accum
 
         if rank == 0:
             pbar.update(1)
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
-                log_dict = {"train/loss": avg_loss}
+                avg_repa_loss = running_repa_loss / log_interval
+                log_dict = {"train/loss": avg_loss, "train/repa_loss": avg_repa_loss}
 
                 wandb.log(log_dict, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "repa": f"{avg_repa_loss:.4f}"})
                 running_loss = 0.0
+                running_repa_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
