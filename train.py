@@ -13,6 +13,8 @@ import builtins
 import torch.nn.functional as F
 from huggingface_hub import upload_file
 import threading
+import timm
+import torchvision.transforms.functional as TF
 
 from model_dit import PixNerDiT as ModelClass
 
@@ -51,6 +53,22 @@ def _async_upload(ckpt_path, repo_id, step):
         print(f"[HF] Uploaded: {ckpt_path}")
     except Exception as e:
         print(f"[HF] Upload failed for {ckpt_path}: {e}")
+
+DINO_MEAN = [0.485, 0.456, 0.406]
+DINO_STD = [0.229, 0.224, 0.225]
+
+def preprocess_for_dino(imgs):
+    if imgs.min() < 0:
+        imgs = (imgs + 1.0) / 2.0
+    
+    # Ensure dimensions are multiples of 32
+    B, C, H, W = imgs.shape
+    new_h = max(32, round(H / 32) * 32)
+    new_w = max(32, round(W / 32) * 32)
+    if new_h != H or new_w != W:
+        imgs = TF.resize(imgs, [new_h, new_w], interpolation=TF.InterpolationMode.BICUBIC)
+        
+    return TF.normalize(imgs, mean=DINO_MEAN, std=DINO_STD)
 
 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -211,6 +229,12 @@ def train(config_path):
             vae = standard_vae
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
+
+    print(">>> Loading DINOv2 model...")
+    dino_model = timm.create_model(
+        "vit_base_patch16_dinov3_qkvb.lvd1689m",
+        pretrained=True, num_classes=0,
+    ).to(device=device).eval()
 
     patch_size = config['model'].get('patch_size', 2)
 
@@ -383,6 +407,15 @@ def train(config_path):
 
             B, C, H, W = inputs.shape
 
+            # Get DINO features
+            with torch.no_grad():
+                dino_inputs = preprocess_for_dino(images).to(dtype=torch.float32)
+                dino_out = dino_model.forward_features(dino_inputs)
+                if isinstance(dino_out, (list, tuple)):
+                    dino_feat = dino_out[0]
+                else:
+                    dino_feat = dino_out
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Generate timestep
                 t = torch.rand((B,), device=device)
@@ -400,7 +433,16 @@ def train(config_path):
                 y_input = y_indices.clone()
                 y_input[drop_mask] = tag_processor.pad_idx
 
-                x0_pred = model(xt, t_condition, y_input)
+                x0_pred, layer_4_feat = model(xt, t_condition, y_input, return_layer_4_feat=True)
+                
+                # process dino
+                B_dino, _, H_dino, W_dino = dino_inputs.shape
+                H_patch, W_patch = H_dino // 16, W_dino // 16
+                base_model = model.module if hasattr(model, 'module') else model
+                target_feat = base_model.process_dino_features(dino_feat, H_patch, W_patch)
+                
+                # cosine sim loss
+                sim_loss = 1.0 - F.cosine_similarity(layer_4_feat, target_feat, dim=-1).mean()
 
                 # calculate v-space target
                 target_v = inputs - x0_noise
@@ -412,10 +454,10 @@ def train(config_path):
                 mse_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
                 mse_loss_mean = mse_loss_raw.mean()
 
-                loss = mse_loss_mean / accum_steps
+                loss = (mse_loss_mean + sim_loss) / accum_steps
 
             loss.backward()
-            loss_accum += mse_loss_mean.item()
+            loss_accum += (mse_loss_mean.item() + sim_loss.item())
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()

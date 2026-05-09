@@ -261,6 +261,10 @@ class PixNerDiT(nn.Module):
         self.blocks = nn.ModuleList([
             FlattenDiTBlock(self.hidden_size, self.num_groups) for _ in range(self.num_encoder_blocks)
         ])
+        
+        # DINO projection layers
+        self.dino_proj = nn.Conv2d(self.hidden_size, 768, kernel_size=3, padding=1)
+        self.dino_gamma = 0.8
 
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
 
@@ -287,8 +291,20 @@ class PixNerDiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.constant_(self.final_conv.weight, 0)
+        
+    def process_dino_features(self, dino_feat, H_patch, W_patch):
+        # dino_feat: [B, 2057, 768] (with 5 cls/reg tokens)
+        B = dino_feat.shape[0]
+        # Remove first 5 tokens
+        x = dino_feat[:, 5:, :]
+        
+        # Spatial normalization on encoder features [B, T, D]
+        x = x - self.dino_gamma * x.mean(dim=1, keepdim=True)
+        x = x / (x.std(dim=1, keepdim=True) + 1e-6)
+        
+        return x
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, return_layer_4_feat=False):
         B, _, H, W = x.shape
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
@@ -307,6 +323,7 @@ class PixNerDiT(nn.Module):
 
         v_skips = []
         num_blocks = len(self.blocks)
+        layer_4_feat = None
         for i, block in enumerate(self.blocks):
             if i < num_blocks // 2:
                 v_skip = None
@@ -323,6 +340,9 @@ class PixNerDiT(nn.Module):
 
             if i < num_blocks // 2:
                 v_skips.append(v_out)
+                
+            if i == 3 and return_layer_4_feat:
+                layer_4_feat = seq[:, num_txt_tokens:]
 
         s = seq[:, num_txt_tokens:]
 
@@ -331,6 +351,11 @@ class PixNerDiT(nn.Module):
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
 
+        if return_layer_4_feat:
+            layer_4_feat_spatial = layer_4_feat.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
+            layer_4_feat_proj = self.dino_proj(layer_4_feat_spatial)
+            layer_4_feat = layer_4_feat_proj.flatten(2).transpose(1, 2)
+            return x_out, layer_4_feat
         return x_out
 
     @torch.no_grad()
