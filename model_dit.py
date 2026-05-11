@@ -254,7 +254,7 @@ class PixNerDiT(nn.Module):
             FlattenDiTBlock(self.hidden_size, self.num_groups) for _ in range(self.num_encoder_blocks)
         ])
 
-        self.final_conv = nn.Conv2d(self.hidden_size, (self.in_channels + 1) * self.patch_size ** 2, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(self.hidden_size, (self.in_channels) * self.patch_size ** 2, kernel_size=3, padding=1)
 
         self.initialize_weights()
         self.precompute_pos = dict()
@@ -324,24 +324,14 @@ class PixNerDiT(nn.Module):
         
         # Split uncertainty
         c = self.in_channels * self.patch_size ** 2
-        logvar_theta = x_out[:, c:, :, :]
         x_out = x_out[:, :c, :, :]
         
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-<<<<<<< HEAD
-        if return_layer_4_feat:
-            layer_4_feat_spatial = layer_4_feat.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
-            layer_4_feat_proj = self.dino_proj(layer_4_feat_spatial)
-            layer_4_feat = layer_4_feat_proj.flatten(2).transpose(1, 2)
-            return x_out, logvar_theta, layer_4_feat
-        return x_out, logvar_theta
-=======
-        
+
         if return_layers is not None:
             return x_out, layer_feats
         return x_out
->>>>>>> 07fd233
 
     @torch.no_grad()
     def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None, p=0.4, alpha=1.5):
