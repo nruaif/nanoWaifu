@@ -17,7 +17,7 @@ training:
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
-  sampler_type: "euler"
+  sampler_type: "look-ahead"
 
 model:
   type: "dit"

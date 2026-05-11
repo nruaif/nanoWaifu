@@ -167,11 +167,7 @@ class Attention(nn.Module):
 
         nn.init.constant_(self.proj.weight, 0)
 
-        self.alpha = nn.Parameter(torch.ones(1))
-        self.beta = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x: torch.Tensor, pos, num_txt_tokens: int, v_skip: torch.Tensor = None) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, pos, num_txt_tokens: int) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -187,15 +183,11 @@ class Attention(nn.Module):
         q = torch.cat([q_txt, q_img], dim=2)
         k = torch.cat([k_txt, k_img], dim=2)
 
-        v_out = v
-        if v_skip is not None:
-            v = v * self.alpha + v_skip * self.beta
-
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, v_out
+        return x
 
 
 class FlattenDiTBlock(nn.Module):
@@ -209,9 +201,9 @@ class FlattenDiTBlock(nn.Module):
         self.mlp_txt = FeedForward(hidden_size, mlp_hidden_dim)
         self.mlp_img = FeedForwardDW(hidden_size, mlp_hidden_dim)
 
-    @torch.compile
-    def forward(self, x, pos, num_txt_tokens, H, W, v_skip=None):
-        attn_out, v_out = self.attn(self.norm1(x), pos, num_txt_tokens, v_skip=v_skip)
+   #@torch.compile
+    def forward(self, x, pos, num_txt_tokens, H, W):
+        attn_out = self.attn(self.norm1(x), pos, num_txt_tokens)
         x = x + attn_out
 
         x_txt, x_img = x[:, :num_txt_tokens], x[:, num_txt_tokens:]
@@ -220,7 +212,7 @@ class FlattenDiTBlock(nn.Module):
         x_img = x_img + self.mlp_img(self.norm2_img(x_img), H, W)
 
         x = torch.cat([x_txt, x_img], dim=1)
-        return x, v_out
+        return x
 
 
 class PixNerDiT(nn.Module):
@@ -266,7 +258,7 @@ class PixNerDiT(nn.Module):
         self.dino_proj = nn.Conv2d(self.hidden_size, 768, kernel_size=3, padding=1)
         self.dino_gamma = 0.8
 
-        self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(self.hidden_size, (self.in_channels + 1) * self.patch_size ** 2, kernel_size=3, padding=1)
 
         self.initialize_weights()
         self.precompute_pos = dict()
@@ -311,35 +303,34 @@ class PixNerDiT(nn.Module):
         x_unfolded = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H_patch, W_patch, x.device)
         ypos = self.y_pos_embedding[:, :y.shape[1], :]
-        t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
+        
+        # Patch-level t's support
+        if t.dim() == 1:
+            # Broadcast scalar t to all patches if needed
+            t = t.view(B, 1, 1).expand(B, H_patch * W_patch, 1)
+        elif t.dim() == 2:
+             t = t.unsqueeze(-1)
+        elif t.dim() == 3:
+            t = t.view(B, H_patch * W_patch, 1)
+
+        t_emb = self.t_embedder(t) # (B, N, hidden_size)
 
         y_emb = self.y_embedder(y).view(B, -1, self.hidden_size)
 
         s = self.s_embedder(x_unfolded)
-        s = s + t_emb.view(B, 1, self.hidden_size)
+        s = s + t_emb
 
         num_txt_tokens = y_emb.shape[1]
         seq = torch.cat([y_emb, s], dim=1)
 
-        v_skips = []
         num_blocks = len(self.blocks)
         layer_4_feat = None
         for i, block in enumerate(self.blocks):
-            if i < num_blocks // 2:
-                v_skip = None
-            elif i > num_blocks // 2 or (num_blocks % 2 == 0 and i >= num_blocks // 2):
-                v_skip = v_skips.pop()
-            else:
-                v_skip = None
-
             if self.grad_checkpointing and self.training:
-                seq, v_out = checkpoint(block, seq, xpos, num_txt_tokens, H_patch, W_patch, v_skip, use_reentrant=False,
+                seq = checkpoint(block, seq, xpos, num_txt_tokens, H_patch, W_patch, use_reentrant=False,
                                         context_fn=context_fn)
             else:
-                seq, v_out = block(seq, xpos, num_txt_tokens, H_patch, W_patch, v_skip)
-
-            if i < num_blocks // 2:
-                v_skips.append(v_out)
+                seq = block(seq, xpos, num_txt_tokens, H_patch, W_patch)
                 
             if i == 3 and return_layer_4_feat:
                 layer_4_feat = seq[:, num_txt_tokens:]
@@ -347,41 +338,123 @@ class PixNerDiT(nn.Module):
         s = seq[:, num_txt_tokens:]
 
         s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
-        x_out = self.final_conv(s)
+        x_out = self.final_conv(s) # (B, (in_channels + 1) * patch_size**2, H_patch, W_patch)
+        
+        # Split uncertainty
+        c = self.in_channels * self.patch_size ** 2
+        logvar_theta = x_out[:, c:, :, :]
+        x_out = x_out[:, :c, :, :]
+        
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-
         if return_layer_4_feat:
             layer_4_feat_spatial = layer_4_feat.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
             layer_4_feat_proj = self.dino_proj(layer_4_feat_spatial)
             layer_4_feat = layer_4_feat_proj.flatten(2).transpose(1, 2)
-            return x_out, layer_4_feat
-        return x_out
+            return x_out, logvar_theta, layer_4_feat
+        return x_out, logvar_theta
 
     @torch.no_grad()
-    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None):
+    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None, p=0.4, alpha=1.5):
         x = torch.randn(B, self.in_channels, H, W, device=device)
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+        
+        # Start at t=0 (full noise) and go to t=1 (clean) following flow matching
+        # Wait, the original code had t=1000 to t=0 for diffusion.
+        # But flow matching usually goes t=0 (noise) to t=1 (data), as defined in eq (1): x_t = t x_1 + (1-t) x_0.
+        # The previous sample code had x = x + v_pred * dt, which is typical for Euler from t=0 to 1 if x0_pred is used to compute v_pred = (x0_pred - x) / denom.
+        # Let's adapt to use the predicted velocity directly.
+        # Original:
+        # denom = max(1.0 - t_val, 0.05)
+        # v_pred = (x0_pred - x) / denom
+        # In Flow Matching, the network predicts the velocity v_theta(x_t, t) pointing from noise to data.
+        
         dt = 1.0 / steps
-        for step in range(steps):
-            t_val = step * dt
-            t = torch.full((B,), t_val, device=device) * 1000
+        t_current = torch.zeros(B, H_patch * W_patch, 1, device=device) # Start at t=0
 
+        for step in range(steps):
+            t_next_val = (step + 1) * dt
+            
+            # 1. Predict velocity and uncertainty
+            # t passed to forward should be t_current * 1000 if that's what TimestepEmbedder expects
+            t_in = t_current * 1000
+            
             if cfg_scale > 1.0 and y is not None and pad_idx is not None:
                 x_in = x.repeat(2, 1, 1, 1)
-                t_in = t.repeat(2)
+                t_in = t_in.repeat(2, 1, 1)
                 y_uncond = y.clone()
                 y_uncond[:] = pad_idx
                 y_in = torch.cat([y, y_uncond], dim=0)
 
-                out = self(x_in, t_in, y_in)
+                out, logvar = self(x_in, t_in, y_in)
                 out_cond, out_uncond = out.chunk(2, dim=0)
-                x0_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond) # Assuming output is x1 or velocity
+                
+                # If output is x1, we compute velocity:
+                denom = torch.clamp(1.0 - t_current.view(B, 1, H_patch, W_patch), min=0.05)
+                v_pred = (v_pred - x) / denom
+                
+                logvar_cond, logvar_uncond = logvar.chunk(2, dim=0)
+                # Just use conditional uncertainty for thresholding
+                uc = logvar_cond
             else:
-                x0_pred = self(x, t, y)
-
-            denom = max(1.0 - t_val, 0.05)
-            v_pred = (x0_pred - x) / denom
-            x = x + v_pred * dt
+                x1_pred, logvar = self(x, t_in, y)
+                denom = torch.clamp(1.0 - t_current.view(B, 1, H_patch, W_patch), min=0.05)
+                v_pred = (x1_pred - x) / denom
+                uc = logvar
+                
+            # Average uncertainty over channels
+            uc = uc.mean(dim=1, keepdim=True) # (B, 1, H_patch, W_patch)
+            
+            # 2. Adaptive thresholding
+            # Flatten to find percentiles per item in batch
+            uc_flat = uc.view(B, -1)
+            # Find the value at percentile p (lower p = lower uncertainty = easier)
+            # Higher uncertainty means harder. The paper says: "percentile for confident pixels... our samplers perform best at around the 40% percentile"
+            # This means we take the bottom 40% of uncertainty values as confident.
+            k = int(p * uc_flat.shape[1])
+            k = max(1, min(k, uc_flat.shape[1] - 1))
+            tau_p = torch.kthvalue(uc_flat, k, dim=1).values.view(B, 1, 1, 1)
+            
+            M_conf = (uc <= tau_p).float()
+            M_unc = 1.0 - M_conf
+            
+            # 3. Look-ahead for context
+            # advance confident patches by alpha * dt, capped at 1.0
+            t_ctx = torch.clamp(t_current.view(B, 1, H_patch, W_patch) + alpha * dt, max=1.0)
+            x_ctx = x + (t_ctx - t_current.view(B, 1, H_patch, W_patch)) * v_pred
+            
+            # Create mixed input x_tilde
+            x_tilde = M_conf * x_ctx + M_unc * x
+            t_tilde = M_conf * t_ctx + M_unc * t_current.view(B, 1, H_patch, W_patch)
+            t_tilde_flat = t_tilde.view(B, H_patch * W_patch, 1)
+            
+            # 4. Context-aware velocity
+            t_in_tilde = t_tilde_flat * 1000
+            
+            if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+                x_in_tilde = x_tilde.repeat(2, 1, 1, 1)
+                t_in_tilde = t_in_tilde.repeat(2, 1, 1)
+                
+                out_tilde, _ = self(x_in_tilde, t_in_tilde, y_in)
+                out_cond_tilde, out_uncond_tilde = out_tilde.chunk(2, dim=0)
+                v_ctx_pred = out_uncond_tilde + cfg_scale * (out_cond_tilde - out_uncond_tilde)
+                
+                denom_tilde = torch.clamp(1.0 - t_tilde, min=0.05)
+                v_ctx_pred = (v_ctx_pred - x_tilde) / denom_tilde
+            else:
+                x1_tilde, _ = self(x_tilde, t_in_tilde, y)
+                denom_tilde = torch.clamp(1.0 - t_tilde, min=0.05)
+                v_ctx_pred = (x1_tilde - x_tilde) / denom_tilde
+                
+            # Replace uncertain prediction
+            v_final = M_unc * v_ctx_pred + M_conf * v_pred
+            
+            # 5. Advance all to t_next
+            x = x + (t_next_val - t_current.view(B, 1, H_patch, W_patch)) * v_final
+            
+            t_current = torch.full((B, H_patch * W_patch, 1), t_next_val, device=device)
 
         return x
 
