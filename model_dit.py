@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from functools import lru_cache
 from typing import Tuple
-from torch.utils.checkpoint import checkpoint
 from torch.utils.checkpoint import (
     checkpoint,
     create_selective_checkpoint_contexts,
@@ -170,7 +168,7 @@ class Attention(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1))
         self.beta = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor, pos, num_txt_tokens: int, v_skip: torch.Tensor = None) -> Tuple[
+    def forward(self, x: torch.Tensor, v_skip: torch.Tensor = None) -> Tuple[
         torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -178,14 +176,6 @@ class Attention(nn.Module):
 
         q = self.q_norm(q.contiguous())
         k = self.k_norm(k.contiguous())
-
-        q_txt, q_img = q[:, :, :num_txt_tokens], q[:, :, num_txt_tokens:]
-        k_txt, k_img = k[:, :, :num_txt_tokens], k[:, :, num_txt_tokens:]
-
-        # q_img, k_img = apply_rotary_emb(q_img, k_img, freqs_cis=pos)
-
-        q = torch.cat([q_txt, q_img], dim=2)
-        k = torch.cat([k_txt, k_img], dim=2)
 
         v_out = v
         if v_skip is not None:
@@ -203,23 +193,25 @@ class FlattenDiTBlock(nn.Module):
         super().__init__()
         self.norm1 = Norm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=True)
-        self.norm2_txt = Norm(hidden_size, eps=1e-6)
-        self.norm2_img = Norm(hidden_size, eps=1e-6)
+        self.norm2 = Norm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp_txt = FeedForward(hidden_size, mlp_hidden_dim)
-        self.mlp_img = FeedForwardDW(hidden_size, mlp_hidden_dim)
+        self.mlp = FeedForwardDW(hidden_size, mlp_hidden_dim)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
    #@torch.compile
-    def forward(self, x, pos, num_txt_tokens, H, W, v_skip=None):
-        attn_out, v_out = self.attn(self.norm1(x), pos, num_txt_tokens, v_skip=v_skip)
-        x = x + attn_out
+    def forward(self, x, c, H, W, v_skip=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).unsqueeze(1).chunk(6, dim=2)
+        attn_out, v_out = self.attn(modulate(self.norm1(x), shift_msa, scale_msa), v_skip=v_skip)
+        x = x + gate_msa * attn_out
 
-        x_txt, x_img = x[:, :num_txt_tokens], x[:, num_txt_tokens:]
+        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), H, W)
+        x = x + gate_mlp * mlp_out
 
-        x_txt = x_txt + self.mlp_txt(self.norm2_txt(x_txt))
-        x_img = x_img + self.mlp_img(self.norm2_img(x_img), H, W)
-
-        x = torch.cat([x_txt, x_img], dim=1)
         return x, v_out
 
 
@@ -249,13 +241,9 @@ class PixNerDiT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         self.y_embedder = nn.Sequential(
-            nn.Embedding(vocab_size, hidden_size),
-            Norm(hidden_size)
-        )
-
-        self.y_pos_embedding = torch.nn.Parameter(
-            torch.randn(1, txt_max_length, hidden_size),
-            requires_grad=True
+            nn.Linear(vocab_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size)
         )
 
         self.blocks = nn.ModuleList([
@@ -291,17 +279,17 @@ class PixNerDiT(nn.Module):
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
         x_unfolded = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
-        xpos = self.fetch_pos(H_patch, W_patch, x.device)
-        ypos = self.y_pos_embedding[:, :y.shape[1], :]
-        t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
+        
+        y_multi_hot = torch.zeros(B, self.vocab_size, dtype=x.dtype, device=y.device)
+        y_multi_hot.scatter_(1, y, 1.0)
+        y_emb = self.y_embedder(y_multi_hot).view(B, 1, self.hidden_size)
 
-        y_emb = self.y_embedder(y).view(B, -1, self.hidden_size)
+        t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
+        c = (t_emb + y_emb).view(B, self.hidden_size)
 
         s = self.s_embedder(x_unfolded)
-        s = s + t_emb.view(B, 1, self.hidden_size)
 
-        num_txt_tokens = y_emb.shape[1]
-        seq = torch.cat([y_emb, s], dim=1)
+        seq = s
 
         v_skips = []
         num_blocks = len(self.blocks)
@@ -315,18 +303,18 @@ class PixNerDiT(nn.Module):
                 v_skip = None
 
             if self.grad_checkpointing and self.training:
-                seq, v_out = checkpoint(block, seq, xpos, num_txt_tokens, H_patch, W_patch, v_skip, use_reentrant=False,
+                seq, v_out = checkpoint(block, seq, c, H_patch, W_patch, v_skip, use_reentrant=False,
                                         context_fn=context_fn)
             else:
-                seq, v_out = block(seq, xpos, num_txt_tokens, H_patch, W_patch, v_skip)
+                seq, v_out = block(seq, c, H_patch, W_patch, v_skip)
 
             if i < num_blocks // 2:
                 v_skips.append(v_out)
                 
             if return_layers is not None and i in return_layers:
-                layer_feats[i] = seq[:, num_txt_tokens:]
+                layer_feats[i] = seq
 
-        s = seq[:, num_txt_tokens:]
+        s = seq
 
         s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
         x_out = self.final_conv(s)
