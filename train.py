@@ -58,7 +58,6 @@ def _async_upload(ckpt_path, repo_id, step):
         print(f"[HF] Upload failed for {ckpt_path}: {e}")
 
 
-
 torch.backends.cuda.enable_flash_sdp(True)
 
 
@@ -408,14 +407,14 @@ def train(config_path):
                 y_input[drop_mask] = tag_processor.pad_idx
 
                 x0_pred, layer_feats = model(xt, t_condition, y_input, return_layers=[4, 12])
-                
-                feat_4 = layer_feats[4]
-                feat_12 = layer_feats[12].detach()
-                
+
+                feat_4 = layer_feats[8]
+                feat_12 = layer_feats[16].detach()
+
                 # LayerSync loss: -cosine similarity
                 layersync_loss = -F.cosine_similarity(feat_4, feat_12, dim=-1).mean()
                 lambda_sync = config['training'].get('lambda_sync', 0.2)
-                
+
                 # calculate v-space target
                 target_v = inputs - x0_noise
 
@@ -424,17 +423,13 @@ def train(config_path):
                 v_pred = (x0_pred - xt) / (1.0 - t_clipped)
 
                 # Pseudo-Huber Loss on velocity
-                ph_loss_raw = pseudo_huber_loss(v_pred, target_v, delta=1.0, reduction='none')
+                ph_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
                 ph_loss_mean = ph_loss_raw.mean()
-                
-                # DeCo Frequency-Aware Flow Matching Loss on data prediction x0
-                deco_loss_raw = deco_loss_fn(x0_pred, inputs)
-                deco_loss_mean = deco_loss_raw.mean()
 
-                loss = (ph_loss_mean + deco_loss_mean + lambda_sync * layersync_loss) / accum_steps
+                loss = (ph_loss_mean + lambda_sync * layersync_loss) / accum_steps
 
             loss.backward()
-            loss_accum += (ph_loss_mean.item() + deco_loss_mean.item())
+            loss_accum += ph_loss_mean.item()
             layersync_loss_accum += layersync_loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

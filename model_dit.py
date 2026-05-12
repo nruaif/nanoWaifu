@@ -195,7 +195,7 @@ class FlattenDiTBlock(nn.Module):
         self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=True)
         self.norm2 = Norm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = FeedForwardDW(hidden_size, mlp_hidden_dim)
+        self.mlp = FeedForward(hidden_size, mlp_hidden_dim)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -203,13 +203,14 @@ class FlattenDiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-   #@torch.compile
-    def forward(self, x, c, H, W, v_skip=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).unsqueeze(1).chunk(6, dim=2)
+    @torch.compile
+    def forward(self, x, c, v_skip=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).unsqueeze(1).chunk(6,
+                                                                                                                     dim=2)
         attn_out, v_out = self.attn(modulate(self.norm1(x), shift_msa, scale_msa), v_skip=v_skip)
         x = x + gate_msa * attn_out
 
-        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), H, W)
+        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         x = x + gate_mlp * mlp_out
 
         return x, v_out
@@ -221,7 +222,7 @@ class PixNerDiT(nn.Module):
             in_channels=3,
             num_groups=16,
             hidden_size=1024,
-            num_encoder_blocks=16,
+            num_encoder_blocks=24,
             patch_size=16,
             vocab_size=12477,
             txt_max_length=32,
@@ -257,6 +258,7 @@ class PixNerDiT(nn.Module):
         self.weight_path = weight_path
         self.load_ema = load_ema
         self.grad_checkpointing = False
+
     def enable_gradient_checkpointing(self):
         self.grad_checkpointing = True
 
@@ -267,6 +269,7 @@ class PixNerDiT(nn.Module):
             pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width).to(device)
             self.precompute_pos[(height, width)] = pos
             return pos
+
     def initialize_weights(self):
         w = self.s_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -279,7 +282,7 @@ class PixNerDiT(nn.Module):
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
         x_unfolded = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
-        
+
         y_multi_hot = torch.zeros(B, self.vocab_size, dtype=x.dtype, device=y.device)
         y_multi_hot.scatter_(1, y, 1.0)
         y_emb = self.y_embedder(y_multi_hot).view(B, 1, self.hidden_size)
@@ -294,6 +297,16 @@ class PixNerDiT(nn.Module):
         v_skips = []
         num_blocks = len(self.blocks)
         layer_feats = {}
+
+        # TREAD Routing Setup
+        route_start = 2
+        route_end = num_blocks - 2
+        route_ratio = 0.7
+        routed_seq = None
+        routed_indices = None
+        unrouted_indices = None
+        seq_len = seq.shape[1]
+
         for i, block in enumerate(self.blocks):
             if i < num_blocks // 2:
                 v_skip = None
@@ -302,15 +315,37 @@ class PixNerDiT(nn.Module):
             else:
                 v_skip = None
 
+            # TREAD: Remove tokens at start layer
+            if self.training and i == route_start:
+                num_route = int(seq_len * route_ratio)
+                perm = torch.randperm(seq_len, device=seq.device)
+                routed_indices = perm[:num_route]
+                unrouted_indices = perm[num_route:]
+                routed_seq = seq[:, routed_indices, :]
+                seq = seq[:, unrouted_indices, :]
+
+            # TREAD: Reintroduce tokens at end layer
+            if self.training and i == route_end and routed_seq is not None:
+                full_seq = torch.zeros(B, seq_len, self.hidden_size, dtype=seq.dtype, device=seq.device)
+
+                # Expand indices for scatter
+                r_idx_exp = routed_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
+                u_idx_exp = unrouted_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
+
+                full_seq.scatter_(1, r_idx_exp, routed_seq)
+                full_seq.scatter_(1, u_idx_exp, seq)
+                seq = full_seq
+                routed_seq = None
+
             if self.grad_checkpointing and self.training:
-                seq, v_out = checkpoint(block, seq, c, H_patch, W_patch, v_skip, use_reentrant=False,
+                seq, v_out = checkpoint(block, seq, c, v_skip, use_reentrant=False,
                                         context_fn=context_fn)
             else:
-                seq, v_out = block(seq, c, H_patch, W_patch, v_skip)
+                seq, v_out = block(seq, c, v_skip)
 
             if i < num_blocks // 2:
                 v_skips.append(v_out)
-                
+
             if return_layers is not None and i in return_layers:
                 layer_feats[i] = seq
 
@@ -320,7 +355,7 @@ class PixNerDiT(nn.Module):
         x_out = self.final_conv(s)
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-        
+
         if return_layers is not None:
             return x_out, layer_feats
         return x_out

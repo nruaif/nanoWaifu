@@ -24,7 +24,7 @@ model:
   use_vae: false
   use_tiny_vae: false
   fcdm_dim: 1024
-  fcdm_depth: 16
+  fcdm_depth: 24
   num_heads: 16
   in_channels: 3
   lambda_nll: 0.01
