@@ -13,10 +13,13 @@ import builtins
 import torch.nn.functional as F
 from huggingface_hub import upload_file
 import threading
-import timm
 import torchvision.transforms.functional as TF
 
+from loss import FrequencyAwareFMLoss, pseudo_huber_loss, massive_cosine_sim
 from model_dit import PixNerDiT as ModelClass
+
+# Initialize DeCo Loss
+deco_loss_fn = FrequencyAwareFMLoss(reduction="none")
 
 
 class TagProcessor:
@@ -54,21 +57,6 @@ def _async_upload(ckpt_path, repo_id, step):
     except Exception as e:
         print(f"[HF] Upload failed for {ckpt_path}: {e}")
 
-DINO_MEAN = [0.485, 0.456, 0.406]
-DINO_STD = [0.229, 0.224, 0.225]
-
-def preprocess_for_dino(imgs):
-    if imgs.min() < 0:
-        imgs = (imgs + 1.0) / 2.0
-    
-    # Ensure dimensions are multiples of 32
-    B, C, H, W = imgs.shape
-    new_h = max(32, round(H / 32) * 32)
-    new_w = max(32, round(W / 32) * 32)
-    if new_h != H or new_w != W:
-        imgs = TF.resize(imgs, [new_h, new_w], interpolation=TF.InterpolationMode.BICUBIC)
-        
-    return TF.normalize(imgs, mean=DINO_MEAN, std=DINO_STD)
 
 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -115,7 +103,7 @@ def save_checkpoint(
         config,
         fixed_prompts=None,
         fixed_noise=None,
-        push_to_hf=False,
+        push_to_hf=True,
         repo_id="Shio-Koube/ConvNext-Diff"
 ):
     if rank != 0:
@@ -230,14 +218,7 @@ def train(config_path):
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    print(">>> Loading DINOv2 model...")
-    dino_model = timm.create_model(
-        "vit_base_patch16_dinov3_qkvb.lvd1689m",
-        pretrained=True, num_classes=0,
-    ).to(device=device).eval()
-
     patch_size = config['model'].get('patch_size', 2)
-
     model = ModelClass(
         in_channels=3,
         hidden_size=1024,
@@ -364,7 +345,7 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
-    running_repa_loss = 0.0
+    running_layersync_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
 
     while global_step < config['training'].get('max_train_steps', 1000000):
@@ -372,7 +353,7 @@ def train(config_path):
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
-        repa_loss_accum = 0.0
+        layersync_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -409,15 +390,6 @@ def train(config_path):
 
             B, C, H, W = inputs.shape
 
-            # Get DINO features
-            with torch.no_grad():
-                dino_inputs = preprocess_for_dino(images).to(dtype=torch.float32)
-                dino_out = dino_model.forward_features(dino_inputs)
-                if isinstance(dino_out, (list, tuple)):
-                    dino_feat = dino_out[0]
-                else:
-                    dino_feat = dino_out
-
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Generate timestep
                 t = torch.rand((B,), device=device)
@@ -435,17 +407,23 @@ def train(config_path):
                 y_input = y_indices.clone()
                 y_input[drop_mask] = tag_processor.pad_idx
 
-                x0_pred, layer_4_feat = model(xt, t_condition, y_input, return_layer_4_feat=True)
+                x0_pred, layer_feats = model(xt, t_condition, y_input, return_layers=[4, 12])
                 
-                # process dino
-                B_dino, _, H_dino, W_dino = dino_inputs.shape
-                H_patch, W_patch = H_dino // 16, W_dino // 16
-                base_model = model.module if hasattr(model, 'module') else model
-                target_feat = base_model.process_dino_features(dino_feat, H_patch, W_patch)
+                feat_4 = layer_feats[4]
+                feat_12 = layer_feats[12].detach()
                 
-                # cosine sim loss
-                sim_loss = 1.0 - F.cosine_similarity(layer_4_feat, target_feat, dim=-1).mean()
-
+                # LayerSync loss: massive-aware cosine similarity
+                sim_massive, _ = massive_cosine_sim(
+                    feat_4,
+                    feat_12,
+                    topk_ratio=0.03,
+                    alpha=0.4,
+                    clamp_value=20.0,
+                )
+                diag_massive = sim_massive.diagonal(dim1=-2, dim2=-1)
+                layersync_loss = -diag_massive.mean()
+                lambda_sync = config['training'].get('lambda_sync', 0.2)
+                
                 # calculate v-space target
                 target_v = inputs - x0_noise
 
@@ -453,34 +431,35 @@ def train(config_path):
                 t_clipped = torch.clamp(t_expand, max=0.95)
                 v_pred = (x0_pred - xt) / (1.0 - t_clipped)
 
-                mse_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
-                mse_loss_mean = mse_loss_raw.mean()
-
-                loss = (mse_loss_mean + sim_loss) / accum_steps
+                # Pseudo-Huber Loss on velocity
+                ph_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
+                ph_loss_mean = ph_loss_raw.mean()
+                
+                loss = (ph_loss_mean + lambda_sync * layersync_loss) / accum_steps
 
             loss.backward()
-            loss_accum += (mse_loss_mean.item() + sim_loss.item())
-            repa_loss_accum += sim_loss.item()
+            loss_accum += ph_loss_mean.item()
+            layersync_loss_accum += layersync_loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
-        running_repa_loss += repa_loss_accum
+        running_layersync_loss += layersync_loss_accum
 
         if rank == 0:
             pbar.update(1)
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
-                avg_repa_loss = running_repa_loss / log_interval
-                log_dict = {"train/loss": avg_loss, "train/repa_loss": avg_repa_loss}
+                avg_ls_loss = running_layersync_loss / log_interval
+                log_dict = {"train/loss": avg_loss, "train/layersync": avg_ls_loss}
 
                 wandb.log(log_dict, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "repa": f"{avg_repa_loss:.4f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "ls": f"{avg_ls_loss:.4f}"})
                 running_loss = 0.0
-                running_repa_loss = 0.0
+                running_layersync_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
