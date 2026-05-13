@@ -137,15 +137,18 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
+        """Supports arbitrary-rank t: (B,) for global or (B, N) for per-patch."""
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
-        args = t[..., None].float() * freqs[None, ...]
+        args = t[..., None].float() * freqs  # broadcasts: (..., 1) * (half,) -> (..., half)
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2: embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[..., :1])], dim=-1)
         return embedding.to(dtype=t.dtype)
 
     def forward(self, t):
+        """t: (B,) for global timestep or (B, N) for per-patch timesteps."""
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         return self.mlp(t_freq)
 
@@ -264,11 +267,17 @@ class PixNerDiT(nn.Module):
 
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
 
+        # Patch Forcing: per-patch uncertainty/logvar head
+        self.logvar_head = nn.Linear(hidden_size, 1, bias=True)
+        nn.init.constant_(self.logvar_head.weight, 0)
+        nn.init.constant_(self.logvar_head.bias, 0)
+
         self.initialize_weights()
         self.precompute_pos = dict()
         self.weight_path = weight_path
         self.load_ema = load_ema
         self.grad_checkpointing = False
+
     def enable_gradient_checkpointing(self):
         self.grad_checkpointing = True
 
@@ -279,6 +288,7 @@ class PixNerDiT(nn.Module):
             pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width).to(device)
             self.precompute_pos[(height, width)] = pos
             return pos
+
     def initialize_weights(self):
         w = self.s_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -287,18 +297,36 @@ class PixNerDiT(nn.Module):
         nn.init.constant_(self.final_conv.weight, 0)
 
     def forward(self, x, t, y, return_layers=None):
+        """
+        Args:
+            x: (B, C, H, W) noisy input
+            t: (B,) global timestep OR (B, N) per-patch timesteps (scaled by 1000)
+            y: (B, txt_len) token indices
+            return_layers: optional list of layer indices to return features from
+        Returns:
+            x_out: (B, C, H, W) velocity prediction
+            logvar_theta: (B, 1, H_patch, W_patch) per-patch log-variance
+            [layer_feats]: optional dict of intermediate features
+        """
         B, _, H, W = x.shape
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
         x_unfolded = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H_patch, W_patch, x.device)
         ypos = self.y_pos_embedding[:, :y.shape[1], :]
-        t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
+
+        # Handle both global (B,) and per-patch (B, N) timesteps
+        if t.dim() == 1:
+            # Global timestep: broadcast to all patches
+            t_emb = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
+        else:
+            # Per-patch timesteps: (B, N) -> (B, N, D)
+            t_emb = self.t_embedder(t)  # (B, N, D)
 
         y_emb = self.y_embedder(y).view(B, -1, self.hidden_size)
 
         s = self.s_embedder(x_unfolded)
-        s = s + t_emb.view(B, 1, self.hidden_size)
+        s = s + t_emb  # (B, N, D) + (B, 1, D) or (B, N, D)
 
         num_txt_tokens = y_emb.shape[1]
         seq = torch.cat([y_emb, s], dim=1)
@@ -322,23 +350,28 @@ class PixNerDiT(nn.Module):
 
             if i < num_blocks // 2:
                 v_skips.append(v_out)
-                
+
             if return_layers is not None and i in return_layers:
                 layer_feats[i] = seq[:, num_txt_tokens:]
 
-        s = seq[:, num_txt_tokens:]
+        s = seq[:, num_txt_tokens:]  # (B, N, D)
+
+        # Patch Forcing: predict per-patch logvar from patch tokens
+        logvar_theta = self.logvar_head(s)  # (B, N, 1)
+        logvar_theta = logvar_theta.transpose(1, 2).reshape(B, 1, H_patch, W_patch)  # (B, 1, Hp, Wp)
 
         s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
         x_out = self.final_conv(s)
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-        
+
         if return_layers is not None:
-            return x_out, layer_feats
-        return x_out
+            return x_out, logvar_theta, layer_feats
+        return x_out, logvar_theta
 
     @torch.no_grad()
     def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None):
+        """Standard Euler sampler (global timesteps). Ignores logvar output."""
         x = torch.randn(B, self.in_channels, H, W, device=device)
         dt = 1.0 / steps
         for step in range(steps):
@@ -352,15 +385,110 @@ class PixNerDiT(nn.Module):
                 y_uncond[:] = pad_idx
                 y_in = torch.cat([y, y_uncond], dim=0)
 
-                out = self(x_in, t_in, y_in)
+                out, _ = self(x_in, t_in, y_in)
                 out_cond, out_uncond = out.chunk(2, dim=0)
                 x0_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
-                x0_pred = self(x, t, y)
+                x0_pred, _ = self(x, t, y)
 
             denom = max(1.0 - t_val, 0.05)
             v_pred = (x0_pred - x) / denom
             x = x + v_pred * dt
+
+        return x
+
+    @torch.no_grad()
+    def sample_lookahead(self, B, H, W, device, steps=50, y=None,
+                         cfg_scale=4.0, pad_idx=None,
+                         alpha=1.5, percentile=0.40):
+        """
+        Look-Ahead adaptive sampler from Patch Forcing.
+        Advances confident patches ahead in time to provide context for uncertain ones.
+
+        Args:
+            alpha: context advance factor (t_ctx = min(alpha * t, 1.0))
+            percentile: fraction of patches considered 'confident' (low uncertainty)
+        """
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+        N = H_patch * W_patch
+        x = torch.randn(B, self.in_channels, H, W, device=device)
+        dt = 1.0 / steps
+
+        for step in range(steps):
+            t_val = step * dt
+            t_next = (step + 1) * dt
+            t_global = torch.full((B,), t_val, device=device) * 1000
+
+            # --- Step 1: Get velocity + uncertainty with CFG ---
+            if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+                x_in = x.repeat(2, 1, 1, 1)
+                t_in = t_global.repeat(2)
+                y_uncond = y.clone()
+                y_uncond[:] = pad_idx
+                y_in = torch.cat([y, y_uncond], dim=0)
+
+                out, logvar_out = self(x_in, t_in, y_in)
+                out_cond, out_uncond = out.chunk(2, dim=0)
+                x0_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+                # Use conditional logvar for difficulty estimate
+                logvar_cond, _ = logvar_out.chunk(2, dim=0)
+                uc = logvar_cond  # (B, 1, Hp, Wp)
+            else:
+                x0_pred, uc = self(x, t_global, y)
+
+            denom = max(1.0 - t_val, 0.05)
+            v_pred = (x0_pred - x) / denom
+
+            # --- Step 2: Identify confident patches ---
+            uc_flat = uc.view(B, -1)  # (B, N)
+            k = max(1, int(N * percentile))
+            tau = uc_flat.kthvalue(k, dim=-1).values  # (B,) - threshold
+            M_conf = (uc_flat <= tau.unsqueeze(-1))  # (B, N) bool mask
+
+            # --- Step 3: Advance confident patches ---
+            t_ctx = min(alpha * t_val, 1.0)
+            if t_ctx > t_val + 1e-6 and step < steps - 1:
+                # Advance confident regions in pixel space
+                x_ctx = x + (t_ctx - t_val) * v_pred
+
+                # Build per-patch mixed timestep map
+                t_conf_val = t_ctx * 1000
+                t_unc_val = t_val * 1000
+                t_mixed = torch.where(
+                    M_conf,
+                    torch.full_like(uc_flat, t_conf_val),
+                    torch.full_like(uc_flat, t_unc_val)
+                )  # (B, N)
+
+                # Build mixed spatial state: confident patches advanced, others unchanged
+                # Create pixel-space mask by upsampling patch mask
+                M_pixel = M_conf.view(B, 1, H_patch, W_patch).float()
+                M_pixel = M_pixel.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
+                x_tilde = M_pixel * x_ctx + (1 - M_pixel) * x
+
+                # --- Step 4: Context-aware re-evaluation ---
+                if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+                    x_t_in = x_tilde.repeat(2, 1, 1, 1)
+                    t_m_in = t_mixed.repeat(2, 1)
+                    y_in2 = torch.cat([y, y_uncond], dim=0)
+
+                    out2, _ = self(x_t_in, t_m_in, y_in2)
+                    out2_cond, out2_uncond = out2.chunk(2, dim=0)
+                    x0_ctx = out2_uncond + cfg_scale * (out2_cond - out2_uncond)
+                else:
+                    x0_ctx, _ = self(x_tilde, t_mixed, y)
+
+                v_ctx = (x0_ctx - x) / denom
+
+                # --- Step 5: Combine velocities ---
+                # Use context-aware velocity for uncertain patches, original for confident
+                M_pixel_bool = M_pixel > 0.5
+                v_final = torch.where(M_pixel_bool, v_pred, v_ctx)
+            else:
+                v_final = v_pred
+
+            x = x + v_final * dt
 
         return x
 
@@ -553,7 +681,7 @@ if __name__ == "__main__":
     )
 
     with torch.no_grad():
-        out = model(x, t, y)
+        out, logvar = model(x, t, y)
 
     print("\nOutput stats:")
     print(
@@ -561,6 +689,12 @@ if __name__ == "__main__":
         f"mean={out.mean().item():+.5f} "
         f"std={out.std().item():.5f} "
         f"absmax={out.abs().max().item():.5f}"
+    )
+    print(f"\nLogvar stats:")
+    print(
+        f"shape={tuple(logvar.shape)} "
+        f"mean={logvar.mean().item():+.5f} "
+        f"std={logvar.std().item():.5f} "
     )
 
     # Print activation stats

@@ -17,7 +17,13 @@ training:
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
-  sampler_type: "euler"
+  sampler_type: "euler"  # 'euler' or 'lookahead'
+
+  # Patch Forcing: LTG timestep sampler
+  ltg_loc: 0.0
+  ltg_scale: 1.0
+  ltg_std: 0.5
+  lambda_uncertainty: 0.01
 
 model:
   type: "dit"
