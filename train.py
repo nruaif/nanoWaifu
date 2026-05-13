@@ -225,6 +225,7 @@ def train(config_path):
         patch_size=16,
         vocab_size=num_classes,
         txt_max_length=tag_processor.max_tags,
+        route_ratio=config['model'].get('sprint_route_ratio', 0.75),
     ).to(device=device)
 
     if config['training'].get('gradient_checkpointing', False):
@@ -391,12 +392,41 @@ def train(config_path):
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Generate timestep
-                t = torch.rand((B,), device=device)
-                t_condition = t * 1000
+                if config['training'].get('patch_forcing', True):
+                    # LTG Sampler
+                    patch_sz = model.module.patch_size if hasattr(model, 'module') else model.patch_size
+                    N = (H // patch_sz) * (W // patch_sz)
+                    
+                    m = config['training'].get('ltg_m', 0.0)
+                    s = config['training'].get('ltg_s', 1.0)
+                    sigma = config['training'].get('ltg_sigma', 0.25)
+                    
+                    epsilon = torch.randn(B, device=device)
+                    t_max = torch.sigmoid(m + s * epsilon)
+                    
+                    std = torch.clamp(t_max / 2, max=sigma)
+                    t_max_exp = t_max.unsqueeze(1)
+                    std_exp = std.unsqueeze(1)
+                    
+                    eps = torch.randn(B, N, device=device)
+                    t = t_max_exp - torch.abs(eps) * std_exp
+                    
+                    neg_mask = t < 0
+                    if neg_mask.any():
+                        t[neg_mask] = torch.rand_like(t[neg_mask]) * t_max_exp.expand(B, N)[neg_mask]
+                        
+                    t_condition = t * 1000
+                    # For XT interpolation, we need pixel level t
+                    t_pixel = t.view(B, 1, H // patch_sz, W // patch_sz)
+                    t_pixel = F.interpolate(t_pixel, scale_factor=patch_sz, mode='nearest')
+                    t_expand = t_pixel
+                else:
+                    t = torch.rand((B,), device=device)
+                    t_condition = t * 1000
+                    t_expand = t.view(B, 1, 1, 1)
 
                 x0_noise = torch.randn_like(inputs)
 
-                t_expand = t.view(B, 1, 1, 1)
                 xt = t_expand * inputs + (1 - t_expand) * x0_noise
 
                 # CFG Dropout Mask
@@ -406,7 +436,11 @@ def train(config_path):
                 y_input = y_indices.clone()
                 y_input[drop_mask] = tag_processor.pad_idx
 
-                x0_pred, layer_feats = model(xt, t_condition, y_input, return_layers=[4, 12])
+                # SPRINT Path-Drop Guidance (PDG) Mask
+                path_drop_prob = config['training'].get('sprint_path_drop_prob', 0.1)
+                is_path_drop = torch.rand(1).item() < path_drop_prob
+
+                x0_pred, logvar_theta, layer_feats = model(xt, t_condition, y_input, return_layers=[4, 12], path_drop=is_path_drop)
 
                 feat_4 = layer_feats[8]
                 feat_12 = layer_feats[16].detach()
@@ -426,7 +460,16 @@ def train(config_path):
                 ph_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
                 ph_loss_mean = ph_loss_raw.mean()
 
-                loss = (ph_loss_mean + lambda_sync * layersync_loss) / accum_steps
+                # Uncertainty loss
+                patch_sz = model.module.patch_size if hasattr(model, 'module') else model.patch_size
+                logvar_expanded = F.interpolate(logvar_theta, scale_factor=patch_sz, mode='nearest')
+                
+                mse_detached = F.mse_loss(v_pred.detach(), target_v, reduction='none').mean(dim=1, keepdim=True)
+                unc_loss = 0.5 * (mse_detached / torch.exp(logvar_expanded) + logvar_expanded).mean()
+                
+                lambda_unc = 0.01
+
+                loss = (ph_loss_mean + lambda_sync * layersync_loss + lambda_unc * unc_loss) / accum_steps
 
             loss.backward()
             loss_accum += ph_loss_mean.item()
@@ -467,7 +510,11 @@ def train(config_path):
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         samples = base_model.sample(
                             B=val_y.shape[0], H=H_val, W=W_val,
-                            device=device, steps=50, y=val_y, cfg_scale=4.0, pad_idx=tag_processor.pad_idx
+                            device=device, steps=50, y=val_y, cfg_scale=4.0, pad_idx=tag_processor.pad_idx,
+                            sampler_type=config['training'].get('sampler_type', 'euler'),
+                            sampler_percentile=config['training'].get('sampler_percentile', 0.4),
+                            sampler_alpha=config['training'].get('sampler_alpha', 1.5),
+                            sampler_inner_steps=config['training'].get('sampler_inner_steps', 10)
                         )
 
                     if use_tiny_vae or use_vae:

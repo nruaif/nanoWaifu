@@ -155,7 +155,8 @@ class Attention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim * 4, bias=qkv_bias)
+        self.lam_proj = nn.Linear(dim, num_heads, bias=True)
 
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
@@ -164,28 +165,38 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         nn.init.constant_(self.proj.weight, 0)
+        nn.init.constant_(self.lam_proj.weight, 0)
+        nn.init.constant_(self.lam_proj.bias, 0)
 
-        self.alpha = nn.Parameter(torch.ones(1))
-        self.beta = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x: torch.Tensor, v_skip: torch.Tensor = None) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = self.qkv(x)
+        q, k, v = torch.split(qkv, [self.dim * 2, self.dim, self.dim], dim=-1)
+
+        q = q.reshape(B, N, self.num_heads * 2, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         q = self.q_norm(q.contiguous())
         k = self.k_norm(k.contiguous())
 
-        v_out = v
-        if v_skip is not None:
-            v = v * self.alpha + v_skip * self.beta
+        k = k.repeat_interleave(2, dim=1)
+        v = v.repeat_interleave(2, dim=1)
 
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x, v_out
+        lam = self.lam_proj(x)
+        lam = lam.transpose(1, 2).unsqueeze(-1)
+
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn1 = attn[:, 0::2]
+        attn2 = attn[:, 1::2]
+
+        lam_val = torch.sigmoid(lam)
+        x_out = attn1 - lam_val * attn2
+
+        x_out = x_out.transpose(1, 2).reshape(B, N, C)
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        return x_out
 
 
 class FlattenDiTBlock(nn.Module):
@@ -203,17 +214,15 @@ class FlattenDiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    @torch.compile
-    def forward(self, x, c, v_skip=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).unsqueeze(1).chunk(6,
-                                                                                                                     dim=2)
-        attn_out, v_out = self.attn(modulate(self.norm1(x), shift_msa, scale_msa), v_skip=v_skip)
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        attn_out = self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_msa * attn_out
 
         mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         x = x + gate_mlp * mlp_out
 
-        return x, v_out
+        return x
 
 
 class PixNerDiT(nn.Module):
@@ -228,6 +237,7 @@ class PixNerDiT(nn.Module):
             txt_max_length=32,
             weight_path=None,
             load_ema=False,
+            route_ratio=0.75,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -238,6 +248,7 @@ class PixNerDiT(nn.Module):
         self.patch_size = patch_size
         self.vocab_size = vocab_size
         self.txt_max_length = txt_max_length
+        self.route_ratio = route_ratio
         self.s_embedder = Embed(in_channels * patch_size ** 2, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
@@ -252,6 +263,11 @@ class PixNerDiT(nn.Module):
         ])
 
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
+        self.uncertainty_head = nn.Linear(self.hidden_size, 1)
+
+        self.sink_tokens = nn.Parameter(torch.zeros(1, 4, hidden_size))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.fusion_proj = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
         self.initialize_weights()
         self.precompute_pos = dict()
@@ -276,8 +292,14 @@ class PixNerDiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.constant_(self.final_conv.weight, 0)
+        nn.init.constant_(self.uncertainty_head.weight, 0)
+        nn.init.constant_(self.uncertainty_head.bias, 0)
+        nn.init.normal_(self.sink_tokens, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.constant_(self.fusion_proj.weight, 0)
+        nn.init.constant_(self.fusion_proj.bias, 0)
 
-    def forward(self, x, t, y, return_layers=None):
+    def forward(self, x, t, y, return_layers=None, path_drop=False):
         B, _, H, W = x.shape
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
@@ -287,103 +309,168 @@ class PixNerDiT(nn.Module):
         y_multi_hot.scatter_(1, y, 1.0)
         y_emb = self.y_embedder(y_multi_hot).view(B, 1, self.hidden_size)
 
-        t_emb = self.t_embedder(t.view(-1)).view(B, 1, self.hidden_size)
-        c = (t_emb + y_emb).view(B, self.hidden_size)
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+            
+        t_emb = self.t_embedder(t)
+        c = t_emb + y_emb
 
-        s = self.s_embedder(x_unfolded)
+        seq = self.s_embedder(x_unfolded)
 
-        seq = s
-
-        v_skips = []
         num_blocks = len(self.blocks)
         layer_feats = {}
 
-        # TREAD Routing Setup
+        # SPRINT Routing Setup
         route_start = 2
         route_end = num_blocks - 2
-        route_ratio = 0.7
-        routed_seq = None
+        route_ratio = 0.75
         routed_indices = None
         unrouted_indices = None
         seq_len = seq.shape[1]
+        dense_features = None
 
         for i, block in enumerate(self.blocks):
-            if i < num_blocks // 2:
-                v_skip = None
-            elif i > num_blocks // 2 or (num_blocks % 2 == 0 and i >= num_blocks // 2):
-                v_skip = v_skips.pop()
-            else:
-                v_skip = None
+            if i == route_start:
+                dense_features = seq
+                if path_drop:
+                    pass
+                elif self.training:
+                    num_route = int(seq_len * route_ratio)
+                    perm = torch.randperm(seq_len, device=seq.device)
+                    routed_indices = perm[:num_route]
+                    unrouted_indices = perm[num_route:]
+                    seq = seq[:, unrouted_indices, :]
 
-            # TREAD: Remove tokens at start layer
-            if self.training and i == route_start:
-                num_route = int(seq_len * route_ratio)
-                perm = torch.randperm(seq_len, device=seq.device)
-                routed_indices = perm[:num_route]
-                unrouted_indices = perm[num_route:]
-                routed_seq = seq[:, routed_indices, :]
-                seq = seq[:, unrouted_indices, :]
+            if path_drop and route_start <= i < route_end:
+                continue
 
-            # TREAD: Reintroduce tokens at end layer
-            if self.training and i == route_end and routed_seq is not None:
-                full_seq = torch.zeros(B, seq_len, self.hidden_size, dtype=seq.dtype, device=seq.device)
-
-                # Expand indices for scatter
-                r_idx_exp = routed_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
-                u_idx_exp = unrouted_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
-
-                full_seq.scatter_(1, r_idx_exp, routed_seq)
-                full_seq.scatter_(1, u_idx_exp, seq)
-                seq = full_seq
-                routed_seq = None
+            if i == route_end:
+                if path_drop:
+                    g_pad = self.mask_token.expand(B, seq_len, -1)
+                    fused = torch.cat([dense_features, g_pad], dim=-1)
+                    seq = self.fusion_proj(fused)
+                else:
+                    if self.training and routed_indices is not None:
+                        g_pad = torch.zeros(B, seq_len, self.hidden_size, dtype=seq.dtype, device=seq.device)
+                        r_idx_exp = routed_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
+                        u_idx_exp = unrouted_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, self.hidden_size)
+                        mask_tokens = self.mask_token.expand(B, len(routed_indices), -1)
+                        g_pad.scatter_(1, r_idx_exp, mask_tokens)
+                        g_pad.scatter_(1, u_idx_exp, seq)
+                        seq = g_pad
+                    else:
+                        seq = seq
+                    fused = torch.cat([dense_features, seq], dim=-1)
+                    seq = self.fusion_proj(fused)
 
             if self.grad_checkpointing and self.training:
-                seq, v_out = checkpoint(block, seq, c, v_skip, use_reentrant=False,
-                                        context_fn=context_fn)
+                seq = checkpoint(block, seq, c, use_reentrant=False, context_fn=context_fn)
             else:
-                seq, v_out = block(seq, c, v_skip)
-
-            if i < num_blocks // 2:
-                v_skips.append(v_out)
+                seq = block(seq, c)
 
             if return_layers is not None and i in return_layers:
                 layer_feats[i] = seq
 
-        s = seq
+        logvar_theta = self.uncertainty_head(seq)
+        logvar_theta = logvar_theta.transpose(1, 2).reshape(B, 1, H_patch, W_patch)
 
+        s = seq
         s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
         x_out = self.final_conv(s)
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
 
         if return_layers is not None:
-            return x_out, layer_feats
-        return x_out
+            return x_out, logvar_theta, layer_feats
+        return x_out, logvar_theta
 
     @torch.no_grad()
-    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None):
+    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None, sampler_type="euler", sampler_percentile=0.4, sampler_alpha=1.5, sampler_inner_steps=10):
         x = torch.randn(B, self.in_channels, H, W, device=device)
         dt = 1.0 / steps
         for step in range(steps):
             t_val = step * dt
             t = torch.full((B,), t_val, device=device) * 1000
 
-            if cfg_scale > 1.0 and y is not None and pad_idx is not None:
-                x_in = x.repeat(2, 1, 1, 1)
-                t_in = t.repeat(2)
-                y_uncond = y.clone()
-                y_uncond[:] = pad_idx
-                y_in = torch.cat([y, y_uncond], dim=0)
-
-                out = self(x_in, t_in, y_in)
-                out_cond, out_uncond = out.chunk(2, dim=0)
+            if cfg_scale > 1.0 and y is not None:
+                out_cond, uc_cond = self(x, t, y, path_drop=False)
+                out_uncond, uc_uncond = self(x, t, y, path_drop=True)
                 x0_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+                uc_pred = uc_cond
             else:
-                x0_pred = self(x, t, y)
+                x0_pred, uc_pred = self(x, t, y, path_drop=False)
 
             denom = max(1.0 - t_val, 0.05)
             v_pred = (x0_pred - x) / denom
-            x = x + v_pred * dt
+            
+            if sampler_type == "euler":
+                x = x + v_pred * dt
+                
+            elif sampler_type == "look-ahead":
+                uc_flat = uc_pred.reshape(B, -1)
+                k = max(1, int(uc_flat.shape[1] * sampler_percentile))
+                tau_p = torch.kthvalue(uc_flat, k, dim=1).values.view(B, 1, 1, 1)
+                
+                uc_upscaled = F.interpolate(uc_pred, scale_factor=self.patch_size, mode='nearest')
+                M_conf = (uc_upscaled <= tau_p).float()
+                M_unc = 1.0 - M_conf
+                
+                t_ctx_val = min(sampler_alpha * t_val, 1.0)
+                if t_ctx_val <= t_val:
+                    t_ctx_val = t_val + dt # always provide at least one step lookahead
+                    
+                x_ctx = x + v_pred * (t_ctx_val - t_val)
+                x_mix = M_conf * x_ctx + M_unc * x
+                
+                t_mix_pixel = M_conf * t_ctx_val + M_unc * t_val
+                t_mix_patch = F.interpolate(t_mix_pixel, scale_factor=1/self.patch_size, mode='nearest')
+                t_mix_tensor = t_mix_patch * 1000
+                
+                if cfg_scale > 1.0 and y is not None:
+                    out_cond, _ = self(x_mix, t_mix_tensor, y, path_drop=False)
+                    out_uncond, _ = self(x_mix, t_mix_tensor, y, path_drop=True)
+                    x0_mix = out_uncond + cfg_scale * (out_cond - out_uncond)
+                else:
+                    x0_mix, _ = self(x_mix, t_mix_tensor, y, path_drop=False)
+                
+                v_ctx = (x0_mix - x) / denom
+                v_final = M_unc * v_ctx + M_conf * v_pred
+                x = x + v_final * dt
+                
+            elif sampler_type == "dual-loop":
+                uc_flat = uc_pred.reshape(B, -1)
+                k = max(1, int(uc_flat.shape[1] * sampler_percentile))
+                tau_p = torch.kthvalue(uc_flat, k, dim=1).values.view(B, 1, 1, 1)
+                
+                uc_upscaled = F.interpolate(uc_pred, scale_factor=self.patch_size, mode='nearest')
+                M_conf = (uc_upscaled <= tau_p).float()
+                M_unc = 1.0 - M_conf
+                
+                dt_inner = dt / sampler_inner_steps
+                x_conf_next = x + v_pred * dt
+                x_inner = x.clone()
+                
+                t_next_val = t_val + dt
+                
+                for inner in range(sampler_inner_steps):
+                    t_inner_val = t_val + inner * dt_inner
+                    t_mix_pixel = M_conf * t_next_val + M_unc * t_inner_val
+                    t_mix_patch = F.interpolate(t_mix_pixel, scale_factor=1/self.patch_size, mode='nearest')
+                    t_mix_tensor = t_mix_patch * 1000
+                    
+                    x_mix = M_conf * x_conf_next + M_unc * x_inner
+                    
+                    if cfg_scale > 1.0 and y is not None:
+                        out_cond, _ = self(x_mix, t_mix_tensor, y, path_drop=False)
+                        out_uncond, _ = self(x_mix, t_mix_tensor, y, path_drop=True)
+                        x0_mix = out_uncond + cfg_scale * (out_cond - out_uncond)
+                    else:
+                        x0_mix, _ = self(x_mix, t_mix_tensor, y, path_drop=False)
+                        
+                    v_mix = (x0_mix - x_inner) / max(1.0 - t_inner_val, 0.05)
+                    x_inner = x_inner + v_mix * dt_inner
+                    
+                x = M_conf * x_conf_next + M_unc * x_inner
 
         return x
 
@@ -542,14 +629,6 @@ if __name__ == "__main__":
 
     model = PixNerDiT().to(device=device, dtype=torch.float32)
 
-    ckpt_path = "ckpt_step_185000.pth"
-
-    load_checkpoint(
-        model,
-        ckpt_path,
-        device=device,
-        ema_key=None,  # e.g. "ema" if your checkpoint stores EMA weights
-    )
 
     model.eval()
 
@@ -558,37 +637,3 @@ if __name__ == "__main__":
 
     # Print weight stats
     print_weight_statistics(model)
-
-    # Register activation hooks
-    activation_stats, handles = register_activation_hooks(model)
-
-    # Single-image forward pass
-    x = torch.randn(1, 3, 256, 256, dtype=torch.float32, device=device)
-
-    t = torch.rand(1, dtype=torch.float32, device=device) * 1000
-
-    y = torch.randint(
-        0,
-        1000,
-        (1, 16),
-        dtype=torch.long,
-        device=device
-    )
-
-    with torch.no_grad():
-        out = model(x, t, y)
-
-    print("\nOutput stats:")
-    print(
-        f"shape={tuple(out.shape)} "
-        f"mean={out.mean().item():+.5f} "
-        f"std={out.std().item():.5f} "
-        f"absmax={out.abs().max().item():.5f}"
-    )
-
-    # Print activation stats
-    print_activation_statistics(activation_stats)
-
-    # Cleanup hooks
-    for h in handles:
-        h.remove()
