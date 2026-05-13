@@ -234,7 +234,7 @@ class PixNerDiT(nn.Module):
             hidden_size=1024,
             num_encoder_blocks=16,
             patch_size=16,
-            vocab_size=12477,
+            text_embed_dim=1024,  # Changed from vocab_size
             txt_max_length=32,
             weight_path=None,
             load_ema=False,
@@ -246,13 +246,13 @@ class PixNerDiT(nn.Module):
         self.num_groups = num_groups
         self.num_encoder_blocks = num_encoder_blocks
         self.patch_size = patch_size
-        self.vocab_size = vocab_size
+        self.text_embed_dim = text_embed_dim
         self.txt_max_length = txt_max_length
         self.s_embedder = Embed(in_channels * patch_size ** 2, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         self.y_embedder = nn.Sequential(
-            nn.Embedding(vocab_size, hidden_size),
+            nn.Linear(text_embed_dim, hidden_size),
             Norm(hidden_size)
         )
 
@@ -301,7 +301,7 @@ class PixNerDiT(nn.Module):
         Args:
             x: (B, C, H, W) noisy input
             t: (B,) global timestep OR (B, N) per-patch timesteps (scaled by 1000)
-            y: (B, txt_len) token indices
+            y: (B, S, D) text embedding
             return_layers: optional list of layer indices to return features from
         Returns:
             x_out: (B, C, H, W) velocity prediction
@@ -323,7 +323,7 @@ class PixNerDiT(nn.Module):
             # Per-patch timesteps: (B, N) -> (B, N, D)
             t_emb = self.t_embedder(t)  # (B, N, D)
 
-        y_emb = self.y_embedder(y).view(B, -1, self.hidden_size)
+        y_emb = self.y_embedder(y)
 
         s = self.s_embedder(x_unfolded)
         s = s + t_emb  # (B, N, D) + (B, 1, D) or (B, N, D)
@@ -370,7 +370,7 @@ class PixNerDiT(nn.Module):
         return x_out, logvar_theta
 
     @torch.no_grad()
-    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, pad_idx=None):
+    def sample(self, B, H, W, device, steps=50, y=None, cfg_scale=4.0, y_uncond=None):
         """Standard Euler sampler (global timesteps). Ignores logvar output."""
         x = torch.randn(B, self.in_channels, H, W, device=device)
         dt = 1.0 / steps
@@ -378,11 +378,9 @@ class PixNerDiT(nn.Module):
             t_val = step * dt
             t = torch.full((B,), t_val, device=device) * 1000
 
-            if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+            if cfg_scale > 1.0 and y is not None and y_uncond is not None:
                 x_in = x.repeat(2, 1, 1, 1)
                 t_in = t.repeat(2)
-                y_uncond = y.clone()
-                y_uncond[:] = pad_idx
                 y_in = torch.cat([y, y_uncond], dim=0)
 
                 out, _ = self(x_in, t_in, y_in)
@@ -399,7 +397,7 @@ class PixNerDiT(nn.Module):
 
     @torch.no_grad()
     def sample_lookahead(self, B, H, W, device, steps=50, y=None,
-                         cfg_scale=4.0, pad_idx=None,
+                         cfg_scale=4.0, y_uncond=None,
                          alpha=1.5, percentile=0.40):
         """
         Look-Ahead adaptive sampler from Patch Forcing.
@@ -421,11 +419,9 @@ class PixNerDiT(nn.Module):
             t_global = torch.full((B,), t_val, device=device) * 1000
 
             # --- Step 1: Get velocity + uncertainty with CFG ---
-            if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+            if cfg_scale > 1.0 and y is not None and y_uncond is not None:
                 x_in = x.repeat(2, 1, 1, 1)
                 t_in = t_global.repeat(2)
-                y_uncond = y.clone()
-                y_uncond[:] = pad_idx
                 y_in = torch.cat([y, y_uncond], dim=0)
 
                 out, logvar_out = self(x_in, t_in, y_in)
@@ -468,7 +464,7 @@ class PixNerDiT(nn.Module):
                 x_tilde = M_pixel * x_ctx + (1 - M_pixel) * x
 
                 # --- Step 4: Context-aware re-evaluation ---
-                if cfg_scale > 1.0 and y is not None and pad_idx is not None:
+                if cfg_scale > 1.0 and y is not None and y_uncond is not None:
                     x_t_in = x_tilde.repeat(2, 1, 1, 1)
                     t_m_in = t_mixed.repeat(2, 1)
                     y_in2 = torch.cat([y, y_uncond], dim=0)
@@ -645,16 +641,18 @@ if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = PixNerDiT().to(device=device, dtype=torch.float32)
+    model = PixNerDiT(text_embed_dim=1024).to(device=device, dtype=torch.float32)
 
-    ckpt_path = "ckpt_step_185000.pth"
-
-    load_checkpoint(
-        model,
-        ckpt_path,
-        device=device,
-        ema_key=None,  # e.g. "ema" if your checkpoint stores EMA weights
-    )
+    try:
+        ckpt_path = "ckpt_step_185000.pth"
+        load_checkpoint(
+            model,
+            ckpt_path,
+            device=device,
+            ema_key=None,  # e.g. "ema" if your checkpoint stores EMA weights
+        )
+    except FileNotFoundError:
+        print(f"File {ckpt_path} not found. Skipping weight loading.")
 
     model.eval()
 
@@ -672,11 +670,10 @@ if __name__ == "__main__":
 
     t = torch.rand(1, dtype=torch.float32, device=device) * 1000
 
-    y = torch.randint(
-        0,
-        1000,
-        (1, 16),
-        dtype=torch.long,
+    # Passing continuous embedding tensor of shape (B, S, D) directly
+    y = torch.randn(
+        1, 16, 1024,
+        dtype=torch.float32,
         device=device
     )
 
