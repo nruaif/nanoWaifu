@@ -1,203 +1,197 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 
-class FrequencyAwareFMLoss(nn.Module):
-    """
-    Frequency-aware Flow Matching loss from DeCo.
-
-    Input:
-        pred : [B,C,H,W]
-        target : [B,C,H,W]
-
-    Returns:
-        scalar loss
-    """
-
-    def __init__(
-        self,
-        block_size: int = 8,
-        quality: int = 85,
-        mode: str = "inv_gamma",
-        gamma: float = 1.0,
-        reduction: str = "mean",
-    ):
+class DriftingAndPerceptualLoss(nn.Module):
+    def __init__(self, model_name='convnext_tiny.dinov3_lvd1689m', drift_weight=1.0, lpips_weight=1.0, device='cuda', dtype=torch.bfloat16):
         super().__init__()
+        self.drift_weight = drift_weight
+        self.lpips_weight = lpips_weight
+        
+        # 1. Load Pretrained Feature Extractor
+        print(f"Loading {model_name}...")
+        self.feature_extractor = timm.create_model(
+            model_name,
+            pretrained=True,
+            features_only=True,
+        ).eval()
+        
+        # Move to device and dtype
+        self.feature_extractor.to(device=device, dtype=dtype)
+        self.dtype = dtype
 
-        self.block_size = block_size
-        self.reduction = reduction
-
-        self.register_buffer(
-            "dct_mat",
-            self._create_dct_matrix(block_size),
-            persistent=False,
-        )
-
-        self.register_buffer(
-            "freq_weight",
-            self._build_freq_weight(
-                quality=quality,
-                mode=mode,
-                gamma=gamma,
-            ),
-            persistent=False,
-        )
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ):
-        pred = self.rgb_to_ycbcr(pred)
-        target = self.rgb_to_ycbcr(target)
-
-        pred_freq = self.block_dct(pred)
-        target_freq = self.block_dct(target)
-
-        loss = self.freq_weight * (pred_freq - target_freq).pow(2)
-
-        if self.reduction == "mean":
-            return loss.mean()
-
-        elif self.reduction == "sum":
-            return loss.sum()
-
-        elif self.reduction == "none":
-            return loss
+        # Freeze weights
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
             
-        return loss
+        # 2. Standard ImageNet Normalization (for input tensors in 0-1 range)
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1))
 
-    @staticmethod
-    def _create_dct_matrix(N: int):
-        n = torch.arange(N, dtype=torch.float32)
-        k = torch.arange(N, dtype=torch.float32).unsqueeze(1)
+        # 3. Drifting Parameters (from Paper Appendix A.6)
+        self.temperatures = [0.02, 0.05, 0.2] 
 
-        C = torch.cos(math.pi * (2 * n + 1) * k / (2 * N))
+    def normalize_input(self, x):
+        """Expects x in [0, 1]. Normalizes to ImageNet stats."""
+        return (x - self.mean) / self.std
 
-        alpha = torch.sqrt(torch.tensor(2.0) / N) * torch.ones(N)
-        alpha[0] = math.sqrt(1.0 / N)
+    def compute_pairwise_dist(self, x, y):
+        """Computes Euclidean distance matrix between shape [B, D] and [B2, D]"""
+        return torch.cdist(x, y, p=2)
 
-        return alpha.unsqueeze(1) * C
+    def compute_drift_component(self, feat_x, feat_y):
+        """
+        Calculates the Drifting Loss for a single feature scale.
+        Logic follows Algorithm 2 and Appendix A.6 of the paper.
+        
+        Args:
+            feat_x: Generated features [B, N_tokens, C] -> flattened to [B*N, C] inside
+            feat_y: Target (Real) features [B, N_tokens, C] -> flattened to [B*N, C] inside
+        """
+        # Flatten spatial dimensions: [B, C, H, W] -> [B*H*W, C]
+        # The paper treats every spatial location as an independent sample
+        b, c, h, w = feat_x.shape
+        x_flat = feat_x.permute(0, 2, 3, 1).reshape(-1, c) # Generated (Negatives)
+        y_flat = feat_y.permute(0, 2, 3, 1).reshape(-1, c) # Real (Positives)
+        
+        # Ensure float32 for distance calculations to avoid overflow/underflow in half precision
+        x_flat = x_flat.float()
+        y_flat = y_flat.float()
 
-    @staticmethod
-    def rgb_to_ycbcr(x: torch.Tensor):
-        r = x[:, 0:1]
-        g = x[:, 1:2]
-        b = x[:, 2:3]
+        # --- 1. Feature Normalization (Eq. 20, 21) ---
+        # Compute mean distance to scale features so average dist is sqrt(C)
+        with torch.no_grad():
+            # Estimate mean distance using a subset or batch mean to save memory
+            # Here we calc exact batch mean dist
+            raw_dist = torch.cdist(x_flat, y_flat)
+            mean_dist = raw_dist.mean()
+            # Avoid divide by zero
+            scale_S = (mean_dist / (c ** 0.5)).clamp(min=1e-6)
+        
+        # Normalize features
+        x_norm = x_flat / scale_S
+        y_norm = y_flat / scale_S
 
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        cb = -0.168736 * r - 0.331264 * g + 0.5 * b
-        cr = 0.5 * r - 0.418688 * g - 0.081312 * b
+        # --- 2. Perceptual Loss (LPIPS-style) ---
+        # Simple MSE on the normalized features
+        loss_lpips_scale = F.mse_loss(x_norm, y_norm)
 
-        return torch.cat([y, cb, cr], dim=1)
+        # --- 3. Drifting Loss ---
+        # Calculate pairwise distances on normalized features
+        dist_pos = torch.cdist(x_norm, y_norm) # Distance to Real
+        dist_neg = torch.cdist(x_norm, x_norm) # Distance to Self (Generated)
+        
+        # Mask self-distance in neg to infinity (don't repel self)
+        eye_mask = torch.eye(dist_neg.shape[0], device=dist_neg.device).bool()
+        dist_neg.masked_fill_(eye_mask, 1e6)
 
-    def block_dct(self, x: torch.Tensor):
-        bs = self.block_size
+        total_drift_loss_scale = 0
+        
+        # Iterate over temperatures (Appendix A.6 "Multiple temperatures")
+        for T in self.temperatures:
+            # Softmax normalization (Alg 2)
+            # Logits
+            logit_pos = -dist_pos / T
+            logit_neg = -dist_neg / T
+            
+            # Double Softmax (Sinkhorn-like) described in Alg 2
+            # 1. Softmax over target (col)
+            # 2. Softmax over source (row)
+            # 3. Geometric mean of both
+            
+            # Positives
+            attn_pos_row = F.softmax(logit_pos, dim=1) # over y
+            attn_pos_col = F.softmax(logit_pos, dim=0) # over x
+            attn_pos = torch.sqrt(attn_pos_row * attn_pos_col + 1e-8)
+            
+            # Negatives
+            attn_neg_row = F.softmax(logit_neg, dim=1)
+            attn_neg_col = F.softmax(logit_neg, dim=0)
+            attn_neg = torch.sqrt(attn_neg_row * attn_neg_col + 1e-8)
+            
+            # Normalize weights (Alg 2)
+            # "split" isn't needed if we computed separately, but we need row sums
+            w_pos = attn_pos / (attn_pos.sum(dim=1, keepdim=True) + 1e-8) # weight per x
+            w_neg = attn_neg / (attn_neg.sum(dim=1, keepdim=True) + 1e-8) # weight per x
 
-        B, C, H, W = x.shape
+            # Calculate Attractors and Repulsors
+            # target_pos is the "weighted mean" of real data pulling x
+            target_pos = w_pos @ y_norm 
+            # target_neg is the "weighted mean" of fake data pushing x
+            target_neg = w_neg @ x_norm
 
-        pad_h = (-H) % bs
-        pad_w = (-W) % bs
+            # Drift Vector V (Eq. 10: V = V_pos - V_neg)
+            # V_pos = target_pos - x
+            # V_neg = target_neg - x
+            # V = (target_pos - x) - (target_neg - x) = target_pos - target_neg
+            V = target_pos - target_neg
 
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
+            # --- Drift Normalization (Eq. 23, 24) ---
+            with torch.no_grad():
+                # Normalize V so E[||V||^2] approx C
+                # lambda_j = sqrt( E[ ||V||^2 / C ] )
+                v_norm_sq = (V ** 2).sum(dim=1).mean()
+                scale_lambda = torch.sqrt(v_norm_sq / c).clamp(min=1e-6)
+            
+            V_normalized = V / scale_lambda
 
-        B, C, H2, W2 = x.shape
+            # --- Target Calculation ---
+            # x_drifted = stopgrad(x + V)
+            x_target = (x_norm + V_normalized).detach()
 
-        Bh = H2 // bs
-        Bw = W2 // bs
+            # MSE Loss (Eq. 26)
+            loss_T = F.mse_loss(x_norm, x_target)
+            total_drift_loss_scale += loss_T
 
-        blocks = (
-            x.unfold(2, bs, bs)
-             .unfold(3, bs, bs)
-             .contiguous()
-        )
+        return total_drift_loss_scale, loss_lpips_scale
 
-        # [B,C,Bh,Bw,bs,bs]
-        blocks = blocks.view(-1, bs, bs)
+    def forward(self, x, y):
+        """
+        Args:
+            x: Generated images [B, 3, H, W] in range [0, 1]
+            y: Target/Real images [B, 3, H, W] in range [0, 1]
+        """
+        # Ensure batch size > 1 for Drifting (need negatives!)
+        if x.shape[0] < 2:
+            # Fallback to just LPIPS or return 0 if strictly required
+            # raising ValueError might break training if last batch is small
+            # return {"loss": torch.tensor(0.0, device=x.device, requires_grad=True)}
+            # Better to just return 0 loss but warn
+             # raise ValueError("Drifting loss requires batch size > 1 to calculate repulsion.")
+             pass
 
-        Cmat = self.dct_mat.to(dtype=x.dtype)
+        # Cast input to match feature extractor dtype
+        x_in = x.to(dtype=self.dtype)
+        y_in = y.to(dtype=self.dtype)
 
-        dct = torch.matmul(Cmat.unsqueeze(0), blocks)
-        dct = torch.matmul(dct, Cmat.t().unsqueeze(0))
+        # Normalize
+        x_in = self.normalize_input(x_in)
+        y_in = self.normalize_input(y_in)
 
-        return dct.view(B, C, Bh, Bw, bs, bs)
+        # Extract Features
+        # Using no_grad is redundant if params are frozen but good for safety
+        # However, we need gradients for x, so we can't use torch.no_grad() context manager globally
+        # But feature extractor parameters are frozen.
+        
+        feats_x = self.feature_extractor(x_in)
+        
+        with torch.no_grad():
+             feats_y = self.feature_extractor(y_in)
 
-    @staticmethod
-    def _scale_q(base_q, quality):
-        quality = max(1, min(100, int(quality)))
+        total_drift_loss = 0
+        total_lpips_loss = 0
 
-        if quality < 50:
-            scale = 5000 / quality
-        else:
-            scale = 200 - 2 * quality
+        # Loop through multi-scale features
+        for fx, fy in zip(feats_x, feats_y):
+            drift_loss, lpips_loss = self.compute_drift_component(fx, fy)
+            total_drift_loss += drift_loss
+            total_lpips_loss += lpips_loss
 
-        q = torch.floor((base_q * scale + 50) / 100)
-
-        return q.clamp(1, 255)
-
-    def _build_freq_weight(
-        self,
-        quality=85,
-        mode="inv_gamma",
-        gamma=1.0,
-    ):
-        lum_q = torch.tensor([
-            [16,11,10,16,24,40,51,61],
-            [12,12,14,19,26,58,60,55],
-            [14,13,16,24,40,57,69,56],
-            [14,17,22,29,51,87,80,62],
-            [18,22,37,56,68,109,103,77],
-            [24,35,55,64,81,104,113,92],
-            [49,64,78,87,103,121,120,101],
-            [72,92,95,98,112,100,103,99],
-        ], dtype=torch.float32)
-
-        chr_q = torch.tensor([
-            [17,18,24,47,99,99,99,99],
-            [18,21,26,66,99,99,99,99],
-            [24,26,56,99,99,99,99,99],
-            [47,66,99,99,99,99,99,99],
-            [99,99,99,99,99,99,99,99],
-            [99,99,99,99,99,99,99,99],
-            [99,99,99,99,99,99,99,99],
-            [99,99,99,99,99,99,99,99],
-        ], dtype=torch.float32)
-
-        Qy = self._scale_q(lum_q, quality)
-        Qc = self._scale_q(chr_q, quality)
-
-        def q_to_weight(Q):
-            if mode == "inv":
-                w = 1.0 / Q
-
-            elif mode == "inv_gamma":
-                w = (Q.mean() / Q).pow(gamma)
-
-            else:
-                raise ValueError(mode)
-
-            return w / w.mean()
-
-        wy = q_to_weight(Qy)
-        wc = q_to_weight(Qc)
-
-        w = torch.stack([wy, wc, wc], dim=0)
-
-        # [1,C,1,1,8,8]
-        return w.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-
-def pseudo_huber_loss(pred, target, delta=1.0, reduction='mean'):
-    """
-    Pseudo-Huber Loss (Charbonnier loss)
-    L(x) = delta^2 * (sqrt(1 + (x/delta)^2) - 1)
-    """
-    diff = pred - target
-    loss = (delta**2) * (torch.sqrt(1 + (diff / delta)**2) - 1)
-    
-    if reduction == 'mean':
-        return loss.mean()
-    elif reduction == 'sum':
-        return loss.sum()
-    return loss
+        combined_loss = (self.drift_weight * total_drift_loss) + (self.lpips_weight * total_lpips_loss)
+        
+        return {
+            "loss": combined_loss,
+            "drift_loss": total_drift_loss,
+            "lpips_loss": total_lpips_loss
+        }

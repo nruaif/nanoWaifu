@@ -1,7 +1,7 @@
 training:
   batch_size: 128
   grad_accum_steps: 1
-  learning_rate: 1.0e-4
+  learning_rate: 3.0e-4
   num_epochs: 100
   max_train_steps: 2000000
   gradient_checkpointing: false
@@ -32,5 +32,5 @@ model:
   use_deco_decoder: true
 
 data:
-  webdataset_url: '/workspace/data/train/00{01..080}.tar'
+  webdataset_url: '/workspace/data/train/00{041..080}.tar'
   use_advanced_captions: true
