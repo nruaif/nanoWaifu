@@ -114,8 +114,10 @@ def main():
             x0_pred = model(xt, t_cond, y)
             
         # Save generated/noised images into a folder
-        save_image((xt.clamp(-1, 1) + 1.0) / 2.0, f"images/xt_t_{t_val:.1f}.png")
-        save_image((x0_pred.clamp(-1, 1) + 1.0) / 2.0, f"images/pred_t_{t_val:.1f}.png")
+        mean = torch.tensor([0.6569382548332214, 0.5977839827537537, 0.5958537459373474], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.3143513798713684, 0.31483596563339233, 0.30866608023643494], device=device).view(1, 3, 1, 1)
+        save_image(torch.clamp((xt * std) + mean, 0, 1), f"images/xt_t_{t_val:.1f}.png")
+        save_image(torch.clamp((x0_pred * std) + mean, 0, 1), f"images/pred_t_{t_val:.1f}.png")
         
         print(f"\n--- Timestep {t_val:.1f} ---")
         

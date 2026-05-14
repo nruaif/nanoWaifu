@@ -423,6 +423,12 @@ def train(config_path):
             images, prompts, _ = batch
             if hasattr(images, "to"):
                 images = images.to(device, memory_format=torch.channels_last)
+            
+            # --- Dataset Normalization ---
+            d_mean = torch.tensor([0.6569382548332214, 0.5977839827537537, 0.5958537459373474], device=device).view(1, 3, 1, 1)
+            d_std = torch.tensor([0.3143513798713684, 0.31483596563339233, 0.30866608023643494], device=device).view(1, 3, 1, 1)
+            images = (images.float() - d_mean) / d_std
+
             y_indices = tag_processor.process_prompts(prompts, device)
 
             # VAE Encoding
@@ -611,11 +617,19 @@ def train(config_path):
                             out = vae.decode(samples, return_dict=False)
                             recon = out[0] if isinstance(out, tuple) else out
 
-                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                        samples = samples.to(dtype=torch.float32)
+                        samples = recon.to(dtype=torch.float32)
+                        # Unnormalize dataset stats
+                        d_mean_val = torch.tensor([0.6569382548332214, 0.5977839827537537, 0.5958537459373474], device=device).view(1, 3, 1, 1)
+                        d_std_val = torch.tensor([0.3143513798713684, 0.31483596563339233, 0.30866608023643494], device=device).view(1, 3, 1, 1)
+                        samples = (samples * d_std_val) + d_mean_val
+                        samples = samples.clamp(0, 1)
                     else:
-                        samples = samples.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
+                        # Unnormalize dataset stats
+                        d_mean_val = torch.tensor([0.6569382548332214, 0.5977839827537537, 0.5958537459373474], device=device).view(1, 3, 1, 1)
+                        d_std_val = torch.tensor([0.3143513798713684, 0.31483596563339233, 0.30866608023643494], device=device).view(1, 3, 1, 1)
+                        samples = (samples * d_std_val) + d_mean_val
+                        samples = samples.clamp(0, 1)
 
                     grid = make_grid(samples, nrow=4)
                     wandb.log({f"val/samples": wandb.Image(grid, caption=f"Validation @ Step {global_step}")},
