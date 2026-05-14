@@ -203,148 +203,111 @@ def pseudo_huber_loss(pred, target, delta=1.0, reduction='mean'):
     return loss
 
 
-# ------------------------------------------------------------
-# Detect massive activation channels
-# ------------------------------------------------------------
 
-def detect_massive_channels(
-    feat,
-    topk_ratio=0.02
-):
-    """
-    feat: [B, T, D]
-
-    returns:
-        indices of high-energy channels
-    """
-
-    # channel energy over batch + tokens
-    energy = feat.abs().mean(dim=(0, 1))   # [D]
-
-    k = max(1, int(feat.shape[-1] * topk_ratio))
-
-    massive_idx = torch.topk(
-        energy,
-        k=k
-    ).indices
-
-    return massive_idx
-
-
-# ------------------------------------------------------------
-# Massive activation modulation
-# ------------------------------------------------------------
-
-def modulate_features(
-    feat,
-    massive_idx,
-    alpha=0.3,
-    clamp_value=10.0,
-):
-    """
-    feat: [B, T, D]
-    """
-
-    feat = feat.clone()
-
-    D = feat.shape[-1]
-
-    massive_mask = torch.zeros(
-        D,
-        device=feat.device,
-        dtype=torch.bool
-    )
-
-    massive_mask[massive_idx] = True
-
-    normal_mask = ~massive_mask
-
-    # split features
-    normal_feat = feat[..., normal_mask]
-    massive_feat = feat[..., massive_mask]
-
-    # --------------------------------------------------------
-    # stabilize massive channels
-    # --------------------------------------------------------
-
-    # soft clamp
-    massive_feat = torch.tanh(
-        massive_feat / clamp_value
-    ) * clamp_value
-
-    # per-channel standardization
-    massive_feat = (
-        massive_feat
-        / (
-            massive_feat.std(
-                dim=(0, 1),
-                keepdim=True
-            ) + 1e-6
-        )
-    )
-
-    # controlled re-weighting
-    massive_feat = alpha * massive_feat
-
-    # --------------------------------------------------------
-    # rebuild descriptor
-    # --------------------------------------------------------
-
-    out = torch.zeros_like(feat)
-
-    out[..., normal_mask] = normal_feat
-    out[..., massive_mask] = massive_feat
-
-    return out
 
 
 # ------------------------------------------------------------
 # Massive-aware cosine similarity
 # ------------------------------------------------------------
 
-def massive_cosine_sim(
+def massive_cosine_similarity(
     f1,
     f2,
-    topk_ratio=0.02,
-    alpha=0.3,
-    clamp_value=10.0,
+    percentile=0.90,
+    multiplier=5.0,
+    lambda_scale=0.5,
+    spike_q=0.999,
+    clamp=20.0,
+    eps=1e-6,
 ):
     """
-    returns:
-        sim: [B, T, T]
+    f1, f2: [B,T,D]
     """
 
-    # detect channels jointly
-    joint_feat = torch.cat([f1, f2], dim=1)
+    # --------------------------------------------------------
+    # detect massive channels
+    # --------------------------------------------------------
 
-    massive_idx = detect_massive_channels(
-        joint_feat,
-        topk_ratio=topk_ratio,
+    feat = torch.cat([f1, f2], dim=1)
+
+    energy = torch.quantile(
+        feat.abs().flatten(0,1),
+        q=spike_q,
+        dim=0
     )
 
-    # modulate features
-    f1_mod = modulate_features(
-        f1,
-        massive_idx,
-        alpha=alpha,
-        clamp_value=clamp_value,
+    threshold = multiplier * torch.quantile(
+        energy,
+        percentile
     )
 
-    f2_mod = modulate_features(
-        f2,
-        massive_idx,
-        alpha=alpha,
-        clamp_value=clamp_value,
-    )
+    massive_idx = torch.where(
+        energy > threshold
+    )[0]
 
-    # normalize
-    f1_mod = F.normalize(f1_mod, dim=-1)
-    f2_mod = F.normalize(f2_mod, dim=-1)
+    if len(massive_idx) == 0:
+        massive_idx = torch.topk(energy, 1).indices
 
+    # --------------------------------------------------------
+    # modulation
+    # --------------------------------------------------------
+
+    def modulate(x):
+
+        x = x.clone()
+
+        mask = torch.zeros(
+            x.shape[-1],
+            device=x.device,
+            dtype=torch.bool
+        )
+
+        mask[massive_idx] = True
+
+        normal = x[..., ~mask]
+        massive = x[..., mask]
+
+        # stabilize spikes
+        massive = torch.tanh(
+            massive / clamp
+        ) * clamp
+
+        massive = massive / (
+            massive.std(
+                dim=(0,1),
+                keepdim=True
+            ) + eps
+        )
+
+        # adaptive alpha
+        alpha = lambda_scale * (
+            normal.pow(2).mean(dim=-1, keepdim=True).sqrt()
+            /
+            (
+                massive.pow(2).mean(dim=-1, keepdim=True).sqrt()
+                + eps
+            )
+        )
+
+        massive = alpha * massive
+
+        out = torch.zeros_like(x)
+
+        out[..., ~mask] = normal
+        out[..., mask] = massive
+
+        return F.normalize(out, dim=-1)
+
+    f1 = modulate(f1)
+    f2 = modulate(f2)
+
+    # --------------------------------------------------------
     # cosine similarity
+    # --------------------------------------------------------
+
     sim = torch.matmul(
-        f1_mod,
-        f2_mod.transpose(-1, -2)
+        f1,
+        f2.transpose(-1, -2)
     )
 
     return sim, massive_idx

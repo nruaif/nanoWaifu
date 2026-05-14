@@ -32,5 +32,5 @@ model:
   use_deco_decoder: true
 
 data:
-  webdataset_url: '/workspace/data/train/00{001..080}.tar'
+  webdataset_url: '/workspace/data/train/00{001..040}.tar'
   use_advanced_captions: true

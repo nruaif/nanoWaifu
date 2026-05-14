@@ -15,11 +15,52 @@ from huggingface_hub import upload_file
 import threading
 import torchvision.transforms.functional as TF
 
-from loss import FrequencyAwareFMLoss, pseudo_huber_loss, massive_cosine_sim
+from loss import FrequencyAwareFMLoss, pseudo_huber_loss, massive_cosine_similarity
 from model_dit import PixNerDiT as ModelClass
 
 # Initialize DeCo Loss
 deco_loss_fn = FrequencyAwareFMLoss(reduction="none")
+
+
+def sample_ltg(batch_size, num_patches, loc=0.0, scale=1.0, std=0.5, device='cuda'):
+    """
+    Logit-Normal Truncated Gaussian (LTG) sampler from Patch Forcing.
+    Samples per-patch timesteps that constrain the MAXIMUM information per sample,
+    preventing overly clean context during training.
+
+    Args:
+        batch_size: number of samples in batch
+        num_patches: total number of spatial patches (H_patch * W_patch)
+        loc: location parameter for logit-normal distribution
+        scale: scale parameter for logit-normal distribution
+        std: base std for the truncated Gaussian spread
+        device: torch device
+
+    Returns:
+        t: (B, N) per-patch timesteps in [0, 1]
+    """
+    # Sample t_max from logit-normal distribution
+    eps = torch.randn(batch_size, device=device)
+    t_max = torch.sigmoid(loc + scale * eps)  # (B,)
+
+    # Effective std: ensure ~95% mass falls above 0
+    std_eff = torch.minimum(t_max / 2, torch.full_like(t_max, std))  # (B,)
+
+    # Sample from lower half of Gaussian centered at t_max
+    t_max_exp = t_max.unsqueeze(1)       # (B, 1)
+    std_eff_exp = std_eff.unsqueeze(1)   # (B, 1)
+    noise = torch.randn(batch_size, num_patches, device=device)
+
+    t = t_max_exp - noise.abs() * std_eff_exp  # (B, N)
+
+    # Fix negative values: replace with uniform sample in [0, t_max]
+    neg_mask = t < 0
+    t = torch.where(neg_mask, torch.rand_like(t) * t_max_exp, t)
+
+    # Clamp to valid range
+    t = t.clamp(0.0, 1.0)
+
+    return t
 
 
 class TagProcessor:
@@ -346,14 +387,31 @@ def train(config_path):
     data_iter = iter(dataloader)
     running_loss = 0.0
     running_layersync_loss = 0.0
+    running_uncertainty_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
 
+    resume_step = global_step if (resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else "")) else -1
+
     while global_step < config['training'].get('max_train_steps', 1000000):
+        # LR Warmup logic on resume
+        if resume_step != -1 and global_step < resume_step + 100:
+            warmup_progress = (global_step - resume_step) / 100.0
+            current_lr = config['training']['learning_rate'] * max(warmup_progress, 1e-4)
+            for opt in [optimizer.opt1, optimizer.opt2]:
+                for param_group in opt.param_groups:
+                    param_group['lr'] = current_lr
+        elif resume_step != -1 and global_step == resume_step + 100:
+            current_lr = config['training']['learning_rate']
+            for opt in [optimizer.opt1, optimizer.opt2]:
+                for param_group in opt.param_groups:
+                    param_group['lr'] = current_lr
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
         layersync_loss_accum = 0.0
+        uncertainty_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -389,16 +447,36 @@ def train(config_path):
                 fixed_noise = torch.randn_like(inputs[:16])
 
             B, C, H, W = inputs.shape
+            patch_size = config['model'].get('patch_size', 16)
+            H_patch = H // patch_size
+            W_patch = W // patch_size
+            N = H_patch * W_patch
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Generate timestep
-                t = torch.rand((B,), device=device)
-                t_condition = t * 1000
+                # --- Patch Forcing: LTG per-patch timestep sampling ---
+                ltg_loc = config['training'].get('ltg_loc', 0.0)
+                ltg_scale = config['training'].get('ltg_scale', 1.0)
+                ltg_std = config['training'].get('ltg_std', 0.5)
+
+                t_patches = sample_ltg(
+                    batch_size=B, num_patches=N,
+                    loc=ltg_loc, scale=ltg_scale, std=ltg_std,
+                    device=device
+                )  # (B, N) in [0, 1]
+
+                # Condition timesteps (scaled by 1000) for model input
+                t_condition = t_patches * 1000  # (B, N)
+
+                # Upsample per-patch timesteps to pixel space for noise interpolation
+                t_spatial = t_patches.view(B, 1, H_patch, W_patch)  # (B, 1, Hp, Wp)
+                t_pixel = t_spatial.repeat_interleave(patch_size, dim=2).repeat_interleave(
+                    patch_size, dim=3
+                )  # (B, 1, H, W)
 
                 x0_noise = torch.randn_like(inputs)
 
-                t_expand = t.view(B, 1, 1, 1)
-                xt = t_expand * inputs + (1 - t_expand) * x0_noise
+                # Per-patch noise interpolant: xt = t * data + (1-t) * noise
+                xt = t_pixel * inputs + (1 - t_pixel) * x0_noise
 
                 # CFG Dropout Mask
                 drop_prob = config['training'].get('class_dropout_prob', 0.1)
@@ -407,18 +485,20 @@ def train(config_path):
                 y_input = y_indices.clone()
                 y_input[drop_mask] = tag_processor.pad_idx
 
-                x0_pred, layer_feats = model(xt, t_condition, y_input, return_layers=[4, 12])
+                x0_pred, logvar_theta, layer_feats = model(
+                    xt, t_condition, y_input, return_layers=[4, 12]
+                )
+                # x0_pred: (B, C, H, W)
+                # logvar_theta: (B, 1, Hp, Wp)
+                # layer_feats: dict
                 
                 feat_4 = layer_feats[4]
                 feat_12 = layer_feats[12].detach()
                 
                 # LayerSync loss: massive-aware cosine similarity
-                sim_massive, _ = massive_cosine_sim(
+                sim_massive, _ = massive_cosine_similarity(
                     feat_4,
                     feat_12,
-                    topk_ratio=0.03,
-                    alpha=0.4,
-                    clamp_value=20.0,
                 )
                 diag_massive = sim_massive.diagonal(dim1=-2, dim2=-1)
                 layersync_loss = -diag_massive.mean()
@@ -427,19 +507,43 @@ def train(config_path):
                 # calculate v-space target
                 target_v = inputs - x0_noise
 
-                # model predicts x (data), convert to v
-                t_clipped = torch.clamp(t_expand, max=0.95)
-                v_pred = (x0_pred - xt) / (1.0 - t_clipped)
+                # model predicts x (data), convert to v using per-patch clipped t
+                t_pixel_clipped = torch.clamp(t_pixel, max=0.95)
+                v_pred = (x0_pred - xt) / (1.0 - t_pixel_clipped)
 
-                # Pseudo-Huber Loss on velocity
+                # Velocity MSE loss
                 ph_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
                 ph_loss_mean = ph_loss_raw.mean()
-                
-                loss = (ph_loss_mean + lambda_sync * layersync_loss) / accum_steps
+
+                # --- Patch Forcing: Uncertainty NLL loss ---
+                # Compute per-patch MSE by avg-pooling pixel-level error
+                with torch.no_grad():
+                    pixel_mse = (v_pred.detach() - target_v).pow(2).mean(dim=1, keepdim=True)  # (B, 1, H, W)
+                    patch_mse = F.avg_pool2d(pixel_mse, kernel_size=patch_size)  # (B, 1, Hp, Wp)
+
+                # NLL: 0.5 * (mse * exp(-logvar) + logvar)
+                lambda_uc = config['training'].get('lambda_uncertainty', 0.01)
+                uncertainty_nll = 0.5 * (patch_mse * torch.exp(-logvar_theta) + logvar_theta)
+                uncertainty_loss = lambda_uc * uncertainty_nll.mean()
+
+                loss = (ph_loss_mean + lambda_sync * layersync_loss + uncertainty_loss) / accum_steps
 
             loss.backward()
             loss_accum += ph_loss_mean.item()
             layersync_loss_accum += layersync_loss.item()
+            uncertainty_loss_accum += uncertainty_loss.item()
+
+        grad_stats = {}
+        if rank == 0 and (global_step + 1) % config['training']['log_every_steps'] == 0:
+            base_model = model.module if hasattr(model, 'module') else model
+            if hasattr(base_model, 'blocks'):
+                for i, block in enumerate(base_model.blocks):
+                    block_grads = [p.grad for p in block.parameters() if p.grad is not None]
+                    if block_grads:
+                        grad_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in block_grads]), 2).item()
+                        grad_max = max(g.detach().abs().max().item() for g in block_grads)
+                        grad_stats[f"grad_norm/block_{i}"] = grad_norm
+                        grad_stats[f"grad_max/block_{i}"] = grad_max
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -447,6 +551,7 @@ def train(config_path):
         global_step += 1
         running_loss += loss_accum
         running_layersync_loss += layersync_loss_accum
+        running_uncertainty_loss += uncertainty_loss_accum
 
         if rank == 0:
             pbar.update(1)
@@ -454,12 +559,19 @@ def train(config_path):
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
                 avg_ls_loss = running_layersync_loss / log_interval
-                log_dict = {"train/loss": avg_loss, "train/layersync": avg_ls_loss}
+                avg_uc_loss = running_uncertainty_loss / log_interval
+                log_dict = {
+                    "train/loss": avg_loss,
+                    "train/layersync": avg_ls_loss,
+                    "train/uncertainty": avg_uc_loss,
+                }
+                log_dict.update(grad_stats)
 
                 wandb.log(log_dict, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "ls": f"{avg_ls_loss:.4f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "ls": f"{avg_ls_loss:.4f}", "uc": f"{avg_uc_loss:.4f}"})
                 running_loss = 0.0
                 running_layersync_loss = 0.0
+                running_uncertainty_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
@@ -472,12 +584,22 @@ def train(config_path):
                     val_y = tag_processor.process_prompts(fixed_prompts, device)
 
                     H_val, W_val = inputs.shape[2], inputs.shape[3]
+                    sampler_type = config['training'].get('sampler_type', 'lookahead')
 
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        samples = base_model.sample(
-                            B=val_y.shape[0], H=H_val, W=W_val,
-                            device=device, steps=50, y=val_y, cfg_scale=4.0, pad_idx=tag_processor.pad_idx
-                        )
+                        if sampler_type == 'lookahead':
+                            samples = base_model.sample_lookahead(
+                                B=val_y.shape[0], H=H_val, W=W_val,
+                                device=device, steps=50, y=val_y, cfg_scale=4.0,
+                                pad_idx=tag_processor.pad_idx,
+                                alpha=1.5, percentile=0.40
+                            )
+                        else:
+                            samples = base_model.sample(
+                                B=val_y.shape[0], H=H_val, W=W_val,
+                                device=device, steps=50, y=val_y, cfg_scale=4.0,
+                                pad_idx=tag_processor.pad_idx
+                            )
 
                     if use_tiny_vae or use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
