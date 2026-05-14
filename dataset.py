@@ -364,7 +364,7 @@ class WDSLoader:
 
             # To Tensor and Normalize [-1, 1]
             image = F.to_tensor(image)
-            image = (image - 0.5) * 2.0
+            #image = (image - 0.5) * 2.0
 
             # Dummy coords for backward compatibility
             rel_coords = torch.tensor([0.0, 0.0, 1.0, 1.0])
