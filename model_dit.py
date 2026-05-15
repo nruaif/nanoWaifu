@@ -233,7 +233,7 @@ class PixNerDiT(nn.Module):
             num_groups=16,
             hidden_size=1024,
             num_encoder_blocks=16,
-            patch_size=16,
+            patch_size=32,
             vocab_size=12477,
             txt_max_length=32,
             weight_path=None,
@@ -351,6 +351,23 @@ class PixNerDiT(nn.Module):
                 
             if return_layers is not None and i in return_layers:
                 layer_feats[i] = seq[:, num_txt_tokens:]
+
+            # --- Pool Text Tokens After 2 Blocks ---
+            if i == 1 and num_txt_tokens > 1:
+                seq_txt = seq[:, :num_txt_tokens].mean(dim=1, keepdim=True)
+                seq_img = seq[:, num_txt_tokens:]
+                seq = torch.cat([seq_txt, seq_img], dim=1)
+                
+                # Also pool the v_skips stored so far
+                new_v_skips = []
+                for v_sk in v_skips:
+                    # v_sk shape: (B, num_heads, sequence_length, head_dim)
+                    v_sk_txt = v_sk[:, :, :num_txt_tokens].mean(dim=2, keepdim=True)
+                    v_sk_img = v_sk[:, :, num_txt_tokens:]
+                    new_v_skips.append(torch.cat([v_sk_txt, v_sk_img], dim=2))
+                v_skips = new_v_skips
+                
+                num_txt_tokens = 1
 
         s = seq[:, num_txt_tokens:]  # (B, N, D)
 

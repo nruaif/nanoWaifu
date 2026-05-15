@@ -28,7 +28,7 @@ model:
   num_heads: 16
   in_channels: 3
   lambda_nll: 0.01
-  patch_size: 16
+  patch_size: 32
   use_deco_decoder: true
 
 data:
