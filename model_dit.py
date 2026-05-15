@@ -268,7 +268,7 @@ class PixNerDiT(nn.Module):
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
 
         # Patch Forcing: per-pixel uncertainty/logvar head
-        self.logvar_head = nn.Linear(hidden_size, self.patch_size ** 2, bias=True)
+        self.logvar_head = nn.Conv2d(self.hidden_size, self.patch_size ** 2, kernel_size=3, padding=1)
         nn.init.constant_(self.logvar_head.weight, 0)
         nn.init.constant_(self.logvar_head.bias, 0)
 
@@ -353,14 +353,14 @@ class PixNerDiT(nn.Module):
                 layer_feats[i] = seq[:, num_txt_tokens:]
 
         s = seq[:, num_txt_tokens:]  # (B, N, D)
+        s_spatial = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
 
         # Patch Forcing: predict per-pixel logvar from patch tokens
-        logvar_theta = self.logvar_head(s)  # (B, N, patch_size**2)
-        logvar_theta = logvar_theta.transpose(1, 2) # (B, patch_size**2, N)
+        logvar_theta = self.logvar_head(s_spatial)  # (B, patch_size**2, H_patch, W_patch)
+        logvar_theta = logvar_theta.reshape(B, self.patch_size ** 2, -1)
         logvar_theta = torch.nn.functional.fold(logvar_theta, (H, W), kernel_size=self.patch_size, stride=self.patch_size) # (B, 1, H, W)
 
-        s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
-        x_out = self.final_conv(s)
+        x_out = self.final_conv(s_spatial)
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
         
