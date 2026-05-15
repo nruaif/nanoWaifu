@@ -259,12 +259,13 @@ def train(config_path):
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    patch_size = config['model'].get('patch_size', 2)
+    patch_size = config['model'].get('patch_size', 32)
     model = ModelClass(
-        in_channels=3,
+        in_channels=in_channels,
         hidden_size=1024,
         num_groups=16,
-        patch_size=16,
+        num_encoder_blocks=24,
+        patch_size=patch_size,
         vocab_size=num_classes,
         txt_max_length=tag_processor.max_tags,
     ).to(device=device)

@@ -232,7 +232,7 @@ class PixNerDiT(nn.Module):
             in_channels=3,
             num_groups=16,
             hidden_size=1024,
-            num_encoder_blocks=16,
+            num_encoder_blocks=24,
             patch_size=32,
             vocab_size=12477,
             txt_max_length=32,
