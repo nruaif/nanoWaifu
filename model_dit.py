@@ -280,6 +280,64 @@ class PixNerDiT(nn.Module):
     def enable_gradient_checkpointing(self):
         self.grad_checkpointing = True
 
+    def init_asymflow(self, proj_mat=None):
+        if proj_mat is not None:
+            self.register_buffer('proj_mat', proj_mat)
+        else:
+            self.proj_mat = None
+
+    def asymflow_velocity(self, v_A, x_t, t_val):
+        """
+        Converts asymmetric velocity v_A to full-rank velocity v.
+        v_A: (B, C, H, W)
+        x_t: (B, C, H, W)
+        t_val: (B,) or (B, N) or (B, 1, H, W), in range [0, 1]
+        """
+        if not hasattr(self, 'proj_mat') or self.proj_mat is None:
+            # Not using AsymFlow, v_A is actually x0_pred
+            if t_val.dim() == 1:
+                t_val = t_val.view(-1, 1, 1, 1)
+            elif t_val.dim() == 2:
+                H_patch = x_t.shape[2] // self.patch_size
+                W_patch = x_t.shape[3] // self.patch_size
+                t_val = t_val.view(-1, 1, H_patch, W_patch)
+                t_val = t_val.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
+                
+            denom = torch.clamp(1.0 - t_val, min=0.05)
+            return (v_A - x_t) / denom
+            
+        B, C, H, W = v_A.shape
+        v_A_patches = torch.nn.functional.unfold(v_A, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        x_t_patches = torch.nn.functional.unfold(x_t, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        
+        # apply projection
+        # proj_mat: (D, rank)
+        v_A_subspace = (v_A_patches @ self.proj_mat) @ self.proj_mat.T
+        v_A_complement = v_A_patches - v_A_subspace
+        
+        x_t_subspace = (x_t_patches @ self.proj_mat) @ self.proj_mat.T
+        x_t_complement = x_t_patches - x_t_subspace
+        
+        if t_val.dim() == 1:
+            t_val = t_val.view(-1, 1, 1)
+        elif t_val.dim() == 4:
+            # (B, 1, H, W) -> (B, N, 1)
+            H_patch = H // self.patch_size
+            W_patch = W // self.patch_size
+            t_val = t_val[:, :, ::self.patch_size, ::self.patch_size].reshape(B, 1, -1).transpose(1, 2)
+        else:
+            t_val = t_val.unsqueeze(-1)
+            
+        t_val_clipped = torch.clamp(t_val, max=0.95)
+        
+        v_pred_subspace = v_A_subspace
+        v_pred_complement = (v_A_complement - x_t_complement) / (1.0 - t_val_clipped)
+        
+        v_pred_patches = v_pred_subspace + v_pred_complement
+        v_pred_folded = v_pred_patches.transpose(1, 2)
+        v_pred = torch.nn.functional.fold(v_pred_folded, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
+        return v_pred
+
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
             return self.precompute_pos[(height, width)].to(device)
@@ -389,8 +447,7 @@ class PixNerDiT(nn.Module):
             else:
                 x0_pred, _ = self(x, t, y)
 
-            denom = max(1.0 - t_val, 0.05)
-            v_pred = (x0_pred - x) / denom
+            v_pred = self.asymflow_velocity(x0_pred, x, t_val=torch.tensor([t_val], device=device))
             x = x + v_pred * dt
 
         return x
@@ -435,8 +492,7 @@ class PixNerDiT(nn.Module):
             else:
                 x0_pred, uc = self(x, t_global, y)
 
-            denom = max(1.0 - t_val, 0.05)
-            v_pred = (x0_pred - x) / denom
+            v_pred = self.asymflow_velocity(x0_pred, x, t_val=torch.tensor([t_val], device=device))
 
             # --- Step 2: Identify confident patches ---
             uc_flat = uc.view(B, -1)  # (B, N)
@@ -477,7 +533,7 @@ class PixNerDiT(nn.Module):
                 else:
                     x0_ctx, _ = self(x_tilde, t_mixed, y)
 
-                v_ctx = (x0_ctx - x) / denom
+                v_ctx = self.asymflow_velocity(x0_ctx, x, t_val=t_mixed / 1000.0)
 
                 # --- Step 5: Combine velocities ---
                 # Use context-aware velocity for uncertain patches, original for confident

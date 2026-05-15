@@ -121,6 +121,83 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
+def get_or_compute_pca(dataloader, device, config, vae, latents_mean, latents_std, tag_processor):
+    out_path = config['training'].get('pca_checkpoint_path', 'checkpoints/asymflow_pca.pth')
+    patch_size = config['model'].get('patch_size', 16)
+    rank = config['model'].get('asymflow_rank', 0)
+    
+    if rank <= 0:
+        return None
+        
+    if os.path.exists(out_path):
+        print(f">>> Loading PCA subspace from {out_path}...")
+        ckpt = torch.load(out_path, map_location='cpu')
+        return ckpt[f'proj_mat_p{patch_size}'].to(device)
+        
+    num_images = config['training'].get('pca_num_images', 10000)
+    print(f">>> Computing PCA subspace for AsymFlow (num_images={num_images}, rank={rank})...")
+    pixel_gram = None
+    num_seen = 0
+    
+    use_vae = config['model'].get('use_vae', False)
+    use_tiny_vae = config['model'].get('use_tiny_vae', False)
+    
+    for batch in dataloader:
+        if num_seen >= num_images:
+            break
+            
+        images, prompts, _ = batch
+        images = images.to(device, memory_format=torch.channels_last)
+        
+        d_mean = torch.tensor([0.6569382548332214, 0.5977839827537537, 0.5958537459373474], device=device).view(1, 3, 1, 1)
+        d_std = torch.tensor([0.3143513798713684, 0.31483596563339233, 0.30866608023643494], device=device).view(1, 3, 1, 1)
+        images = (images.float() - d_mean) / d_std
+        
+        if use_tiny_vae:
+            with torch.no_grad():
+                v_images = images.to(dtype=torch.bfloat16)
+                out = vae.encode(v_images, return_dict=False)
+                latents = out[0] if isinstance(out, tuple) else out
+                latents = (latents - latents_mean) / latents_std
+                inputs = latents.to(dtype=torch.float32)
+        elif use_vae:
+            with torch.no_grad():
+                v_images = images.to(dtype=torch.bfloat16)
+                latents = vae.encode(v_images).latent_dist.mode()
+                latents = F.pixel_unshuffle(latents, 2)
+                inputs = ((latents - latents_mean) / latents_std).to(dtype=torch.float32)
+        else:
+            inputs = images.to(dtype=torch.float32)
+            
+        B = inputs.shape[0]
+        remaining = num_images - num_seen
+        if B > remaining:
+            inputs = inputs[:remaining]
+            B = remaining
+            
+        patches = torch.nn.functional.unfold(inputs, kernel_size=patch_size, stride=patch_size)
+        patches = patches.transpose(1, 2).reshape(-1, patches.shape[1]).double()
+        
+        if pixel_gram is None:
+            dim = patches.shape[1]
+            pixel_gram = torch.zeros((dim, dim), dtype=torch.float64, device=device)
+            
+        pixel_gram += patches.T @ patches
+        num_seen += B
+        
+    if pixel_gram is None:
+        raise RuntimeError("No images processed for PCA.")
+        
+    print(f">>> Solving for top {rank} eigenvectors...")
+    _, evecs = torch.linalg.eigh(pixel_gram)
+    proj_mat = evecs[:, -rank:].contiguous().float().cpu()
+    
+    os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else '.', exist_ok=True)
+    torch.save({f'proj_mat_p{patch_size}': proj_mat}, out_path)
+    print(f">>> Saved rank-{rank} PCA subspace to {out_path}")
+    return proj_mat.to(device)
+
+
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0:
         return
@@ -268,6 +345,31 @@ def train(config_path):
         vocab_size=num_classes,
         txt_max_length=tag_processor.max_tags,
     ).to(device=device)
+
+    # PCA Compute logic
+    if rank == 0:
+        proj_mat = get_or_compute_pca(
+            dataloader, device, config,
+            vae if (use_vae or use_tiny_vae) else None,
+            latents_mean if (use_vae or use_tiny_vae) else None,
+            latents_std if (use_vae or use_tiny_vae) else None,
+            tag_processor
+        )
+    else:
+        proj_mat = None
+
+    if is_ddp:
+        dist.barrier()
+        if rank != 0:
+            proj_mat = get_or_compute_pca(
+                dataloader, device, config,
+                vae if (use_vae or use_tiny_vae) else None,
+                latents_mean if (use_vae or use_tiny_vae) else None,
+                latents_std if (use_vae or use_tiny_vae) else None,
+                tag_processor
+            )
+            
+    model.init_asymflow(proj_mat)
 
     if config['training'].get('gradient_checkpointing', False):
         model.enable_gradient_checkpointing()
@@ -513,9 +615,9 @@ def train(config_path):
                 # calculate v-space target
                 target_v = inputs - x0_noise
 
-                # model predicts x (data), convert to v using per-patch clipped t
-                t_pixel_clipped = torch.clamp(t_pixel, max=0.95)
-                v_pred = (x0_pred - xt) / (1.0 - t_pixel_clipped)
+                # model predicts x (data) or v_A (AsymFlow), convert to full-rank v
+                base_model = model.module if hasattr(model, 'module') else model
+                v_pred = base_model.asymflow_velocity(x0_pred, xt, t_val=t_pixel)
 
                 # Velocity MSE loss
                 ph_loss_raw = F.mse_loss(v_pred, target_v, reduction='none')
