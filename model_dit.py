@@ -267,8 +267,8 @@ class PixNerDiT(nn.Module):
 
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
 
-        # Patch Forcing: per-pixel uncertainty/logvar head
-        self.logvar_head = nn.Conv2d(self.hidden_size, self.patch_size ** 2, kernel_size=3, padding=1)
+        # Patch Forcing: per-patch uncertainty/logvar head
+        self.logvar_head = nn.Linear(hidden_size, 1, bias=True)
         nn.init.constant_(self.logvar_head.weight, 0)
         nn.init.constant_(self.logvar_head.bias, 0)
 
@@ -353,14 +353,13 @@ class PixNerDiT(nn.Module):
                 layer_feats[i] = seq[:, num_txt_tokens:]
 
         s = seq[:, num_txt_tokens:]  # (B, N, D)
-        s_spatial = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
 
-        # Patch Forcing: predict per-pixel logvar from patch tokens
-        logvar_theta = self.logvar_head(s_spatial)  # (B, patch_size**2, H_patch, W_patch)
-        logvar_theta = logvar_theta.reshape(B, self.patch_size ** 2, -1)
-        logvar_theta = torch.nn.functional.fold(logvar_theta, (H, W), kernel_size=self.patch_size, stride=self.patch_size) # (B, 1, H, W)
+        # Patch Forcing: predict per-patch logvar from patch tokens
+        logvar_theta = self.logvar_head(s)  # (B, N, 1)
+        logvar_theta = logvar_theta.transpose(1, 2).reshape(B, 1, H_patch, W_patch)  # (B, 1, Hp, Wp)
 
-        x_out = self.final_conv(s_spatial)
+        s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
+        x_out = self.final_conv(s)
         x_out = x_out.reshape(B, self.in_channels * self.patch_size ** 2, -1)
         x_out = torch.nn.functional.fold(x_out, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
         
@@ -440,9 +439,7 @@ class PixNerDiT(nn.Module):
             v_pred = (x0_pred - x) / denom
 
             # --- Step 2: Identify confident patches ---
-            # Average pixel-level uncertainty to patch-level for patch selection
-            uc_patch = F.avg_pool2d(uc, kernel_size=self.patch_size)
-            uc_flat = uc_patch.view(B, -1)  # (B, N)
+            uc_flat = uc.view(B, -1)  # (B, N)
             k = max(1, int(N * percentile))
             tau = uc_flat.kthvalue(k, dim=-1).values  # (B,) - threshold
             M_conf = (uc_flat <= tau.unsqueeze(-1))  # (B, N) bool mask

@@ -527,13 +527,14 @@ def train(config_path):
                 lambda_cfm = 0.05
 
                 # --- Patch Forcing: Uncertainty NLL loss ---
-                # Compute per-pixel MSE
+                # Compute per-patch MSE by avg-pooling pixel-level error
                 with torch.no_grad():
                     pixel_mse = (v_pred.detach() - target_v).pow(2).mean(dim=1, keepdim=True)  # (B, 1, H, W)
+                    patch_mse = F.avg_pool2d(pixel_mse, kernel_size=patch_size)  # (B, 1, Hp, Wp)
 
                 # NLL: 0.5 * (mse * exp(-logvar) + logvar)
                 lambda_uc = config['training'].get('lambda_uncertainty', 0.01)
-                uncertainty_nll = 0.5 * (pixel_mse * torch.exp(-logvar_theta) + logvar_theta)
+                uncertainty_nll = 0.5 * (patch_mse * torch.exp(-logvar_theta) + logvar_theta)
                 uncertainty_loss = lambda_uc * uncertainty_nll.mean()
 
                 loss = (ph_loss_mean + lambda_sync * layersync_loss + uncertainty_loss + lambda_cfm * cfm_loss) / accum_steps
