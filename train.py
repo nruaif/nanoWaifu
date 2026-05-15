@@ -339,9 +339,9 @@ def train(config_path):
             normuon_params.append(p)
 
     try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1, betas=(0.9, 0.99),
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.99),
                               cautious_wd=True)
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1,
+        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 100, weight_decay=0.1,
                               cautious_wd=True, normuon_variant=True)
     except Exception:
         opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
@@ -600,14 +600,14 @@ def train(config_path):
                         if sampler_type == 'lookahead':
                             samples = base_model.sample_lookahead(
                                 B=val_y.shape[0], H=H_val, W=W_val,
-                                device=device, steps=50, y=val_y, cfg_scale=4.0,
+                                device=device, steps=256, y=val_y, cfg_scale=4.0,
                                 pad_idx=tag_processor.pad_idx,
                                 alpha=1.5, percentile=0.40
                             )
                         else:
                             samples = base_model.sample(
                                 B=val_y.shape[0], H=H_val, W=W_val,
-                                device=device, steps=50, y=val_y, cfg_scale=4.0,
+                                device=device, steps=256, y=val_y, cfg_scale=4.0,
                                 pad_idx=tag_processor.pad_idx
                             )
 
