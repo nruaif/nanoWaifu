@@ -267,8 +267,8 @@ class PixNerDiT(nn.Module):
 
         self.final_conv = nn.Conv2d(self.hidden_size, self.in_channels * self.patch_size ** 2, kernel_size=3, padding=1)
 
-        # Patch Forcing: per-patch uncertainty/logvar head
-        self.logvar_head = nn.Linear(hidden_size, 1, bias=True)
+        # Patch Forcing: per-pixel uncertainty/logvar head
+        self.logvar_head = nn.Linear(hidden_size, self.patch_size ** 2, bias=True)
         nn.init.constant_(self.logvar_head.weight, 0)
         nn.init.constant_(self.logvar_head.bias, 0)
 
@@ -279,64 +279,6 @@ class PixNerDiT(nn.Module):
         self.grad_checkpointing = False
     def enable_gradient_checkpointing(self):
         self.grad_checkpointing = True
-
-    def init_asymflow(self, proj_mat=None):
-        if proj_mat is not None:
-            self.register_buffer('proj_mat', proj_mat)
-        else:
-            self.proj_mat = None
-
-    def asymflow_velocity(self, v_A, x_t, t_val):
-        """
-        Converts asymmetric velocity v_A to full-rank velocity v.
-        v_A: (B, C, H, W)
-        x_t: (B, C, H, W)
-        t_val: (B,) or (B, N) or (B, 1, H, W), in range [0, 1]
-        """
-        if not hasattr(self, 'proj_mat') or self.proj_mat is None:
-            # Not using AsymFlow, v_A is actually x0_pred
-            if t_val.dim() == 1:
-                t_val = t_val.view(-1, 1, 1, 1)
-            elif t_val.dim() == 2:
-                H_patch = x_t.shape[2] // self.patch_size
-                W_patch = x_t.shape[3] // self.patch_size
-                t_val = t_val.view(-1, 1, H_patch, W_patch)
-                t_val = t_val.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
-                
-            denom = torch.clamp(1.0 - t_val, min=0.05)
-            return (v_A - x_t) / denom
-            
-        B, C, H, W = v_A.shape
-        v_A_patches = torch.nn.functional.unfold(v_A, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
-        x_t_patches = torch.nn.functional.unfold(x_t, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
-        
-        # apply projection
-        # proj_mat: (D, rank)
-        v_A_subspace = (v_A_patches @ self.proj_mat) @ self.proj_mat.T
-        v_A_complement = v_A_patches - v_A_subspace
-        
-        x_t_subspace = (x_t_patches @ self.proj_mat) @ self.proj_mat.T
-        x_t_complement = x_t_patches - x_t_subspace
-        
-        if t_val.dim() == 1:
-            t_val = t_val.view(-1, 1, 1)
-        elif t_val.dim() == 4:
-            # (B, 1, H, W) -> (B, N, 1)
-            H_patch = H // self.patch_size
-            W_patch = W // self.patch_size
-            t_val = t_val[:, :, ::self.patch_size, ::self.patch_size].reshape(B, 1, -1).transpose(1, 2)
-        else:
-            t_val = t_val.unsqueeze(-1)
-            
-        t_val_clipped = torch.clamp(t_val, max=0.95)
-        
-        v_pred_subspace = v_A_subspace
-        v_pred_complement = (v_A_complement - x_t_complement) / (1.0 - t_val_clipped)
-        
-        v_pred_patches = v_pred_subspace + v_pred_complement
-        v_pred_folded = v_pred_patches.transpose(1, 2)
-        v_pred = torch.nn.functional.fold(v_pred_folded, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-        return v_pred
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
@@ -412,9 +354,10 @@ class PixNerDiT(nn.Module):
 
         s = seq[:, num_txt_tokens:]  # (B, N, D)
 
-        # Patch Forcing: predict per-patch logvar from patch tokens
-        logvar_theta = self.logvar_head(s)  # (B, N, 1)
-        logvar_theta = logvar_theta.transpose(1, 2).reshape(B, 1, H_patch, W_patch)  # (B, 1, Hp, Wp)
+        # Patch Forcing: predict per-pixel logvar from patch tokens
+        logvar_theta = self.logvar_head(s)  # (B, N, patch_size**2)
+        logvar_theta = logvar_theta.transpose(1, 2) # (B, patch_size**2, N)
+        logvar_theta = torch.nn.functional.fold(logvar_theta, (H, W), kernel_size=self.patch_size, stride=self.patch_size) # (B, 1, H, W)
 
         s = s.transpose(1, 2).reshape(B, self.hidden_size, H_patch, W_patch)
         x_out = self.final_conv(s)
@@ -447,7 +390,8 @@ class PixNerDiT(nn.Module):
             else:
                 x0_pred, _ = self(x, t, y)
 
-            v_pred = self.asymflow_velocity(x0_pred, x, t_val=torch.tensor([t_val], device=device))
+            denom = max(1.0 - t_val, 0.05)
+            v_pred = (x0_pred - x) / denom
             x = x + v_pred * dt
 
         return x
@@ -492,10 +436,13 @@ class PixNerDiT(nn.Module):
             else:
                 x0_pred, uc = self(x, t_global, y)
 
-            v_pred = self.asymflow_velocity(x0_pred, x, t_val=torch.tensor([t_val], device=device))
+            denom = max(1.0 - t_val, 0.05)
+            v_pred = (x0_pred - x) / denom
 
             # --- Step 2: Identify confident patches ---
-            uc_flat = uc.view(B, -1)  # (B, N)
+            # Average pixel-level uncertainty to patch-level for patch selection
+            uc_patch = F.avg_pool2d(uc, kernel_size=self.patch_size)
+            uc_flat = uc_patch.view(B, -1)  # (B, N)
             k = max(1, int(N * percentile))
             tau = uc_flat.kthvalue(k, dim=-1).values  # (B,) - threshold
             M_conf = (uc_flat <= tau.unsqueeze(-1))  # (B, N) bool mask
@@ -533,7 +480,7 @@ class PixNerDiT(nn.Module):
                 else:
                     x0_ctx, _ = self(x_tilde, t_mixed, y)
 
-                v_ctx = self.asymflow_velocity(x0_ctx, x, t_val=t_mixed / 1000.0)
+                v_ctx = (x0_ctx - x) / denom
 
                 # --- Step 5: Combine velocities ---
                 # Use context-aware velocity for uncertain patches, original for confident
