@@ -207,20 +207,15 @@ class BinaryAutoencoder(nn.Module):
         dims=(96, 192, 384, 768),
         depths=(3, 3, 9, 3),
         latent_discrete=256,
-        latent_continuous=32,
-        residual_dropout_prob=0.1,
         num_transformer_blocks=8,
         num_cls_tokens=4,
-        mask_ratio=0.75,
-        mask_patch=2,
+        mask_block_size=14,
         use_masking=True,
     ):
         super().__init__()
 
-        self.residual_dropout_prob = residual_dropout_prob
         self.num_cls_tokens = num_cls_tokens
-        self.mask_ratio = mask_ratio
-        self.mask_patch = mask_patch
+        self.mask_block_size = mask_block_size
         self.use_masking = use_masking
 
         token_dim = dims[-1]
@@ -247,57 +242,52 @@ class BinaryAutoencoder(nn.Module):
         # CLS tokens and mask token
         # --------------------------------------------------
         self.cls_tokens = nn.Parameter(torch.randn(1, num_cls_tokens, token_dim))
-        self.mask_token = nn.Parameter(torch.randn(1, 1, token_dim))
 
         # --------------------------------------------------
         # Spatial bottleneck (ternary discrete + continuous bypass)
         # --------------------------------------------------
         self.to_latent_discrete = nn.Conv2d(token_dim, latent_discrete, 3, padding=1)
-        self.to_latent_continuous = nn.Conv2d(token_dim, latent_continuous, 3, padding=1)
-        self.from_latent = nn.Conv2d(latent_discrete + latent_continuous, token_dim, 1)
+        self.from_latent = nn.Conv2d(latent_discrete, token_dim, 1)
         self.quant = AdaptiveBitwiseSign()
 
     # ======================================================
-    # MAE-style masking (applied to half the batch)
+    # Channel-wise left-to-right block masking on z_discrete
     # ======================================================
-    def apply_masking(self, tokens, B, C, H, W):
-        """Block-wise masking on spatial tokens. CLS tokens are never masked.
-        Returns (tokens, masked_ids) where masked_ids is the batch indices that were masked."""
+    def apply_masking(self, z, B):
+        """Mask a random suffix of channel blocks (size mask_block_size) in the
+        discrete latent z [B, C, H, W] by zeroing them out. Blocks are always
+        dropped from the *right* of the channel axis, so the model is incentivised
+        to pack the most important information into the leftmost channels.
+
+        n_mask is sampled uniformly in [1, num_blocks] per masked sample so the
+        model sees variable compression levels during training.
+
+        Returns (z_masked, masked_ids) where masked_ids are batch indices that
+        had at least one block zeroed.
+        """
         if (not self.training) or B < 2 or (not self.use_masking):
-            return tokens, None
+            return z, None
 
         num_masked = B // 2
-
-        # Random half of batch to mask
-        idx = torch.randperm(B, device=tokens.device)
+        idx = torch.randperm(B, device=z.device)
         masked_ids = idx[:num_masked]
 
-        cls_part = tokens[:, :self.num_cls_tokens]
-        spatial = tokens[:, self.num_cls_tokens:]
+        C = z.shape[1]          # latent_discrete channels (e.g. 224)
+        block = self.mask_block_size   # e.g. 14
+        num_blocks = C // block        # e.g. 16
 
-        # Reshape spatial to [B, C, H, W] for block masking
-        fmap = spatial.transpose(1, 2).reshape(B, C, H, W)
+        if num_blocks == 0:
+            return z, None
 
-        p = self.mask_patch
-        coarse_h = H // p
-        coarse_w = W // p
+        z = z.clone()
+        # Sample how many blocks to zero for each masked sample: [1, num_blocks]
+        n_mask = torch.randint(1, num_blocks + 1, (num_masked,), device=z.device)
 
-        # Create block mask at coarse resolution, then upscale
-        mask = (
-            torch.rand(num_masked, 1, coarse_h, coarse_w, device=tokens.device)
-            < self.mask_ratio
-        )
-        mask = mask.repeat_interleave(p, 2).repeat_interleave(p, 3)
+        for i in range(num_masked):
+            start_ch = C - n_mask[i].item() * block
+            z[masked_ids[i], start_ch:] = 0.0
 
-        # Replace masked positions with learned mask token
-        target = fmap[masked_ids]
-        mask_tok = self.mask_token.transpose(1, 2).unsqueeze(-1)  # [1, C, 1, 1]
-        mask_tok = mask_tok.expand_as(target)
-        target = torch.where(mask, mask_tok, target)
-        fmap[masked_ids] = target
-
-        spatial = fmap.flatten(2).transpose(1, 2)
-        return torch.cat([cls_part, spatial], dim=1), masked_ids
+        return z, masked_ids
 
     # ======================================================
     # forward
@@ -320,27 +310,16 @@ class BinaryAutoencoder(nn.Module):
         spatial = tokens[:, self.num_cls_tokens:]
         features = spatial.transpose(1, 2).reshape(B, C, H, W)
 
-        # 3. Spatial bottleneck
+        # 3. Spatial bottleneck (discrete only) + channel-block masking
         z_discrete = self.quant(self.to_latent_discrete(features))
-        z_continuous = self.to_latent_continuous(features)
+        z_discrete, masked_ids = self.apply_masking(z_discrete, B)
+        features = self.from_latent(z_discrete)  # [B, C, H, W]
 
-        # Residual dropout on continuous and discrete channels
-        if self.training and self.residual_dropout_prob > 0:
-            mask_cont = torch.rand(B, 1, 1, 1, device=z_continuous.device) > self.residual_dropout_prob
-            z_continuous = z_continuous * mask_cont.float()
-            
-            mask_disc = torch.rand(B, 1, 1, 1, device=z_discrete.device) > self.residual_dropout_prob
-            z_discrete = z_discrete * mask_disc.float()
-
-        z = torch.cat([z_discrete, z_continuous], dim=1)
-        features = self.from_latent(z)  # [B, C, H, W]
-
-        # 4. Decoder transformers with CLS + MAE masking
+        # 4. Decoder transformers with CLS tokens (no token-level masking)
         spatial = features.flatten(2).transpose(1, 2)
         tokens = torch.cat([enc_cls, spatial], dim=1)
 
-        # Apply MAE masking on decoder input (after bottleneck)
-        tokens, masked_ids = self.apply_masking(tokens, B, C, H, W)
+        # (masking already applied at the latent level above)
 
         for block in self.decoder_transformers:
             tokens = block(tokens)

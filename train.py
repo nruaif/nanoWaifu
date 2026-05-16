@@ -124,13 +124,10 @@ def train(config_path):
         dims=cfg.model.dims,
         depths=cfg.model.depths,
         latent_discrete=cfg.model.latent_discrete,
-        latent_continuous=cfg.model.latent_continuous,
-        residual_dropout_prob=cfg.training.residual_dropout,
         num_transformer_blocks=cfg.model.num_transformer_blocks,
         num_cls_tokens=cfg.model.num_cls_tokens,
         use_masking=cfg.training.use_masking,
-        mask_ratio=cfg.training.mask_ratio,
-        mask_patch=cfg.training.mask_patch,
+        mask_block_size=cfg.training.mask_block_size,
     ).to(device)
 
     # ==================== Discriminator ====================

@@ -18,21 +18,17 @@ training:
   temp_anneal_factor: 0.98
   temp_anneal_min: 0.95
 
-  # Continuous latent residual dropout
-  residual_dropout: 0.1
 
-  # MAE-style masking (applied to half the batch after bottleneck)
+  # Sequential block masking: drops contiguous blocks of tokens from the right
   use_masking: true
-  mask_ratio: 0.75      # Fraction of spatial tokens to mask
-  mask_patch: 2          # Block size for masking
+  mask_block_size: 14   # Number of tokens per block; blocks masked left-to-right
 
 model:
   dims: [96, 192, 384]
   depths: [3, 3, 9]
-  latent_discrete: 12
-  latent_continuous: 48
+  latent_discrete: 224  # 14 * 16
   num_transformer_blocks: 12
-  num_cls_tokens: 4
+  num_cls_tokens: 8
 
 data:
   webdataset_url: "/data/train/000{01..40}.tar"
