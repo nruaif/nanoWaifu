@@ -4,98 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==========================================================
-# Positional Embeddings
-# ==========================================================
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-    
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-    
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-    
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
-    return emb
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float32)
-    omega /= (embed_dim / 2.)
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
-import numpy as np
-
-def apply_rotary_emb(x, freqs_cis):
-    # x: [B, N, H_heads, C]
-    # freqs_cis: [N, C/2]
-    x_shape = x.shape
-    x = x.reshape(*x_shape[:-1], -1, 2)
-    x_complex = torch.view_as_complex(x)
-    
-    freqs_cis = freqs_cis.view(1, x_shape[1], 1, -1) # [1, N, 1, C/2]
-    
-    x_rotated = x_complex * freqs_cis
-    x_out = torch.view_as_real(x_rotated)
-    return x_out.reshape(*x_shape)
-
-def compute_2d_freqs_cis(dim, h, w):
-    # dim is the hidden dimension of the head.
-    assert dim % 4 == 0, "Dimension must be divisible by 4 for 2D RoPE"
-    half_dim = dim // 2
-    
-    grid_h = torch.arange(h, dtype=torch.float32)
-    grid_w = torch.arange(w, dtype=torch.float32)
-    
-    freqs_h = 1.0 / (10000 ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
-    freqs_w = 1.0 / (10000 ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
-    
-    # Outer products
-    freqs_h = torch.outer(grid_h, freqs_h)  # [H, D/4]
-    freqs_w = torch.outer(grid_w, freqs_w)  # [W, D/4]
-    
-    freqs_h = torch.polar(torch.ones_like(freqs_h), freqs_h)
-    freqs_w = torch.polar(torch.ones_like(freqs_w), freqs_w)
-    
-    # Broadcast to [H, W, D/4]
-    freqs_h = freqs_h.unsqueeze(1).expand(h, w, -1)
-    freqs_w = freqs_w.unsqueeze(0).expand(h, w, -1)
-    
-    # Concatenate along dim
-    freqs_cis = torch.cat([freqs_h, freqs_w], dim=-1) # [H, W, D/2] complex
-    return freqs_cis.reshape(h * w, -1)
-
-# ==========================================================
 # Blocks
 # ==========================================================
 
@@ -115,7 +23,7 @@ class AdaLNZero(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
         return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
-class AttentionRoPE(nn.Module):
+class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False):
         super().__init__()
         self.num_heads = num_heads
@@ -125,16 +33,10 @@ class AttentionRoPE(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x, freqs_cis=None):
+    def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)   # [B, H, N, D]
-
-        if freqs_cis is not None:
-            # Apply RoPE
-            q_roped = apply_rotary_emb(q.transpose(1, 2), freqs_cis).transpose(1, 2)
-            k_roped = apply_rotary_emb(k.transpose(1, 2), freqs_cis).transpose(1, 2)
-            q, k = q_roped, k_roped
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -153,10 +55,8 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         B, N, C = x.shape
-        H = W = int(math.sqrt(N))
-        
         x = self.fc1(x)
         
         x = x.transpose(1, 2).reshape(B, -1, H, W)
@@ -171,31 +71,31 @@ class TransformerBlockAdaLN(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0, cond_dim=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.attn = AttentionRoPE(dim, num_heads=num_heads, qkv_bias=True)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio))
         self.adaLN = AdaLNZero(cond_dim, dim) if cond_dim else None
 
-    def forward(self, x, cond, freqs_cis=None):
+    def forward(self, x, cond, H, W):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(cond)
         
         # Attention
         norm_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + gate_msa.unsqueeze(1) * self.attn(norm_x, freqs_cis)
+        x = x + gate_msa.unsqueeze(1) * self.attn(norm_x)
         
         # MLP
         norm_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x, H, W)
         return x
 
 class MLPMixerBlock(nn.Module):
-    def __init__(self, num_tokens, dim):
+    def __init__(self, dim):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.token_mix = nn.Sequential(
-            nn.Linear(num_tokens, num_tokens),
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
             nn.GELU(),
-            nn.Linear(num_tokens, num_tokens)
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         )
         self.norm2 = nn.LayerNorm(dim)
         self.channel_mix = nn.Sequential(
@@ -204,12 +104,13 @@ class MLPMixerBlock(nn.Module):
             nn.Linear(dim * 4, dim)
         )
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         # x: [B, N, C]
+        B, N, C = x.shape
         h = self.norm1(x)
-        h = h.transpose(1, 2) # [B, C, N]
+        h = h.transpose(1, 2).reshape(B, C, H, W)
         h = self.token_mix(h)
-        h = h.transpose(1, 2) # [B, N, C]
+        h = h.flatten(2).transpose(1, 2)
         x = x + h
         
         x = x + self.channel_mix(self.norm2(x))
@@ -252,23 +153,12 @@ def spherify(z, sampling=False, sigma=None, max_sigma=None, e=None):
 # ==========================================================
 
 class SphereEncoder(nn.Module):
-    def __init__(self, img_size=256, patch_size=8, in_chans=3, dim=1024, depth=24, num_heads=16, 
+    def __init__(self, patch_size=8, in_chans=3, dim=1024, depth=24, num_heads=16, 
                  mlp_ratio=4.0, cond_dim=1024, mixer_depth=4, latent_dim=128):
         super().__init__()
-        self.img_size = img_size
         self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-        self.grid_size = img_size // patch_size
         
         self.patch_embed = nn.Conv2d(in_chans, dim, kernel_size=patch_size, stride=patch_size)
-        
-        # Absolute positional embeddings
-        pos_embed = get_2d_sincos_pos_embed(dim, self.grid_size)
-        self.register_buffer('pos_embed', torch.from_numpy(pos_embed).float().unsqueeze(0), persistent=False)
-        
-        # RoPE
-        freqs_cis = compute_2d_freqs_cis(dim // num_heads, self.grid_size, self.grid_size)
-        self.register_buffer('freqs_cis', freqs_cis, persistent=False)
         
         self.blocks = nn.ModuleList([
             TransformerBlockAdaLN(dim, num_heads, mlp_ratio, cond_dim)
@@ -276,7 +166,7 @@ class SphereEncoder(nn.Module):
         ])
         
         self.mixers = nn.ModuleList([
-            MLPMixerBlock(self.num_patches, dim)
+            MLPMixerBlock(dim)
             for _ in range(mixer_depth)
         ])
         
@@ -284,47 +174,34 @@ class SphereEncoder(nn.Module):
         self.rms_norm = RMSNorm(latent_dim)
 
     def forward(self, x, cond):
-        # x: [B, C, H, W]
+        # x: [B, C, H_img, W_img]
         x = self.patch_embed(x)
         B, C, H, W = x.shape
         x = x.flatten(2).transpose(1, 2) # [B, N, C]
         
-        x = x + self.pos_embed
-        
         for block in self.blocks:
-            x = block(x, cond, self.freqs_cis)
+            x = block(x, cond, H, W)
             
         for mixer in self.mixers:
-            x = mixer(x)
+            x = mixer(x, H, W)
             
         x = self.to_latent(x) # [B, N, latent_dim]
         x = self.rms_norm(x)
-        return x
+        return x, H, W
 
 class SphereDecoder(nn.Module):
-    def __init__(self, img_size=256, patch_size=8, out_chans=3, dim=1024, depth=24, num_heads=16, 
+    def __init__(self, patch_size=8, out_chans=3, dim=1024, depth=24, num_heads=16, 
                  mlp_ratio=4.0, cond_dim=1024, mixer_depth=4, latent_dim=128):
         super().__init__()
-        self.img_size = img_size
         self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-        self.grid_size = img_size // patch_size
         
         self.rms_norm = RMSNorm(latent_dim)
         self.from_latent = nn.Linear(latent_dim, dim)
         
         self.mixers = nn.ModuleList([
-            MLPMixerBlock(self.num_patches, dim)
+            MLPMixerBlock(dim)
             for _ in range(mixer_depth)
         ])
-        
-        # Absolute positional embeddings
-        pos_embed = get_2d_sincos_pos_embed(dim, self.grid_size)
-        self.register_buffer('pos_embed', torch.from_numpy(pos_embed).float().unsqueeze(0), persistent=False)
-        
-        # RoPE
-        freqs_cis = compute_2d_freqs_cis(dim // num_heads, self.grid_size, self.grid_size)
-        self.register_buffer('freqs_cis', freqs_cis, persistent=False)
         
         self.blocks = nn.ModuleList([
             TransformerBlockAdaLN(dim, num_heads, mlp_ratio, cond_dim)
@@ -336,18 +213,16 @@ class SphereDecoder(nn.Module):
         
         self.unpatchify = nn.Linear(dim, patch_size * patch_size * out_chans)
 
-    def forward(self, x, cond):
+    def forward(self, x, cond, H, W):
         # x: [B, N, latent_dim]
         x = self.rms_norm(x)
         x = self.from_latent(x)
         
         for mixer in self.mixers:
-            x = mixer(x)
+            x = mixer(x, H, W)
             
-        x = x + self.pos_embed
-        
         for block in self.blocks:
-            x = block(x, cond, self.freqs_cis)
+            x = block(x, cond, H, W)
             
         # Final norm
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN(cond)
@@ -358,7 +233,6 @@ class SphereDecoder(nn.Module):
         # Unpatchify
         B = x.shape[0]
         P = self.patch_size
-        H = W = self.grid_size
         C = x.shape[-1] // (P * P)
         
         x = x.reshape(B, H, W, P, P, C)
@@ -398,11 +272,12 @@ class TagConditioner(nn.Module):
 
 
 class SphereAutoencoder(nn.Module):
-    def __init__(self, vocab_size=10000, img_size=256, patch_size=8, dim=1024, enc_depth=24, dec_depth=24, 
+    def __init__(self, vocab_size=10000, patch_size=8, dim=1024, enc_depth=24, dec_depth=24, 
                  latent_dim=128, num_heads=16):
         super().__init__()
         self.vocab_size = vocab_size
         cond_dim = dim
+        self.patch_size = patch_size
         
         # Tag conditioning via 2 transformer blocks
         self.tag_conditioner = TagConditioner(vocab_size, cond_dim, depth=2, num_heads=num_heads)
@@ -410,11 +285,11 @@ class SphereAutoencoder(nn.Module):
         self.null_emb = nn.Parameter(torch.randn(cond_dim))
         
         self.encoder = SphereEncoder(
-            img_size=img_size, patch_size=patch_size, dim=dim, depth=enc_depth, num_heads=num_heads,
+            patch_size=patch_size, dim=dim, depth=enc_depth, num_heads=num_heads,
             cond_dim=cond_dim, latent_dim=latent_dim
         )
         self.decoder = SphereDecoder(
-            img_size=img_size, patch_size=patch_size, dim=dim, depth=dec_depth, num_heads=num_heads,
+            patch_size=patch_size, dim=dim, depth=dec_depth, num_heads=num_heads,
             cond_dim=cond_dim, latent_dim=latent_dim
         )
 
@@ -428,7 +303,7 @@ class SphereAutoencoder(nn.Module):
 
     def forward(self, x, tags, noise_r=1.0, max_sigma=28.6):
         cond = self.get_cond(tags)
-        z = self.encoder(x, cond)
+        z, H, W = self.encoder(x, cond)
         
         # Spherify with jitter
         sigma = noise_r * max_sigma
@@ -446,12 +321,12 @@ class SphereAutoencoder(nn.Module):
         v_NOISY = spherify(z, sampling=True, sigma=sigma, e=e)
         
         # Decode
-        recon_noisy = self.decoder(v_noisy, cond)
-        recon_NOISY = self.decoder(v_NOISY, cond)
+        recon_noisy = self.decoder(v_noisy, cond, H, W)
+        recon_NOISY = self.decoder(v_NOISY, cond, H, W)
         
         return recon_noisy, recon_NOISY, v, cond
 
-    def generate(self, e, tags=None, steps=1, cfg_scale=1.0, max_sigma=28.6):
+    def generate(self, e, H, W, tags=None, steps=1, cfg_scale=1.0, max_sigma=28.6):
         B = e.shape[0]
         device = e.device
         
@@ -463,37 +338,47 @@ class SphereAutoencoder(nn.Module):
             cond_null = self.null_emb.unsqueeze(0).expand(B, -1)
             
         v = spherify(e, sampling=False)
-        x = self.decoder(v, cond)
+        x = self.decoder(v, cond, H, W)
         
         if cfg_scale > 1.0 and tags is not None:
-            x_uncond = self.decoder(v, cond_null)
+            x_uncond = self.decoder(v, cond_null, H, W)
             x = x_uncond + cfg_scale * (x - x_uncond)
             
         if steps > 1:
             for _ in range(steps - 1):
-                z = self.encoder(x, cond)
+                z, _, _ = self.encoder(x, cond)
                 if cfg_scale > 1.0 and tags is not None:
-                    z_uncond = self.encoder(x, cond_null)
+                    z_uncond, _, _ = self.encoder(x, cond_null)
                     z = z_uncond + cfg_scale * (z - z_uncond)
                 
                 v = spherify(z, sampling=True, sigma=max_sigma)
-                x = self.decoder(v, cond)
+                x = self.decoder(v, cond, H, W)
                 
                 if cfg_scale > 1.0 and tags is not None:
-                    x_uncond = self.decoder(v, cond_null)
+                    x_uncond = self.decoder(v, cond_null, H, W)
                     x = x_uncond + cfg_scale * (x - x_uncond)
                     
         return x
 
 if __name__ == "__main__":
-    model = SphereAutoencoder(vocab_size=1000, img_size=32, patch_size=2, dim=256, enc_depth=4, dec_depth=4, latent_dim=8)
-    x = torch.randn(2, 3, 32, 32)
+    model = SphereAutoencoder(vocab_size=1000, patch_size=2, dim=256, enc_depth=4, dec_depth=4, latent_dim=8)
+    
+    # Test adaptive shapes
+    x1 = torch.randn(2, 3, 32, 32)
+    x2 = torch.randn(2, 3, 32, 48)
     tags = torch.randint(0, 1000, (2, 16))
     
-    recon_noisy, recon_NOISY, v, cond = model(x, tags)
-    print("Recon shape:", recon_noisy.shape)
+    recon_noisy1, recon_NOISY1, v1, cond1 = model(x1, tags)
+    print("Recon1 shape:", recon_noisy1.shape)
+    
+    recon_noisy2, recon_NOISY2, v2, cond2 = model(x2, tags)
+    print("Recon2 shape:", recon_noisy2.shape)
     
     # Test generation
-    e = torch.randn(2, 16*16, 8)
-    gen = model.generate(e, tags, steps=2)
-    print("Gen shape:", gen.shape)
+    e1 = torch.randn(2, 16*16, 8)
+    gen1 = model.generate(e1, 16, 16, tags, steps=2)
+    print("Gen1 shape:", gen1.shape)
+
+    e2 = torch.randn(2, 16*24, 8)
+    gen2 = model.generate(e2, 16, 24, tags, steps=2)
+    print("Gen2 shape:", gen2.shape)

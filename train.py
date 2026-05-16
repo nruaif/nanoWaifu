@@ -144,7 +144,6 @@ def train(config_path):
     # Initialize SphereAutoencoder instead of BinaryAutoencoder
     model = SphereAutoencoder(
         vocab_size=tag_processor.num_classes,
-        img_size=cfg.training.image_size,
         patch_size=cfg.model.patch_size,
         dim=cfg.model.dim,
         enc_depth=cfg.model.enc_depth,
@@ -424,10 +423,13 @@ def train(config_path):
                     }, step=global_step)
                     
                     # Generate from random noise
-                    L = model_to_save.encoder.num_patches
+                    patch_size = model_to_save.patch_size
+                    H_grid = x1_sample.shape[2] // patch_size
+                    W_grid = x1_sample.shape[3] // patch_size
+                    L = H_grid * W_grid
                     dim = model_to_save.encoder.to_latent.out_features
                     noise_e = torch.randn(n_viz, L, dim, device=device)
-                    x_gen = model_to_save.generate(noise_e, tags_sample, steps=2, cfg_scale=1.5)
+                    x_gen = model_to_save.generate(noise_e, H_grid, W_grid, tags=tags_sample, steps=2, cfg_scale=1.5)
                     gen_grid = make_grid(x_gen, nrow=n_viz, normalize=True, value_range=(-1, 1))
                     
                     wandb.log({
