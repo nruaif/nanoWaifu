@@ -14,9 +14,38 @@ import glob
 import builtins
 import lpips
 from torch.optim.lr_scheduler import LambdaLR
-from model import BinaryAutoencoder, PatchDiscriminator, disc_hinge_loss, gen_hinge_loss, r1_gradient_penalty
+from sphere_encoder import SphereAutoencoder
+from model import PatchDiscriminator, disc_hinge_loss, gen_hinge_loss, r1_gradient_penalty
 from dataset import WDSLoader
 from config import Config
+
+
+# ==========================================================
+# Tag Processor
+# ==========================================================
+
+class TagProcessor:
+    def __init__(self, class_map, max_tags=32):
+        self.tag_to_idx = class_map
+        if class_map:
+            self.num_classes = max(class_map.values()) + 2
+        else:
+            self.num_classes = 1
+        self.pad_idx = self.num_classes - 1
+        self.max_tags = max_tags
+
+    def process_prompts(self, prompts, device):
+        batch_indices = []
+        for p in prompts:
+            tags = p.split()
+            indices = []
+            for t in tags:
+                if t in self.tag_to_idx:
+                    indices.append(self.tag_to_idx[t])
+            indices = indices[:self.max_tags]
+            indices += [self.pad_idx] * (self.max_tags - len(indices))
+            batch_indices.append(indices)
+        return torch.tensor(batch_indices, dtype=torch.long, device=device)
 
 
 # ==========================================================
@@ -80,16 +109,6 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
                 print(f"Error removing {ckpt}: {e}")
 
 
-def get_pca_latent(latent):
-    B, C, H, W = latent.shape
-    X = latent.permute(0, 2, 3, 1).reshape(-1, C)
-    X = X - X.mean(dim=0)
-    U, S, V = torch.pca_lowrank(X, q=3)
-    X_pca = torch.matmul(X, V[:, :3])
-    X_pca = (X_pca - X_pca.min()) / (X_pca.max() - X_pca.min() + 1e-5)
-    return X_pca.reshape(B, H, W, 3).permute(0, 3, 1, 2)
-
-
 # ==========================================================
 # Training
 # ==========================================================
@@ -118,19 +137,20 @@ def train(config_path):
         num_workers=cfg.training.num_workers,
     )
     dataloader = wds_loader.make_loader()
+    
+    tag_processor = TagProcessor(wds_loader.class_map, max_tags=32)
 
     # ==================== Models ====================
-    model = BinaryAutoencoder(
-        dims=cfg.model.dims,
-        depths=cfg.model.depths,
-        latent_discrete=cfg.model.latent_discrete,
-        latent_continuous=cfg.model.latent_continuous,
-        residual_dropout_prob=cfg.training.residual_dropout,
-        num_transformer_blocks=cfg.model.num_transformer_blocks,
-        num_cls_tokens=cfg.model.num_cls_tokens,
-        use_masking=cfg.training.use_masking,
-        mask_ratio=cfg.training.mask_ratio,
-        mask_patch=cfg.training.mask_patch,
+    # Initialize SphereAutoencoder instead of BinaryAutoencoder
+    model = SphereAutoencoder(
+        vocab_size=tag_processor.num_classes,
+        img_size=cfg.training.image_size,
+        patch_size=cfg.model.patch_size,
+        dim=cfg.model.dim,
+        enc_depth=cfg.model.enc_depth,
+        dec_depth=cfg.model.dec_depth,
+        latent_dim=cfg.model.latent_dim,
+        num_heads=cfg.model.num_heads
     ).to(device)
 
     # ==================== Discriminator ====================
@@ -228,12 +248,12 @@ def train(config_path):
         try:
             batch = next(data_iter)
         except StopIteration:
-            model_raw = model.module if is_ddp else model
-            model_raw.anneal_temperature(factor=cfg.training.temp_anneal_factor, min_temp=cfg.training.temp_anneal_min)
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
         x_real = batch[0].to(device, memory_format=torch.channels_last)
+        prompts = batch[1]
+        tags = tag_processor.process_prompts(prompts, device)
 
         # During disc warmup: freeze autoencoder, only train discriminator
         ae_frozen = cfg.gan.enabled and (global_step < cfg.gan.disc_warmup_steps)
@@ -243,17 +263,33 @@ def train(config_path):
             opt_gen.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            x_rec, latent, masked_ids = model(x_real)
-            recon_loss = charbonnier(x_rec, x_real)
-            perc_loss = lpips_fn(x_rec, x_real).mean()
+            # Forward pass: returns noisy (small jitter), NOISY (large jitter), clean latent v, and conditional embed
+            recon_noisy, recon_NOISY, v, cond = model(x_real, tags)
+            
+            # 1. Pixel Reconstruction Loss (small jitter to x_real)
+            recon_loss = charbonnier(recon_noisy, x_real)
+            perc_loss = lpips_fn(recon_noisy, x_real).mean()
+            loss_pix_recon = recon_loss + cfg.training.perceptual_weight * perc_loss
+
+            # 2. Pixel Consistency Loss (large jitter to small jitter output)
+            recon_con_loss = charbonnier(recon_NOISY, recon_noisy.detach())
+            perc_con_loss = lpips_fn(recon_NOISY, recon_noisy.detach()).mean()
+            loss_pix_con = recon_con_loss + cfg.training.perceptual_weight * perc_con_loss
+            
+            # 3. Latent Consistency Loss (similarity of cleanly encoded large jitter vs clean latent)
+            model_raw = model.module if is_ddp else model
+            z_reenc = model_raw.encoder(recon_NOISY, cond)
+            loss_lat_con = 1.0 - F.cosine_similarity(v.flatten(1), z_reenc.flatten(1), dim=1).mean()
 
             # Generator adversarial loss (only after warmup)
             g_adv_loss = torch.tensor(0.0, device=device)
             if cfg.gan.enabled and not ae_frozen:
-                fake_preds = disc(x_rec)
+                fake_preds = disc(recon_noisy)
                 g_adv_loss = gen_hinge_loss(fake_preds)
 
-            g_total = recon_loss + cfg.training.perceptual_weight * perc_loss
+            # Combined losses
+            g_total = loss_pix_recon + 1.0 * loss_pix_con + 0.1 * loss_lat_con
+            
             if cfg.gan.enabled and not ae_frozen:
                 g_total = g_total + cfg.gan.adv_weight * g_adv_loss
 
@@ -276,7 +312,7 @@ def train(config_path):
             opt_disc.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-                fake_preds = disc(x_rec.detach())
+                fake_preds = disc(recon_noisy.detach())
                 real_preds = disc(x_real)
                 d_loss = disc_hinge_loss(real_preds, fake_preds)
 
@@ -304,26 +340,15 @@ def train(config_path):
         if rank == 0:
             pbar.update(1)
 
-            model_raw = model.module if is_ddp else model
-            current_temp = model_raw.quant.temp.item()
-
             with torch.no_grad():
-                B = x_real.shape[0]
-                if masked_ids is not None and len(masked_ids) > 0:
-                    is_masked = torch.zeros(B, dtype=torch.bool, device=x_real.device)
-                    is_masked[masked_ids] = True
-                    psnr_clean = compute_psnr(x_rec[~is_masked], x_real[~is_masked])
-                    psnr_masked = compute_psnr(x_rec[is_masked], x_real[is_masked])
-                else:
-                    psnr_clean = compute_psnr(x_rec, x_real)
-                    psnr_masked = 0.0
+                psnr_clean = compute_psnr(recon_noisy, x_real)
 
             postfix = {
                 "rec": f"{recon_loss.item():.4f}",
                 "perc": f"{perc_loss.item():.4f}",
-                "psnr_c": f"{psnr_clean:.1f}",
-                "psnr_m": f"{psnr_masked:.1f}",
-                "temp": f"{current_temp:.4f}",
+                "p_con": f"{loss_pix_con.item():.4f}",
+                "l_con": f"{loss_lat_con.item():.4f}",
+                "psnr": f"{psnr_clean:.1f}",
             }
             if cfg.gan.enabled:
                 postfix["d"] = f"{d_loss_val:.3f}"
@@ -336,12 +361,12 @@ def train(config_path):
                 wandb_log = {
                     "train/recon_loss": recon_loss.item(),
                     "train/perceptual_loss": perc_loss.item(),
+                    "train/pix_con_loss": loss_pix_con.item(),
+                    "train/lat_con_loss": loss_lat_con.item(),
                     "train/total_loss": g_total.item(),
                     "train/lr": opt_gen.param_groups[0]['lr'],
                     "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-                    "train/temp": current_temp,
                     "train/psnr_clean": psnr_clean,
-                    "train/psnr_masked": psnr_masked,
                 }
                 if cfg.gan.enabled:
                     wandb_log.update({
@@ -381,42 +406,36 @@ def train(config_path):
                 with torch.no_grad():
                     n_viz = min(8, x_real.shape[0])
                     x1_sample = x_real[:n_viz]
+                    tags_sample = tags[:n_viz]
 
-                    # Clean reconstruction (eval mode = no masking)
-                    x_rec_clean, _, _ = model(x1_sample)
-                    psnr_clean_viz = compute_psnr(x_rec_clean, x1_sample)
+                    # Reconstruction 
+                    x_rec_eval, _, _, _ = model(x1_sample, tags_sample, noise_r=0.0)
+                    psnr_eval_viz = compute_psnr(x_rec_eval, x1_sample)
 
                     clean_grid = make_grid(
-                        torch.cat([x1_sample, x_rec_clean], dim=0),
+                        torch.cat([x1_sample, x_rec_eval], dim=0),
                         nrow=n_viz, normalize=True, value_range=(-1, 1)
                     )
                     wandb.log({
-                        "eval/clean_recon": wandb.Image(
+                        "eval/recon": wandb.Image(
                             clean_grid,
-                            caption=f"Step {global_step} | Clean PSNR: {psnr_clean_viz:.2f} dB | Top: Orig, Bottom: Recon"
+                            caption=f"Step {global_step} | PSNR: {psnr_eval_viz:.2f} dB | Top: Orig, Bottom: Recon"
                         )
                     }, step=global_step)
-
-                    # Masked reconstruction
-                    model.train()
-                    x_rec_masked, _, masked_viz_ids = model(x1_sample)
-                    model.eval()
-
-                    if masked_viz_ids is not None and len(masked_viz_ids) > 0:
-                        masked_orig = x1_sample[masked_viz_ids]
-                        masked_recon = x_rec_masked[masked_viz_ids]
-                        psnr_masked_viz = compute_psnr(masked_recon, masked_orig)
-
-                        masked_grid = make_grid(
-                            torch.cat([masked_orig, masked_recon], dim=0),
-                            nrow=masked_orig.shape[0], normalize=True, value_range=(-1, 1)
+                    
+                    # Generate from random noise
+                    L = model_to_save.encoder.num_patches
+                    dim = model_to_save.encoder.to_latent.out_features
+                    noise_e = torch.randn(n_viz, L, dim, device=device)
+                    x_gen = model_to_save.generate(noise_e, tags_sample, steps=2, cfg_scale=1.5)
+                    gen_grid = make_grid(x_gen, nrow=n_viz, normalize=True, value_range=(-1, 1))
+                    
+                    wandb.log({
+                        "eval/generation": wandb.Image(
+                            gen_grid,
+                            caption=f"Step {global_step} | 2-step Generation with CFG 1.5"
                         )
-                        wandb.log({
-                            "eval/masked_recon": wandb.Image(
-                                masked_grid,
-                                caption=f"Step {global_step} | Masked PSNR: {psnr_masked_viz:.2f} dB | Top: Orig, Bottom: Recon"
-                            )
-                        }, step=global_step)
+                    }, step=global_step)
 
                 model.train()
                 print("Checkpoint and sampling complete.\n")
