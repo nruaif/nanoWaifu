@@ -277,7 +277,7 @@ def train(config_path):
             
             # 3. Latent Consistency Loss (similarity of cleanly encoded large jitter vs clean latent)
             model_raw = model.module if is_ddp else model
-            z_reenc = model_raw.encoder(recon_NOISY, cond)
+            z_reenc, _, _ = model_raw.encoder(recon_NOISY, cond)
             loss_lat_con = 1.0 - F.cosine_similarity(v.flatten(1), z_reenc.flatten(1), dim=1).mean()
 
             # Generator adversarial loss (only after warmup)
