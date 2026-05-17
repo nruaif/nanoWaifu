@@ -31,7 +31,7 @@ class CharbonnierLoss(nn.Module):
 
     def forward(self, pred, target):
         diff = pred - target
-        return torch.abs(diff).mean() + torch.square(diff).mean()
+        return torch.abs(diff).mean() + (diff ** 2).mean()
 
 
 def compute_psnr(pred, target):
@@ -178,8 +178,35 @@ def train(config_path):
             checkpoint = torch.load(cfg.training.resume_from, map_location=device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-                if "optimizer_state_dict" in checkpoint:
-                    opt_gen.load_state_dict(checkpoint["optimizer_state_dict"])
+                state_dict = checkpoint["model_state_dict"]
+                
+                model_state = model.state_dict()
+                
+                filtered_state = {}
+                
+                for k, v in state_dict.items():
+                
+                    if k not in model_state:
+                        print(f"skip missing key: {k}")
+                        continue
+                
+                    if model_state[k].shape != v.shape:
+                        print(
+                            f"skip shape mismatch: {k} "
+                            f"ckpt={tuple(v.shape)} "
+                            f"model={tuple(model_state[k].shape)}"
+                        )
+                        continue
+                
+                    filtered_state[k] = v
+                
+                missing, unexpected = model.load_state_dict(
+                    filtered_state,
+                    strict=False
+                )
+                
+                print(f"missing keys: {len(missing)}")
+                print(f"unexpected keys: {len(unexpected)}")
                 if "scaler_state_dict" in checkpoint:
                     scaler.load_state_dict(checkpoint["scaler_state_dict"])
                 global_step = checkpoint.get("global_step", 0)
@@ -197,9 +224,9 @@ def train(config_path):
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
-        if cfg.gan.enabled:
-            disc = DDP(disc, device_ids=[local_rank])
-
+        #if cfg.gan.enabled:
+        #    disc = DDP(disc, device_ids=[local_rank])
+    
     # LR scheduler with warmup
     def lr_lambda(step):
         if step < cfg.training.warmup_steps:
@@ -226,7 +253,7 @@ def train(config_path):
             batch = next(data_iter)
         except StopIteration:
             model_raw = model.module if is_ddp else model
-            model_raw.anneal_temperature(factor=cfg.training.temp_anneal_factor, min_temp=cfg.training.temp_anneal_min)
+            #model_raw.anneal_temperature(factor=cfg.training.temp_anneal_factor, min_temp=cfg.training.temp_anneal_min)
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
@@ -239,7 +266,7 @@ def train(config_path):
         if not ae_frozen:
             opt_gen.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             x_rec, latent, masked_ids = model(x_real)
             recon_loss = charbonnier(x_rec, x_real)
             perc_loss = lpips_fn(x_rec, x_real).mean()
@@ -250,7 +277,7 @@ def train(config_path):
                 fake_preds = disc(x_rec)
                 g_adv_loss = gen_hinge_loss(fake_preds)
 
-            g_total = recon_loss + cfg.training.perceptual_weight * perc_loss
+            g_total = recon_loss + 0.1 * perc_loss
             if cfg.gan.enabled and not ae_frozen:
                 g_total = g_total + cfg.gan.adv_weight * g_adv_loss
 

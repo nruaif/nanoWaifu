@@ -1,6 +1,6 @@
 training:
   batch_size: 64
-  learning_rate: 2.0e-4
+  learning_rate: 0.0001
   warmup_steps: 1000
   num_epochs: 100
   max_train_steps: 1000000
@@ -10,8 +10,8 @@ training:
   image_size: 256
   num_workers: 4
   output_dir: "outputs"
-  wandb_project: "nanoWaifu-ae"
-  resume_from: "outputs/ckpt_step_80000.pth"
+  wandb_project: "nanoWaifu-ae2"
+  resume_from: "outputs/ckpt_step_40000.pth"
   max_checkpoints: 3
 
   # Binary quantization temperature annealing
@@ -24,12 +24,29 @@ training:
   mask_block_size: 14   # Number of tokens per block; blocks masked left-to-right
 
 model:
-  dims: [96, 192, 384]
-  depths: [3, 3, 9]
+  dims: [96, 192, 384, 768]
+  depths: [4, 4, 6, 4]
   latent_discrete: 224  # 14 * 16
   num_transformer_blocks: 12
   num_cls_tokens: 8
 
 data:
-  webdataset_url: "/data/train/000{01..40}.tar"
+  webdataset_url: "/workspace/data/train/000{01..80}.tar"
   csv_path: "characters.csv"
+
+gan:
+  enabled: false
+  
+  # Architecture
+  ndf: 64                    # Base channel multiplier for the discriminator
+  n_layers: 3                # Gives a patch size of roughly 70x70 (standard PatchGAN)
+  num_scales: 1              # Multi-scale discriminator (set to 1 for stability, 2 for ultra-high-res)
+
+  # Learning Rates & Optimization
+  disc_lr: 0.0002            # Standard AdamW learning rate for discriminators
+  disc_warmup_steps: 10000   # Steps to train ONLY the autoencoder before GAN kicks in*
+  adv_weight: 0.1            # Keeps adversarial guidance from overpowering reconstruction
+
+  # Regularization (Crucial for Hinge Loss)
+  r1_gamma: 10.0             # Gradient penalty strength (1.0 to 10.0 is standard)
+  r1_every: 16               # Evaluates penalty every 16 steps to save VRAM and compute

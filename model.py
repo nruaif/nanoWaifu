@@ -6,14 +6,76 @@ import torch.nn.functional as F
 # ==========================================================
 # Binary quantization with temperature annealing
 # ==========================================================
+torch._functorch.config.activation_memory_budget = 0.5
+class DCAEDownsample(nn.Module):
+    """
+    DC-AE Downsample Block with Residual Autoencoding.
+    Assumes a 2x spatial downsample and 2x channel increase (C -> 2C).
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Main Neural Network Path
+        self.main_path = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(in_channels * 4, out_channels, 1)
+        )
+        
+        # Non-parametric shortcut operations
+        self.unshuffle = nn.PixelUnshuffle(2)
 
+    def forward(self, x):
+        main_out = self.main_path(x)
+        
+        # Shortcut Path [cite: 198, 199, 200]
+        # 1. Space-to-Channel: (B, C, H, W) -> (B, 4C, H/2, W/2)
+        unshuffled = self.unshuffle(x) 
+        
+        # 2. Channel Averaging: Split 4C into two groups of 2C and average them
+        chunk1, chunk2 = unshuffled.chunk(2, dim=1)
+        shortcut_out = (chunk1 + chunk2) / 2.0
+        
+        return main_out + shortcut_out
+
+
+class DCAEUpsample(nn.Module):
+    """
+    DC-AE Upsample Block with Residual Autoencoding.
+    Assumes a 2x spatial upsample and 2x channel decrease (2C -> C).
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Main Neural Network Path
+        self.main_path = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * 4, 1),
+            nn.PixelShuffle(2)
+        )
+        
+        # Non-parametric shortcut operations
+        self.shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x):
+        main_out = self.main_path(x)
+        
+        # Shortcut Path [cite: 202, 203, 204]
+        # 1. Channel-to-Space: (B, 2C, H/2, W/2) -> (B, C/2, H, W)
+        # Note: PixelShuffle(2) expects channels to be divisible by 4.
+        shuffled = self.shuffle(x) 
+        
+        # 2. Channel Duplicating: Duplicate C/2 to C via concatenation
+        shortcut_out = torch.cat([shuffled, shuffled], dim=1)
+        
+        return main_out + shortcut_out
+        
 class BinarySTE(torch.autograd.Function):
     """Binary Straight-Through Estimator with tanh surrogate gradient.
     Produces {-1, +1} values with smooth backward pass."""
     @staticmethod
     def forward(ctx, x, temp):
         ctx.save_for_backward(x, temp)
-        return torch.sign(x)
+        y = torch.where(x >= 0,
+                        torch.ones_like(x),
+                        -torch.ones_like(x))
+        return y
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -118,7 +180,7 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
+    @torch.compile
     def forward(self, x):
         # x: [B, N, C]
         h = self.norm1(x)
@@ -144,15 +206,15 @@ class MultiScaleCNNEncoder(nn.Module):
 
         self.stages = nn.ModuleList()
         for i in range(len(dims) - 1):
-            downsample = nn.Sequential(
-                nn.PixelUnshuffle(2),
-                nn.Conv2d(dims[i] * 4, dims[i + 1], 1)
-            )
+            # REPLACED: Use the new DC-AE downsample block
+            downsample = DCAEDownsample(dims[i], dims[i + 1])
+            
             blocks = nn.Sequential(
                 *[InceptionNeXtBlock(dims[i + 1]) for _ in range(depths[i + 1])]
             )
             self.stages.append(nn.ModuleList([downsample, blocks]))
-
+            
+    @torch.compile
     def forward(self, x):
         x = self.unshuffle(x)
         x = self.stem(x)
@@ -165,20 +227,15 @@ class MultiScaleCNNEncoder(nn.Module):
         return x  # [B, dims[-1], H, W]
 
 
-# ==========================================================
-# Multi-Scale CNN Decoder (InceptionNeXt stages only, no transformers)
-# ==========================================================
-
 class MultiScaleCNNDecoder(nn.Module):
     def __init__(self, patch=4, dims=(96, 192, 384, 768), depths=(3, 3, 9, 3)):
         super().__init__()
 
         self.stages = nn.ModuleList()
         for i in range(len(dims) - 1, 0, -1):
-            upsample = nn.Sequential(
-                nn.Conv2d(dims[i], dims[i - 1] * 4, 1),
-                nn.PixelShuffle(2)
-            )
+            # REPLACED: Use the new DC-AE upsample block
+            upsample = DCAEUpsample(dims[i], dims[i - 1])
+            
             blocks = nn.Sequential(
                 *[InceptionNeXtBlock(dims[i - 1]) for _ in range(depths[i - 1])]
             )
@@ -186,7 +243,8 @@ class MultiScaleCNNDecoder(nn.Module):
 
         self.to_pixels = nn.Conv2d(dims[0], 3 * patch * patch, 3, padding=1)
         self.shuffle = nn.PixelShuffle(patch)
-
+        
+    @torch.compile
     def forward(self, x):
         # x: [B, dims[-1], H, W]
         for upsample, blocks in self.stages:
@@ -250,39 +308,61 @@ class BinaryAutoencoder(nn.Module):
         self.from_latent = nn.Conv2d(latent_discrete, token_dim, 1)
         self.quant = AdaptiveBitwiseSign()
 
-    # ======================================================
+# ======================================================
     # Channel-wise left-to-right block masking on z_discrete
     # ======================================================
-    def apply_masking(self, z, B):
-        """Mask a random suffix of channel blocks (size mask_block_size) in the
-        discrete latent z [B, C, H, W] by zeroing them out. Blocks are always
-        dropped from the *right* of the channel axis, so the model is incentivised
-        to pack the most important information into the leftmost channels.
-
-        n_mask is sampled uniformly in [1, num_blocks] per masked sample so the
-        model sees variable compression levels during training.
-
-        Returns (z_masked, masked_ids) where masked_ids are batch indices that
-        had at least one block zeroed.
-        """
-        if (not self.training) or B < 2 or (not self.use_masking):
-            return z, None
-
-        num_masked = B // 2
-        idx = torch.randperm(B, device=z.device)
-        masked_ids = idx[:num_masked]
-
-        C = z.shape[1]          # latent_discrete channels (e.g. 224)
-        block = self.mask_block_size   # e.g. 14
-        num_blocks = C // block        # e.g. 16
+    def apply_masking(self, z, B, override_num_blocks=None):
+        C = z.shape[1]
+        block = self.mask_block_size
+        num_blocks = C // block
 
         if num_blocks == 0:
             return z, None
 
         z = z.clone()
-        # Sample how many blocks to zero for each masked sample: [1, num_blocks]
-        n_mask = torch.randint(1, num_blocks + 1, (num_masked,), device=z.device)
 
+        # 1. Determine masking behavior
+        if override_num_blocks is not None:
+            # --- OVERRIDE BEHAVIOR ---
+            # Mask ALL samples in the batch
+            num_masked = B
+            masked_ids = torch.arange(B, device=z.device)
+            
+            # Clamp the requested blocks to drop to valid bounds [0, max_blocks]
+            n_blocks_to_drop = max(0, min(override_num_blocks, num_blocks))
+            
+            if n_blocks_to_drop == 0:
+                return z, None
+                
+            # Create a uniform array so every sample drops the exact same amount
+            n_mask = torch.full((B,), n_blocks_to_drop, dtype=torch.long, device=z.device)
+
+        else:
+            # --- DEFAULT TRAINING BEHAVIOR ---
+            if (not self.training) or B < 2 or (not self.use_masking):
+                return z, None
+            
+            num_masked = B // 2
+            idx = torch.randperm(B, device=z.device)
+            masked_ids = idx[:num_masked]
+
+            # ---- Desired peak ----
+            target_remaining_channels = 112 // 2
+
+            mean_mask_blocks = (C - target_remaining_channels) / block
+            std_mask_blocks = num_blocks * 0.15
+
+            # Gaussian sampling for variable dropping
+            n_mask = torch.randint(
+            low=1,
+            high=num_blocks + 1,
+            size=(num_masked,),
+            device=z.device,
+)
+
+            # round + clamp
+
+        # 2. Apply the mask
         for i in range(num_masked):
             start_ch = C - n_mask[i].item() * block
             z[masked_ids[i], start_ch:] = 0.0
@@ -292,7 +372,7 @@ class BinaryAutoencoder(nn.Module):
     # ======================================================
     # forward
     # ======================================================
-    def forward(self, x):
+    def forward(self, x, num_to_drop=None):
         # 1. CNN encode
         features = self.encoder_cnn(x)  # [B, C, H, W]
         B, C, H, W = features.shape
@@ -312,7 +392,10 @@ class BinaryAutoencoder(nn.Module):
 
         # 3. Spatial bottleneck (discrete only) + channel-block masking
         z_discrete = self.quant(self.to_latent_discrete(features))
-        z_discrete, masked_ids = self.apply_masking(z_discrete, B)
+        
+        # Pass the override parameter here
+        z_discrete, masked_ids = self.apply_masking(z_discrete, B, override_num_blocks=num_to_drop)
+        
         features = self.from_latent(z_discrete)  # [B, C, H, W]
 
         # 4. Decoder transformers with CLS tokens (no token-level masking)
@@ -333,9 +416,6 @@ class BinaryAutoencoder(nn.Module):
         img = torch.clamp(img, -1, 1)
 
         return img, z_discrete, masked_ids
-
-    def anneal_temperature(self, factor=0.98, min_temp=0.01):
-        self.quant.anneal_temp(factor=factor, min_temp=min_temp)
 
 
 # ==========================================================
