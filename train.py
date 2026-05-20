@@ -154,22 +154,35 @@ def train(config_path):
     in_channels = config['model'].get('in_channels', 3)
 
     if use_vae or use_tiny_vae:
-        from diffusers import AutoencoderKLFlux2
-        print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
-        standard_vae = AutoencoderKLFlux2.from_pretrained(
-            "black-forest-labs/FLUX.2-dev",
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        ).to(device=device).eval()
+        import os
+        stats_path = "vae_stats.pt"
+        if os.path.exists(stats_path):
+            print(f">>> Loading VAE normalization stats from {stats_path}...")
+            stats = torch.load(stats_path, map_location='cpu')
+            latents_mean = stats["mean"].to(device=device, dtype=torch.bfloat16)
+            latents_std = stats["std"].to(device=device, dtype=torch.bfloat16)
+            standard_vae = None
+        else:
+            from diffusers import AutoencoderKLFlux2
+            print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
+            standard_vae = AutoencoderKLFlux2.from_pretrained(
+                "black-forest-labs/FLUX.2-dev",
+                subfolder="vae",
+                torch_dtype=torch.bfloat16
+            ).to(device=device).eval()
 
-        latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device)
-        latents_std = torch.sqrt(
-            standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
-        ).to(device)
+            latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
+            latents_std = torch.sqrt(
+                standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
+            ).to(device, dtype=torch.bfloat16)
+
+            torch.save({"mean": latents_mean.cpu(), "std": latents_std.cpu()}, stats_path)
+            print(f">>> Saved VAE normalization stats to {stats_path}")
 
         if use_tiny_vae:
-            del standard_vae
-            torch.cuda.empty_cache()
+            if standard_vae is not None:
+                del standard_vae
+                torch.cuda.empty_cache()
 
             from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
             print(">>> Loading Tiny FLUX.2 VAE...")
@@ -180,6 +193,14 @@ def train(config_path):
             in_channels = 128
             print(f">>> Tiny VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
         else:
+            if standard_vae is None:
+                from diffusers import AutoencoderKLFlux2
+                print(">>> Loading Standard FLUX.2 VAE for encoding/decoding...")
+                standard_vae = AutoencoderKLFlux2.from_pretrained(
+                    "black-forest-labs/FLUX.2-dev",
+                    subfolder="vae",
+                    torch_dtype=torch.bfloat16
+                ).to(device=device).eval()
             vae = standard_vae
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
@@ -193,10 +214,7 @@ def train(config_path):
         depth=config['model'].get('fcdm_depth', 12),
         num_heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
-        latent_size=latent_size,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
-        drop_ratio=config['model'].get('drop_ratio', 0.0),
-        path_drop_prob=config['model'].get('path_drop_prob', 0.0)
     ).to(device=device, dtype=torch.bfloat16)
 
     # Resume Logic
@@ -274,6 +292,7 @@ def train(config_path):
 
     data_iter = iter(dataloader)
     running_loss = 0.0
+    running_match_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
     is_mar = config['model'].get('type', 'v2') == 'mar'
     while global_step < config['training'].get('max_train_steps', 1000000):
@@ -281,6 +300,7 @@ def train(config_path):
         optimizer.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
+        match_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -365,58 +385,39 @@ def train(config_path):
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
-            uniformity_weight = config['model'].get('uniformity_weight', 0.1)
-            path_drop_prob = config['model'].get('path_drop_prob', 0.0)
+            # Model outputs direct v-prediction and layer match loss
+            v_pred, match_loss = model(xt, t, y_indices, y_offsets,
+                                       return_layer_match=True)
 
-            # Model outputs raw u-prediction, logvar, and uniformity loss
-            u_pred, logvar_theta, u_loss = model(xt, t, y_indices, y_offsets, return_uniformity=True,
-                                                 path_drop_prob=path_drop_prob)
-
-            # Compute velocity-space loss for uniform weighting (k-diff)
-            k = torch.sigmoid(model_raw.w_k)
-            u_target = k * inputs - (1 - k) * noise
-            v_pred = model_raw.get_velocity(xt, u_pred, t_reshaped)
-            v_target = model_raw.get_velocity(xt, u_target, t_reshaped)
-
-            # Difficulty-aware NLL loss
-            mse_loss_raw = F.mse_loss(v_pred, v_target, reduction='none')  # (B, C, H, W)
-            mse_loss_mean = mse_loss_raw.mean()
-
-            sg_v_pred = v_pred.detach()
-            mse_loss_sg = F.mse_loss(sg_v_pred, v_target, reduction='none').mean(dim=1, keepdim=True)  # (B, 1, H, W)
-
-            nll_loss = 0.5 * (mse_loss_sg * torch.exp(-logvar_theta) + logvar_theta)
-            nll_loss_mean = nll_loss.mean()
-
-            lambda_nll = config['model'].get('lambda_nll', 0.01)
-            loss = mse_loss_mean + lambda_nll * nll_loss_mean
-
-            if u_loss is not None:
-                loss = loss + (uniformity_weight * u_loss)
+            # Compute velocity-space loss (flow matching target: noise - inputs)
+            v_target = noise - inputs
+            loss = F.mse_loss(v_pred, v_target) + 0.2 * match_loss
 
             loss = loss / accum_steps
             loss.backward()
             loss_accum += loss.item()
+            match_loss_accum += match_loss.item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
         running_loss += loss_accum
+        running_match_loss += match_loss_accum
         if rank == 0:
             pbar.update(1)
 
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
                 avg_loss = running_loss / log_interval
-                k_val = torch.sigmoid(model_raw.w_k).item()
+                avg_match_loss = running_match_loss / log_interval
                 wandb.log({
                     "train/loss": avg_loss,
-                    "train/k_value": k_val,
-                    "train/uniformity_weighted": u_loss.item()
+                    "train/match_loss": avg_match_loss
                 }, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "k": f"{k_val:.3f}"})
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "match_loss": f"{avg_match_loss:.4f}"})
                 running_loss = 0.0
+                running_match_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],

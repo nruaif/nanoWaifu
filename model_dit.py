@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy, create_selective_checkpoint_contexts
 from tqdm.auto import tqdm
 from torch.utils.flop_counter import FlopCounterMode
 import functools
+import random
 
 torch._dynamo.config.recompile_limit = 128
 aten = torch.ops.aten
@@ -27,55 +27,85 @@ def policy_fn(ctx, op, *args, **kwargs):
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
-class GatherLayer(torch.autograd.Function):
-    """Gather tensors from all processes, supporting backward propagation."""
-
-    @staticmethod
-    def forward(ctx, input):
-        ctx.save_for_backward(input)
-        output = [torch.zeros_like(input) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, input.contiguous())
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        (input,) = ctx.saved_tensors
-        grad_out = torch.zeros_like(input)
-        grad_out[:] = grads[dist.get_rank()]
-        return grad_out
 
 
-def uniformity_loss(x, sketch_dim=64):
+class TagTransformer(nn.Module):
     """
-    Forces Covariance(x) ~ Identity.
-    Matches the 2nd Moment (Spherical Cloud).
+    Processes variable-length tags separately using a simple 3-layer Transformer blocks stack
+    and extracts the processed [CLS] token as the global tag embedding.
     """
-    if dist.is_initialized():
-        x = torch.cat(GatherLayer.apply(x), dim=0)
-
-    N, C = x.size()
-    if C > sketch_dim:
-        S = torch.randn(sketch_dim, C, device=x.device, dtype=x.dtype) / (C ** 0.5)
-        x = x @ S.T
-    else:
-        sketch_dim = C
-
-    x = x - x.mean(dim=0, keepdim=True)
-    cov = (x.T @ x) / (N - 1 + 1e-6)
-
-    target = torch.eye(sketch_dim, device=x.device)
-
-    return torch.norm(cov - target, p='fro')
-
-
-class MeanPoolingEmbedder(nn.Module):
-    def __init__(self, num_classes: int, dim: int):
+    def __init__(self, num_classes: int, dim: int, num_heads: int = 8, depth: int = 3):
         super().__init__()
-        self.embed = nn.EmbeddingBag(num_classes + 1, dim * 4, mode='mean')
+        self.embedding = nn.Embedding(num_classes + 1, dim)  # +1 for padding/null class
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=dim,
+                nhead=num_heads,
+                dim_feedforward=dim * 4,
+                dropout=0.1,
+                activation=F.gelu,
+                batch_first=True,
+                norm_first=True
+            ) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(dim)
+        
+        # Weight initialization
+        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.normal_(self.embedding.weight, std=0.02)
 
-    def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor) -> torch.Tensor:
-        x = self.embed(y_indices, y_offsets)
-        return x.view(x.shape[0], 4, -1)
+    def forward(self, y_indices: torch.Tensor, y_offsets: torch.Tensor = None) -> torch.Tensor:
+        # Determine Batch Size
+        if y_offsets is not None:
+            B = len(y_offsets)
+        else:
+            B = 1
+            y_offsets = torch.zeros(1, dtype=torch.long, device=y_indices.device)
+            
+        device = y_indices.device
+        
+        # Calculate individual tag lengths for batch items
+        offsets_list = y_offsets.tolist()
+        total_len = len(y_indices)
+        lengths = []
+        for i in range(B):
+            start = offsets_list[i]
+            end = offsets_list[i+1] if i + 1 < B else total_len
+            lengths.append(end - start)
+            
+        max_len = max(lengths) if lengths else 0
+        
+        # Pad tag represents the null token/dropout tag at self.embedding.num_embeddings - 1
+        padding_val = self.embedding.num_embeddings - 1
+        padded_tags = torch.full((B, max_len), padding_val, dtype=torch.long, device=device)
+        
+        for i in range(B):
+            start = offsets_list[i]
+            end = offsets_list[i+1] if i + 1 < B else total_len
+            item_len = end - start
+            if item_len > 0:
+                padded_tags[i, :item_len] = y_indices[start:end]
+                
+        # Embed tags and prepend learnable CLS token
+        tag_embeds = self.embedding(padded_tags)  # [B, max_len, dim]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, dim]
+        x = torch.cat([cls_tokens, tag_embeds], dim=1)  # [B, max_len + 1, dim]
+        
+        # Construct Key Padding Mask (True indicates padding to be masked out)
+        mask = torch.zeros((B, max_len + 1), dtype=torch.bool, device=device)
+        for i in range(B):
+            item_len = lengths[i]
+            if item_len < max_len:
+                mask[i, item_len + 1:] = True
+                
+        # Run through tag transformer encoder stack
+        for block in self.blocks:
+            x = block(x, src_key_padding_mask=mask)
+            
+        x = self.norm(x)
+        return x[:, 0, :]  # Extract CLS token representation [B, dim]
 
 
 class GGRoPE2d(nn.Module):
@@ -165,15 +195,21 @@ class Mlp(nn.Module):
 
         self.fc1 = nn.Linear(in_features, hidden_features * 2)
         self.act = nn.GELU(approximate="tanh")
+        self.dwconv = nn.Conv2d(
+            hidden_features, hidden_features,
+            kernel_size=3, padding=1, groups=hidden_features
+        )
         self.fc2 = nn.Linear(hidden_features, out_features)
-        nn.init.zeros_(self.fc2.weight)
-        if self.fc2.bias is not None:
-            nn.init.zeros_(self.fc2.bias)
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
         x = x * self.act(gate)
+        # Depthwise spatial convolution
+        B, N, C = x.shape
+        x = x.transpose(1, 2).reshape(B, C, H, W)
+        x = self.dwconv(x)
+        x = x.reshape(B, C, N).transpose(1, 2)
         return self.fc2(x)
 
 
@@ -186,19 +222,14 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
         self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
-        nn.init.zeros_(self.proj.weight)
-        if self.proj.bias is not None:
-            nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None, return_v=False):
+    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None):
         B, N_seq, C = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-
-        raw_v = v  # captured before any rope / mixing
 
         if num_context_tokens > 0:
             c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
@@ -211,132 +242,74 @@ class SelfAttention(nn.Module):
             q = rope(q, H, W, seq_indices)
             k = rope(k, H, W, seq_indices)
 
-        dtype = q.dtype
-        x_att = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
-        x_att = x_att.to(dtype).transpose(1, 2).reshape(B, N_seq, C)
-        out = self.proj(x_att)
-        if return_v:
-            return out, raw_v
-        return out
+        # Exclusive Self-Attention (XSA)
+        q_f, k_f, v_f = q.float(), k.float(), v.float()
+        Y = F.scaled_dot_product_attention(q_f, k_f, v_f)
+        Vn = F.normalize(v_f, dim=-1)
+        Z = Y - (Y * Vn).sum(dim=-1, keepdim=True) * Vn
+
+        x_att = Z.to(q.dtype).transpose(1, 2).reshape(B, N_seq, C)
+        return self.proj(x_att)
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_slots=2048):
+class DiTBlock(nn.Module):
+    """
+    Diffusion Transformer (DiT) Block with adaLN-Zero modulation and XSA.
+    Supports CLS tokens that participate in attention but bypass the MLP.
+    """
+    def __init__(self, dim, num_heads):
         super().__init__()
-
-        self.norm1 = RMSNorm(dim)
+        self.norm1 = RMSNorm(dim, elementwise_affine=False)
         self.self_attn = SelfAttention(dim, num_heads)
-
-        self.norm3 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim, elementwise_affine=False)
         self.mlp = Mlp(dim, dim * 4, dim)
 
-    @torch.compile
-    def forward(self, x, H, W, rope, context=None, seq_indices=None, return_v=False):
-        B, N, C = x.shape
-
-        num_context_tokens = 0
-        if context is not None:
-            x_seq = torch.cat([context, x], dim=1)
-            num_context_tokens = context.shape[1]
-        else:
-            x_seq = x
-
-        x_norm1 = self.norm1(x_seq)
-        if return_v:
-            attn_out, raw_v = self.self_attn(
-                x_norm1, H, W, rope, num_context_tokens, seq_indices, return_v=True
-            )
-        else:
-            attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens, seq_indices)
-
-        x_seq = x_seq + attn_out
-        x_seq = x_seq + self.mlp(self.norm3(x_seq))
-
-        if context is not None:
-            context = x_seq[:, :num_context_tokens, :]
-            x = x_seq[:, num_context_tokens:, :]
-        else:
-            x = x_seq
-
-        if return_v:
-            return x, context, raw_v
-        return x, context
-
-
-class ValueResSelfAttention(SelfAttention):
-    """SelfAttention with learnable value residual: v' = λ1·v1 + λ2·v"""
-
-    def __init__(self, dim, num_heads):
-        super().__init__(dim, num_heads)
-        self.lambda1 = nn.Parameter(torch.tensor(0.5))  # weight on v1 (first mid block)
-        self.lambda2 = nn.Parameter(torch.tensor(0.5))  # weight on current v
-
-    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None,
-                v1=None, return_v=False):
-        B, N_seq, C = x.shape
-        qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        if v1 is not None:
-            v = self.lambda1 * v1 + self.lambda2 * v
-
-        raw_v = v
-
-        if num_context_tokens > 0:
-            c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
-            c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
-            s_q = rope(s_q, H, W, seq_indices)
-            s_k = rope(s_k, H, W, seq_indices)
-            q = torch.cat([c_q, s_q], dim=2)
-            k = torch.cat([c_k, s_k], dim=2)
-        else:
-            q = rope(q, H, W, seq_indices)
-            k = rope(k, H, W, seq_indices)
-
-        dtype = q.dtype
-        x_att = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
-        x_att = x_att.to(dtype).transpose(1, 2).reshape(B, N_seq, C)
-        out = self.proj(x_att)
-        if return_v:
-            return out, raw_v
-        return out
-
-
-class ValueResTransformerBlock(TransformerBlock):
-    """TransformerBlock whose attention uses value residual from v1."""
-
-    def __init__(self, dim, num_heads):
-        super().__init__(dim, num_heads)
-        self.self_attn = ValueResSelfAttention(dim, num_heads)  # replaces base attn
-
-    @torch.compile
-    def forward(self, x, H, W, rope, context=None, seq_indices=None, v1=None):
-        B, N, C = x.shape
-
-        num_context_tokens = 0
-        if context is not None:
-            x_seq = torch.cat([context, x], dim=1)
-            num_context_tokens = context.shape[1]
-        else:
-            x_seq = x
-
-        x_norm1 = self.norm1(x_seq)
-        attn_out = self.self_attn(
-            x_norm1, H, W, rope, num_context_tokens, seq_indices, v1=v1
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True)
         )
-        x_seq = x_seq + attn_out
-        x_seq = x_seq + self.mlp(self.norm3(x_seq))
+        
+        # Zero-initialize the linear modulation parameters
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
 
-        if context is not None:
-            context = x_seq[:, :num_context_tokens, :]
-            x = x_seq[:, num_context_tokens:, :]
+    def forward(self, x, c, H, W, rope, num_cls_tokens=0):
+        # Handle 2D conditioning tensor: c is [B, dim] -> [B, 1, dim]
+        if c.dim() == 2:
+            c = c.unsqueeze(1)
+            
+        modulation = self.adaLN_modulation(c)  # [B, N, 6*dim] or [B, 1, 6*dim]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
+
+        # Attention branch — all tokens (CLS + spatial) participate
+        x_norm1 = self.norm1(x)
+        x_norm1 = x_norm1 * (1 + scale_msa) + shift_msa
+        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens=num_cls_tokens)
+        x = x + gate_msa * attn_out
+
+        # MLP branch — only spatial tokens, CLS tokens bypass
+        if num_cls_tokens > 0:
+            cls = x[:, :num_cls_tokens]
+            spatial = x[:, num_cls_tokens:]
+            # Slice per-token modulation to spatial positions only
+            if shift_mlp.shape[1] > 1:
+                shift_mlp = shift_mlp[:, num_cls_tokens:]
+                scale_mlp = scale_mlp[:, num_cls_tokens:]
+                gate_mlp = gate_mlp[:, num_cls_tokens:]
         else:
-            x = x_seq
+            spatial = x
 
-        return x, context
+        spatial_norm = self.norm2(spatial)
+        spatial_norm = spatial_norm * (1 + scale_mlp) + shift_mlp
+        mlp_out = self.mlp(spatial_norm, H, W)
+        spatial = spatial + gate_mlp * mlp_out
+
+        if num_cls_tokens > 0:
+            x = torch.cat([cls, spatial], dim=1)
+        else:
+            x = spatial
+
+        return x
 
 
 class TimestepEmbedder(nn.Module):
@@ -366,23 +339,26 @@ class TimestepEmbedder(nn.Module):
 
 class TokenformerDiT(nn.Module):
     """
-    Pure DiT architecture with SPRINT (Sparse-Dense Residual Fusion).
-    Conditions via concatenated tokens in self-attention.
+    Diffusion Transformer (DiT) with XSA, DW-Conv MLP, and learnable CLS tokens.
+    CLS tokens participate in attention but bypass MLP for global context aggregation.
     """
 
     def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
-                 attn_kv_pairs=576, ffn_kv_pairs=2304, num_classes=12476,
-                 use_checkpoint=False, drop_ratio=0.0, **kwargs):
+                 num_classes=12476, use_checkpoint=False, num_cls_tokens=4):
         super().__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
-        self.drop_ratio = drop_ratio
         self.in_channels = in_channels
+        self.num_cls_tokens = num_cls_tokens
 
         self.patch_embed = nn.Linear(in_channels, dim)
 
+        # Learnable CLS tokens (attend but skip MLP)
+        self.cls_tokens = nn.Parameter(torch.zeros(1, num_cls_tokens, dim))
+        nn.init.normal_(self.cls_tokens, std=0.02)
+
         self.t_embedder = TimestepEmbedder(dim)
-        self.y_embedder = MeanPoolingEmbedder(num_classes, dim)
+        self.y_embedder = TagTransformer(num_classes, dim)
 
         self.rope = GGRoPE2d(
             n_heads=num_heads,
@@ -391,170 +367,117 @@ class TokenformerDiT(nn.Module):
             max_freq=100.0
         )
 
-        self.num_encoder_blocks = 2
-        self.num_decoder_blocks = 2
-        self.num_middle_blocks = depth - self.num_encoder_blocks - self.num_decoder_blocks
-
-        self.encoder_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads) for _ in range(self.num_encoder_blocks)
+        self.blocks = nn.ModuleList([
+            DiTBlock(dim, num_heads) for _ in range(depth)
         ])
-        self.mid_split = self.num_middle_blocks // 2
-        self.middle_blocks = nn.ModuleList(
-            [TransformerBlock(dim, num_heads) for _ in range(self.mid_split)]
-            + [ValueResTransformerBlock(dim, num_heads)
-               for _ in range(self.num_middle_blocks - self.mid_split)]
+
+        # Final Layer Modulation and Projection
+        self.final_norm = RMSNorm(dim, elementwise_affine=False)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 2 * dim, bias=True)
         )
+        self.final_proj = nn.Linear(dim, in_channels)
 
-        self.decoder_blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads) for _ in range(self.num_decoder_blocks)
-        ])
+        # Zero-initialize the final modulation parameters
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.fusion = nn.Linear(dim * 2, dim)
-
-        self.final_norm = RMSNorm(dim)
-        self.final_proj = nn.Linear(dim, in_channels + 1)
-
-        self.w_k = nn.Parameter(torch.tensor(0.0))
-
-    def get_velocity(self, z, u_pred, t):
-        k = torch.sigmoid(self.w_k)
-        if t.dim() == 1:
-            t = t.view(-1, 1, 1, 1)
-        elif t.dim() == 2:
-            B, N = t.shape
-            _, _, H, W = z.shape
-            t = t.view(B, 1, H, W)
-        denom = (k * t + (1 - k) * (1 - t)).clamp(min=0.05)
-        return -((1 - 2 * k) * z + u_pred) / denom
-
-    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False, path_drop_prob=0.0,
-                force_path_drop=False, return_uniformity=False, force_drop=False):
+    def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False,
+                return_layer_match=False, **kwargs):
         B, C, H, W = x_in.shape
         N = H * W
+        
+        # 1. Patch embedding
         x = x_in.flatten(2).transpose(1, 2)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  # [B, N, dim]
 
+        # 2. Prepend learnable CLS tokens
+        cls = self.cls_tokens.expand(B, -1, -1)  # [B, num_cls, dim]
+        x = torch.cat([cls, x], dim=1)  # [B, num_cls + N, dim]
+
+        # 3. Timestep embedding (supports both sequence-varying or global timesteps)
         if t.dim() == 1:
-            t = t.unsqueeze(1).expand(-1, N)
-        t_embeds = self.t_embedder(t)
-        x = x + t_embeds
-
-        y_tokens = self.y_embedder(y_indices, y_offsets)
-        context = y_tokens
-
-        for block in self.encoder_blocks:
-            if self.use_checkpoint and self.training:
-                x, context = checkpoint(block, x, H, W, self.rope, context, None, use_reentrant=False,
-                                        context_fn=context_fn)
-            else:
-                x, context = block(x, H, W, self.rope, context, None)
-
-        f_t = x
-
-        do_drop = False
-        if self.drop_ratio > 0.0:
-            if force_drop:
-                do_drop = True
-            elif self.training:
-                if torch.rand(1).item() > 0.2:
-                    do_drop = True
-
-        if do_drop:
-            num_keep = int(N * (1 - self.drop_ratio))
-            noise = torch.rand(B, N, device=x.device)
-            ids_shuffle = torch.argsort(noise, dim=1)
-            seq_indices = ids_shuffle[:, :num_keep]
-            x_middle = torch.gather(x, dim=1, index=seq_indices.unsqueeze(-1).expand(-1, -1, self.dim))
+            t_emb = self.t_embedder(t)  # [B, dim]
+            t_emb = t_emb.unsqueeze(1)  # [B, 1, dim]
+        elif t.dim() == 2:
+            t_emb = self.t_embedder(t)  # [B, N, dim]
         else:
-            x_middle = x
-            seq_indices = None
+            t_emb = self.t_embedder(t)
 
-        if force_path_drop:
-            g_pad_t = self.mask_token.expand(B, N, -1)
-            u_loss = torch.tensor(0.0, device=x.device) if return_uniformity else None
-        else:
-            v1 = None
-            for i, block in enumerate(self.middle_blocks):
-                is_value_res = i >= self.mid_split
-                if self.use_checkpoint and self.training:
-                    if i == 0:
-                        x_middle, context, v1 = block(
-                            x_middle, H, W, self.rope, context, seq_indices, return_v=True
-                        )
-                    elif is_value_res:
-                        x_middle, context = checkpoint(
-                            block, x_middle, H, W, self.rope, context, seq_indices, v1,
-                            use_reentrant=False, context_fn=context_fn
-                        )
-                    else:
-                        x_middle, context = checkpoint(
-                            block, x_middle, H, W, self.rope, context, seq_indices,
-                            use_reentrant=False, context_fn=context_fn
-                        )
-                else:
-                    if i == 0:
-                        x_middle, context, v1 = block(
-                            x_middle, H, W, self.rope, context, seq_indices, return_v=True
-                        )
-                    elif is_value_res:
-                        x_middle, context = block(
-                            x_middle, H, W, self.rope, context, seq_indices, v1=v1
-                        )
-                    else:
-                        x_middle, context = block(
-                            x_middle, H, W, self.rope, context, seq_indices
-                        )
+        # 4. Class/Tag embedding CLS extraction
+        y_embed = self.y_embedder(y_indices, y_offsets)  # [B, dim]
+        y_emb = y_embed.unsqueeze(1)  # [B, 1, dim]
 
-            u_loss = None
-            if return_uniformity and self.training:
-                x_mid_pooled = x_middle.mean(dim=1)
-                u_loss = uniformity_loss(x_mid_pooled)
-            elif return_uniformity:
-                u_loss = torch.tensor(0.0, device=x.device)
+        # 5. Conditioning Vector
+        c = t_emb + y_emb  # [B, N, dim] or [B, 1, dim]
 
-            g_full = self.mask_token.expand(B, N, -1).clone()
-            if seq_indices is not None:
-                g_full.scatter_(1, seq_indices.unsqueeze(-1).expand(-1, -1, self.dim), x_middle)
-            else:
-                g_full = x_middle
+        # Pad c for CLS tokens when conditioning is per-token
+        if c.shape[1] > 1 and self.num_cls_tokens > 0:
+            cls_c = c.mean(dim=1, keepdim=True).expand(-1, self.num_cls_tokens, -1)
+            c = torch.cat([cls_c, c], dim=1)  # [B, num_cls + N, dim]
 
-            if self.training and path_drop_prob > 0.0:
-                drop_mask = (torch.rand(1, device=x.device) < path_drop_prob).view(1, 1, 1)
-                g_pad_t = torch.where(drop_mask, self.mask_token.expand(B, N, -1), g_full)
-            else:
-                g_pad_t = g_full
-
-        h_t = self.fusion(torch.cat([f_t, g_pad_t], dim=-1))
-
-        for block in self.decoder_blocks:
+        # 6. Process through DiTBlock sequence
+        x3 = None
+        x9 = None
+        for idx, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training:
-                h_t, context = checkpoint(block, h_t, H, W, self.rope, context, None, use_reentrant=False,
-                                          context_fn=context_fn)
+                x = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens,
+                               use_reentrant=False, context_fn=context_fn)
             else:
-                h_t, context = block(h_t, H, W, self.rope, context, None)
+                x = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens)
+            
+            # Capture spatial-only features for layer match loss
+            if idx == 2:  # Layer 3
+                x3 = x[:, self.num_cls_tokens:].clone()
+            if idx == 8:  # Layer 9
+                x9 = x[:, self.num_cls_tokens:].clone()
 
-        feat = h_t
-        x_norm = self.final_norm(h_t)
+        # 7. Strip CLS tokens — only spatial tokens go through the final layer
+        x = x[:, self.num_cls_tokens:]  # [B, N, dim]
 
+        # Also strip CLS from per-token conditioning
+        if c.shape[1] > 1 and self.num_cls_tokens > 0:
+            c = c[:, self.num_cls_tokens:]
+
+        # 8. Final layer modulation
+        final_mod = self.final_modulation(c)  # [B, N, 2*dim] or [B, 1, 2*dim]
+        shift, scale = final_mod.chunk(2, dim=-1)
+        
+        x_norm = self.final_norm(x)
+        x_norm = x_norm * (1 + scale) + shift
         x_out = self.final_proj(x_norm)
 
-        x_out = x_out.transpose(1, 2).reshape(B, self.in_channels + 1, H, W)
-        u_pred = x_out[:, :self.in_channels, :, :]
-        logvar_theta = x_out[:, self.in_channels:, :, :]
+        # Project back to image spatial format
+        v_pred = x_out.transpose(1, 2).reshape(B, self.in_channels, H, W)
 
-        res = [u_pred, logvar_theta]
+        # 9. Layer match loss calculation (if requested)
+        match_loss = None
+        if return_layer_match:
+            if x3 is None or x9 is None:
+                match_loss = torch.tensor(0.0, device=x.device)
+            else:
+                # x3 and x9 have shape [B, N, D] (spatial only)
+                x9_detached = x9.detach()
+                B_m, N_m, D_m = x3.shape
+                if D_m % 64 == 0:
+                    x3_reshaped = x3.view(B_m, N_m, D_m // 64, 64)
+                    x9_reshaped = x9_detached.view(B_m, N_m, D_m // 64, 64)
+                    cos_sim = F.cosine_similarity(x3_reshaped, x9_reshaped, dim=-1)
+                    match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
+                else:
+                    cos_sim = F.cosine_similarity(x3, x9_detached, dim=-1)
+                    match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
+
+        res = [v_pred]
         if return_features:
-            res.append(feat)
-        if return_uniformity:
-            res.append(u_loss)
+            res.append(x)
+        if return_layer_match:
+            res.append(match_loss)
 
-        if len(res) == 2:
-            return res[0], res[1]
+        if len(res) == 1:
+            return res[0]
         return tuple(res)
-
-
-import random
 
 
 class TagProcessor:
@@ -611,7 +534,6 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
-    x = x.to(torch.bfloat16)
     for i in tqdm(range(steps)):
         t_curr = ts[i]
         t_next = ts[i + 1]
@@ -619,50 +541,14 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
         t_vec = torch.full((batch_size, H * W), t_curr.item(), device=device, dtype=x.dtype)
 
-        if sampler_type == "euler":
-            u_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
-            v_cond = model.get_velocity(x, u_cond, t_vec)
+        if sampler_type != "euler":
+            raise NotImplementedError(f"Sampler type '{sampler_type}' is not supported anymore because log-variance has been removed. Use 'euler' instead.")
 
-            u_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets, force_drop=True)
-            v_uncond = model.get_velocity(x, u_uncond, t_vec)
+        v_cond = model(x, t_vec, y_indices, y_offsets)
+        v_uncond = model(x, t_vec, y_null_indices, y_null_offsets)
 
-            v = v_uncond + guidance_scale * (v_cond - v_uncond)
-            x = x + dt * v
-
-        elif sampler_type == "look-ahead":
-            u_cond, logvar_cond = model(x, t_vec, y_indices, y_offsets)
-            v_cond = model.get_velocity(x, u_cond, t_vec)
-
-            u_uncond, _ = model(x, t_vec, y_null_indices, y_null_offsets, force_drop=True)
-            v_uncond = model.get_velocity(x, u_uncond, t_vec)
-
-            v = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-            uc = logvar_cond
-            uc_flat = uc.view(batch_size, -1)
-            tau_p = torch.quantile(uc_flat.float(), p_percentile, dim=1, keepdim=True).to(x.dtype)
-            tau_p = tau_p.view(batch_size, 1, 1, 1)
-
-            M_conf = (uc <= tau_p).to(x.dtype)
-            M_unc = 1.0 - M_conf
-
-            t_ctx_val = max(t_curr.item() + alpha * dt.item(), 0.0)
-
-            x_ctx = x + (t_ctx_val - t_curr.item()) * v
-            x_tilde = M_conf * x_ctx + M_unc * x
-
-            t_tilde_vec = M_conf.view(batch_size, -1) * t_ctx_val + M_unc.view(batch_size, -1) * t_curr.item()
-
-            u_ctx_cond, _ = model(x_tilde, t_tilde_vec, y_indices, y_offsets)
-            v_ctx_cond = model.get_velocity(x_tilde, u_ctx_cond, t_tilde_vec)
-
-            u_ctx_uncond, _ = model(x_tilde, t_tilde_vec, y_null_indices, y_null_offsets, force_drop=True)
-            v_ctx_uncond = model.get_velocity(x_tilde, u_ctx_uncond, t_tilde_vec)
-
-            v_ctx = v_ctx_uncond + guidance_scale * (v_ctx_cond - v_ctx_uncond)
-
-            v_final = M_unc * v_ctx + M_conf * v
-            x = x + dt * v_final
+        v = v_uncond + guidance_scale * (v_cond - v_uncond)
+        x = x + dt * v
 
     model.train()
     return x
@@ -674,33 +560,43 @@ if __name__ == "__main__":
 
     model = TokenformerDiT(
         in_channels=32,
-        dim=768,
-        depth=24,
-        num_heads=12,
-        num_classes=12476,
-        drop_ratio=0.75
+        dim=256,
+        depth=12,
+        num_heads=8,
+        num_classes=100,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model Parameters: {num_params / 1e6:.2f} M")
 
     batch_size = 2
-    latent_size = 16
+    H, W = 8, 8
 
-    x_in = torch.randn(batch_size, 32, latent_size, latent_size, device=device)
-    t = torch.rand(batch_size, device=device)
-
-    y_indices = torch.randint(0, 12476, (batch_size * 3,), device=device)
+    x_in = torch.randn(batch_size, 32, H, W, device=device)
+    y_indices = torch.randint(0, 100, (batch_size * 3,), device=device)
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
 
-    print("\nRunning forward pass (training)...")
+    # --- Test 1: Global timestep (1D) ---
+    print("\n[Test 1] Global timestep (1D)...")
+    t_global = torch.rand(batch_size, device=device)
     model.eval()
-    with FlopCounterMode(model) as flop_counter:
-        u_pred, logvar, u_loss = model(x_in, t, y_indices, y_offsets, path_drop_prob=0.1, return_uniformity=True)
-        total_flops = flop_counter.get_total_flops()
+    v_pred, match_loss = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
+    print(f"  v_pred: {v_pred.shape}, match_loss: {match_loss.item():.6f}")
+    assert v_pred.shape == x_in.shape, f"Shape mismatch: {v_pred.shape} vs {x_in.shape}"
 
-    print(f"Input shape:  {x_in.shape}")
-    print(f"Output u_pred shape: {u_pred.shape}")
-    print(f"Output logvar shape: {logvar.shape}")
-    print(total_flops)
-    print("✅ Forward pass completed successfully!")
+    # --- Test 2: Per-token timestep (2D) ---
+    print("[Test 2] Per-token timestep (2D)...")
+    t_per_token = torch.rand(batch_size, H * W, device=device)
+    v_pred2, match_loss2 = model(x_in, t_per_token, y_indices, y_offsets, return_layer_match=True)
+    print(f"  v_pred: {v_pred2.shape}, match_loss: {match_loss2.item():.6f}")
+    assert v_pred2.shape == x_in.shape
+
+    # --- Test 3: Training backward pass ---
+    print("[Test 3] Training backward pass...")
+    model.train()
+    v_pred3, match_loss3 = model(x_in, t_per_token, y_indices, y_offsets, return_layer_match=True)
+    loss = F.mse_loss(v_pred3, torch.randn_like(v_pred3)) + 0.2 * match_loss3
+    loss.backward()
+    print(f"  loss: {loss.item():.6f}")
+
+    print("\n[SUCCESS] All tests passed!")

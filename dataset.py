@@ -404,3 +404,128 @@ class WDSLoader:
         )
 
         return loader
+
+
+class CachedLatentDataset(torch.utils.data.IterableDataset):
+    def __init__(self, cache_dir, batch_size, shuffle=True, world_size=1, rank=0):
+        super().__init__()
+        import glob
+        import os
+        self.cache_dir = cache_dir
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.world_size = world_size
+        self.rank = rank
+
+        # 1. Discover all .npz files
+        all_files = glob.glob(os.path.join(cache_dir, "bucket_*.npz"))
+        if not all_files:
+            raise FileNotFoundError(f"No cached .npz files found in {cache_dir}")
+
+        # 2. Group files by bucket resolution
+        # Filename format: bucket_{H}x{W}_{shard_idx:05d}.npz
+        self.bucket_groups = {}
+        for f in all_files:
+            basename = os.path.basename(f)
+            parts = basename.split("_")
+            if len(parts) >= 2:
+                # E.g., 'bucket', '256x256', '00000.npz'
+                res_str = parts[1]
+            else:
+                continue
+
+            try:
+                h_str, w_str = res_str.split("x")
+                h, w = int(h_str), int(w_str)
+                bucket_key = (h, w)
+            except ValueError:
+                continue
+
+            if bucket_key not in self.bucket_groups:
+                self.bucket_groups[bucket_key] = []
+            self.bucket_groups[bucket_key].append(f)
+
+        for k in self.bucket_groups:
+            self.bucket_groups[k].sort()
+
+        print(f"[CachedLatentDataset] Loaded cache from {cache_dir}:")
+        for k, v in self.bucket_groups.items():
+            print(f"  Bucket {k[0]}x{k[1]}: {len(v)} files")
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            global_worker_id = self.rank * num_workers + worker_id
+            total_workers = self.world_size * num_workers
+        else:
+            global_worker_id = self.rank
+            total_workers = self.world_size
+
+        # Local partition per global worker
+        local_bucket_groups = {}
+        for bucket_key, files in self.bucket_groups.items():
+            my_files = list(files)
+            if self.shuffle:
+                random.shuffle(my_files)
+            # Shard files among all workers across all ranks
+            my_files = my_files[global_worker_id::total_workers]
+            if my_files:
+                local_bucket_groups[bucket_key] = my_files
+
+        if not local_bucket_groups:
+            return
+
+        # Buffers for loaded data to form full batches
+        buffers = {k: {"latents": [], "prompts": []} for k in local_bucket_groups}
+
+        # Flatten file list for random selection across buckets if shuffling
+        file_list = []
+        for bucket_key, files in local_bucket_groups.items():
+            for f in files:
+                file_list.append((bucket_key, f))
+
+        if self.shuffle:
+            random.shuffle(file_list)
+
+        for bucket_key, fpath in file_list:
+            try:
+                data = np.load(fpath, allow_pickle=True)
+                latents = data["latents"]  # [N, 128, H_latent, W_latent]
+                prompts = json.loads(str(data["prompts"]))
+            except Exception as e:
+                print(f"Error loading {fpath}: {e}")
+                continue
+
+            buf = buffers[bucket_key]
+            buf["latents"].extend(latents)
+            buf["prompts"].extend(prompts)
+
+            while len(buf["latents"]) >= self.batch_size:
+                batch_latents = buf["latents"][:self.batch_size]
+                batch_prompts = buf["prompts"][:self.batch_size]
+
+                buf["latents"] = buf["latents"][self.batch_size:]
+                buf["prompts"] = buf["prompts"][self.batch_size:]
+
+                latents_tensor = torch.from_numpy(np.array(batch_latents))
+                yield latents_tensor, batch_prompts, None
+
+        # Yield remaining partial batches
+        if self.shuffle:
+            keys = list(buffers.keys())
+            random.shuffle(keys)
+        else:
+            keys = list(buffers.keys())
+
+        for bucket_key in keys:
+            buf = buffers[bucket_key]
+            if len(buf["latents"]) > 0:
+                batch_latents = buf["latents"]
+                batch_prompts = buf["prompts"]
+                latents_tensor = torch.from_numpy(np.array(batch_latents))
+                yield latents_tensor, batch_prompts, None
+                buf["latents"].clear()
+                buf["prompts"].clear()
+
