@@ -410,26 +410,10 @@ def train(config_path):
                 eps = torch.randn(bs, device=device, dtype=dtype)
                 return torch.sigmoid(m_loc + s_scale * eps)
 
-            def sample_ltg(m_loc, s_scale, std_param, bs, N, device, dtype):
-                t_max = sample_logit_normal(m_loc, s_scale, bs, device, dtype)
-                std = torch.clamp(t_max / 2, max=std_param)
-                t_max = t_max.unsqueeze(1)
-                std = std.unsqueeze(1)
-                eps = torch.randn(bs, N, device=device, dtype=dtype)
-                t = t_max - torch.abs(eps) * std
-                mask = t < 0
-                if mask.any():
-                    t[mask] = torch.rand_like(t[mask]) * t_max.expand_as(t)[mask]
-                return t
+            # Global Logit-Normal Timestep Sampler
+            t = sample_logit_normal(m_loc=0.0, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
 
-            # Logit-Normal Truncated Gaussian Timestep Sampler
-            t_base = sample_ltg(m_loc=0.0, s_scale=1.0, std_param=0.2, bs=B, N=H * W, device=device,
-                                dtype=torch.bfloat16)
-
-            # Dimension-Dependent Shift timestep sampling
-            t = t_base
-
-            t_reshaped = t.view(B, 1, H, W)
+            t_reshaped = t.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
@@ -494,11 +478,12 @@ def train(config_path):
                     samples = sample_fn(
                         model.module if hasattr(model, 'module') else model,
                         tag_processor,
-                        (16, 16),
-                        16,
+                        latent_size,
+                        len(fixed_prompts),
                         fixed_prompts,
                         device,
                         guidance_scale=config['training'].get('cfg_scale', 1.4),
+                        noise=fixed_noise,
                         sampler_type="euler"
                     )
 

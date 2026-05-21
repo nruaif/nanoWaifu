@@ -329,14 +329,9 @@ class TimestepEmbedder(nn.Module):
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-        if t.dim() == 1:
-            emb = t.float()[:, None] * emb[None, :]
-            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
-            return self.mlp(emb)
-        elif t.dim() == 2:
-            emb = t.float().unsqueeze(-1) * emb.view(1, 1, -1)
-            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1).to(self.mlp[0].weight.dtype)
-            return self.mlp(emb)
+        emb = t.float()[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1).to(self.mlp[0].weight.dtype)
+        return self.mlp(emb)
 
 
 class TokenformerDiT(nn.Module):
@@ -398,26 +393,16 @@ class TokenformerDiT(nn.Module):
         cls = self.cls_tokens.expand(B, -1, -1)  # [B, num_cls, dim]
         x = torch.cat([cls, x], dim=1)  # [B, num_cls + N, dim]
 
-        # 3. Timestep embedding (supports both sequence-varying or global timesteps)
-        if t.dim() == 1:
-            t_emb = self.t_embedder(t)  # [B, dim]
-            t_emb = t_emb.unsqueeze(1)  # [B, 1, dim]
-        elif t.dim() == 2:
-            t_emb = self.t_embedder(t)  # [B, N, dim]
-        else:
-            t_emb = self.t_embedder(t)
+        # 3. Timestep embedding
+        t_emb = self.t_embedder(t)  # [B, dim]
+        t_emb = t_emb.unsqueeze(1)  # [B, 1, dim]
 
         # 4. Class/Tag embedding CLS extraction
         y_embed = self.y_embedder(y_indices, y_offsets)  # [B, dim]
         y_emb = y_embed.unsqueeze(1)  # [B, 1, dim]
 
         # 5. Conditioning Vector
-        c = t_emb + y_emb  # [B, N, dim] or [B, 1, dim]
-
-        # Pad c for CLS tokens when conditioning is per-token
-        if c.shape[1] > 1 and self.num_cls_tokens > 0:
-            cls_c = c.mean(dim=1, keepdim=True).expand(-1, self.num_cls_tokens, -1)
-            c = torch.cat([cls_c, c], dim=1)  # [B, num_cls + N, dim]
+        c = t_emb + y_emb  # [B, 1, dim]
 
         # 6. Process through DiTBlock sequence
         x3 = None
@@ -437,10 +422,6 @@ class TokenformerDiT(nn.Module):
 
         # 7. Strip CLS tokens — only spatial tokens go through the final layer
         x = x[:, self.num_cls_tokens:]  # [B, N, dim]
-
-        # Also strip CLS from per-token conditioning
-        if c.shape[1] > 1 and self.num_cls_tokens > 0:
-            c = c[:, self.num_cls_tokens:]
 
         # 8. Final layer modulation
         final_mod = self.final_modulation(c)  # [B, N, 2*dim] or [B, 1, 2*dim]
@@ -541,7 +522,7 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
         t_next = ts[i + 1]
         dt = t_next - t_curr
 
-        t_vec = torch.full((batch_size, H * W), t_curr.item(), device=device, dtype=x.dtype)
+        t_vec = torch.full((batch_size,), t_curr.item(), device=device, dtype=x.dtype)
 
         if sampler_type != "euler":
             raise NotImplementedError(f"Sampler type '{sampler_type}' is not supported anymore because log-variance has been removed. Use 'euler' instead.")
@@ -586,17 +567,10 @@ if __name__ == "__main__":
     print(f"  v_pred: {v_pred.shape}, match_loss: {match_loss.item():.6f}")
     assert v_pred.shape == x_in.shape, f"Shape mismatch: {v_pred.shape} vs {x_in.shape}"
 
-    # --- Test 2: Per-token timestep (2D) ---
-    print("[Test 2] Per-token timestep (2D)...")
-    t_per_token = torch.rand(batch_size, H * W, device=device)
-    v_pred2, match_loss2 = model(x_in, t_per_token, y_indices, y_offsets, return_layer_match=True)
-    print(f"  v_pred: {v_pred2.shape}, match_loss: {match_loss2.item():.6f}")
-    assert v_pred2.shape == x_in.shape
-
-    # --- Test 3: Training backward pass ---
-    print("[Test 3] Training backward pass...")
+    # --- Test 2: Training backward pass ---
+    print("[Test 2] Training backward pass...")
     model.train()
-    v_pred3, match_loss3 = model(x_in, t_per_token, y_indices, y_offsets, return_layer_match=True)
+    v_pred3, match_loss3 = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
     loss = F.mse_loss(v_pred3, torch.randn_like(v_pred3)) + 0.2 * match_loss3
     loss.backward()
     print(f"  loss: {loss.item():.6f}")
