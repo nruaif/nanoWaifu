@@ -85,17 +85,10 @@ class TagTransformer(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, dim]
         x = torch.cat([cls_tokens, tag_embeds], dim=1)  # [B, max_len + 1, dim]
         
-        # Construct Key Padding Mask (True indicates padding to be masked out)
-        mask = torch.zeros((B, max_len + 1), dtype=torch.bool, device=device)
-        for i in range(B):
-            item_len = lengths[i]
-            if item_len < max_len:
-                mask[i, item_len + 1:] = True
-                
         c = torch.zeros(B, 1, x.shape[-1], device=device, dtype=x.dtype)
         # Run through tag transformer encoder stack
         for block in self.blocks:
-            x = block(x, c, src_key_padding_mask=mask)
+            x = block(x, c)
             
         x = self.norm(x)
         return x[:, 0, :]  # Extract CLS token representation [B, dim]
