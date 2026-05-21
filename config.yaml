@@ -8,7 +8,7 @@ training:
   compile: false
   log_every_steps: 10
 
-  save_image_every_steps: 5000
+  save_image_every_steps: 1000
   image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
@@ -16,20 +16,20 @@ training:
   output_dir: "outputs_dit"
   wandb_project: "nanoWaifu-C2I"
   resume_from: "outputs_dit/"
-  max_checkpoints: 3
+  max_checkpoints: 16
   noise_inject_ratio: 0
   cross_ratio: 0
-  sampler_type: "look-ahead"
+  sampler_type: "euler"
   p_percentile: 0.4
   alpha: 2.0
 
 model:
   type: "dit"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
-  use_tiny_vae: false
-  fcdm_dim: 768    # Hidden dimension (Transformer)
-  fcdm_depth: 24   # Number of layers
-  num_heads: 12    # Number of attention heads
+  use_tiny_vae: true
+  fcdm_dim: 1024    # Hidden dimension (Transformer)
+  fcdm_depth: 16   # Number of layers
+  num_heads: 16    # Number of attention heads
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
   drop_ratio: 0.75 # Token drop ratio (0.0 to 1.0)
@@ -38,6 +38,6 @@ model:
   lambda_nll: 0.01 # Weight for the difficulty-aware NLL loss
 
 data:
-  webdataset_url: '/root/data/train/00{001..020}.tar'
+  webdataset_url: '/workspace/data/train/00{001..120}.tar'
   use_advanced_captions: true
 

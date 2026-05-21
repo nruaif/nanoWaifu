@@ -15,7 +15,7 @@ compute_intensive_ops = [
     aten.bmm,
     aten.addmm,
 ]
-
+torch._functorch.config.activation_memory_budget = 0.5
 
 def policy_fn(ctx, op, *args, **kwargs):
     if op in compute_intensive_ops:
@@ -34,21 +34,13 @@ class TagTransformer(nn.Module):
     Processes variable-length tags separately using a simple 3-layer Transformer blocks stack
     and extracts the processed [CLS] token as the global tag embedding.
     """
-    def __init__(self, num_classes: int, dim: int, num_heads: int = 8, depth: int = 3):
+    def __init__(self, num_classes: int, dim: int, num_heads: int = 16, depth: int = 3):
         super().__init__()
         self.embedding = nn.Embedding(num_classes + 1, dim)  # +1 for padding/null class
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         
         self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=dim,
-                nhead=num_heads,
-                dim_feedforward=dim * 4,
-                dropout=0.1,
-                activation=F.gelu,
-                batch_first=True,
-                norm_first=True
-            ) for _ in range(depth)
+            DiTBlock(dim, num_heads, use_dwconv=False) for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
         
@@ -100,9 +92,10 @@ class TagTransformer(nn.Module):
             if item_len < max_len:
                 mask[i, item_len + 1:] = True
                 
+        c = torch.zeros(B, 1, x.shape[-1], device=device, dtype=x.dtype)
         # Run through tag transformer encoder stack
         for block in self.blocks:
-            x = block(x, src_key_padding_mask=mask)
+            x = block(x, c, src_key_padding_mask=mask)
             
         x = self.norm(x)
         return x[:, 0, :]  # Extract CLS token representation [B, dim]
@@ -178,38 +171,39 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.dim = dim
         self.elementwise_affine = elementwise_affine
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter('weight', None)
+        self.weight = nn.Parameter(torch.ones(dim))
+
 
     def forward(self, x):
         return F.rms_norm(x, (self.dim,), weight=self.weight, eps=self.eps)
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None):
+    def __init__(self, in_features, hidden_features=None, out_features=None, use_dwconv=True):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
+        self.use_dwconv = use_dwconv
 
         self.fc1 = nn.Linear(in_features, hidden_features * 2)
         self.act = nn.GELU(approximate="tanh")
-        self.dwconv = nn.Conv2d(
-            hidden_features, hidden_features,
-            kernel_size=3, padding=1, groups=hidden_features
-        )
+        if self.use_dwconv:
+            self.dwconv = nn.Conv2d(
+                hidden_features, hidden_features,
+                kernel_size=3, padding=1, groups=hidden_features
+            )
         self.fc2 = nn.Linear(hidden_features, out_features)
 
-    def forward(self, x, H, W):
+    def forward(self, x, H=None, W=None):
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
         x = x * self.act(gate)
-        # Depthwise spatial convolution
-        B, N, C = x.shape
-        x = x.transpose(1, 2).reshape(B, C, H, W)
-        x = self.dwconv(x)
-        x = x.reshape(B, C, N).transpose(1, 2)
+        if self.use_dwconv:
+            # Depthwise spatial convolution
+            B, N, C = x.shape
+            x = x.transpose(1, 2).reshape(B, C, H, W)
+            x = self.dwconv(x)
+            x = x.reshape(B, C, N).transpose(1, 2)
         return self.fc2(x)
 
 
@@ -223,7 +217,7 @@ class SelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
         self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
-    def forward(self, x, H, W, rope, num_context_tokens=0, seq_indices=None):
+    def forward(self, x, H=None, W=None, rope=None, num_context_tokens=0, seq_indices=None, src_key_padding_mask=None):
         B, N_seq, C = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
@@ -231,20 +225,27 @@ class SelfAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        if num_context_tokens > 0:
-            c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
-            c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
-            s_q = rope(s_q, H, W, seq_indices)
-            s_k = rope(s_k, H, W, seq_indices)
-            q = torch.cat([c_q, s_q], dim=2)
-            k = torch.cat([c_k, s_k], dim=2)
-        else:
-            q = rope(q, H, W, seq_indices)
-            k = rope(k, H, W, seq_indices)
+        if rope is not None:
+            if num_context_tokens > 0:
+                c_q, s_q = q[:, :, :num_context_tokens, :], q[:, :, num_context_tokens:, :]
+                c_k, s_k = k[:, :, :num_context_tokens, :], k[:, :, num_context_tokens:, :]
+                s_q = rope(s_q, H, W, seq_indices)
+                s_k = rope(s_k, H, W, seq_indices)
+                q = torch.cat([c_q, s_q], dim=2)
+                k = torch.cat([c_k, s_k], dim=2)
+            else:
+                q = rope(q, H, W, seq_indices)
+                k = rope(k, H, W, seq_indices)
 
         # Exclusive Self-Attention (XSA)
         q_f, k_f, v_f = q.float(), k.float(), v.float()
-        Y = F.scaled_dot_product_attention(q_f, k_f, v_f)
+        
+        if src_key_padding_mask is not None:
+            attn_mask = ~src_key_padding_mask.view(B, 1, 1, N_seq)
+            Y = F.scaled_dot_product_attention(q_f, k_f, v_f, attn_mask=attn_mask)
+        else:
+            Y = F.scaled_dot_product_attention(q_f, k_f, v_f)
+            
         Vn = F.normalize(v_f, dim=-1)
         Z = Y - (Y * Vn).sum(dim=-1, keepdim=True) * Vn
 
@@ -257,12 +258,12 @@ class DiTBlock(nn.Module):
     Diffusion Transformer (DiT) Block with adaLN-Zero modulation and XSA.
     Supports CLS tokens that participate in attention but bypass the MLP.
     """
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, use_dwconv=True):
         super().__init__()
         self.norm1 = RMSNorm(dim, elementwise_affine=False)
         self.self_attn = SelfAttention(dim, num_heads)
         self.norm2 = RMSNorm(dim, elementwise_affine=False)
-        self.mlp = Mlp(dim, dim * 4, dim)
+        self.mlp = Mlp(dim, dim * 4, dim, use_dwconv=use_dwconv)
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -272,19 +273,20 @@ class DiTBlock(nn.Module):
         # Zero-initialize the linear modulation parameters
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-
-    def forward(self, x, c, H, W, rope, num_cls_tokens=0):
+    @torch.compile
+    def forward(self, x, c, H=None, W=None, rope=None, num_cls_tokens=0, src_key_padding_mask=None):
         # Handle 2D conditioning tensor: c is [B, dim] -> [B, 1, dim]
         if c.dim() == 2:
             c = c.unsqueeze(1)
             
         modulation = self.adaLN_modulation(c)  # [B, N, 6*dim] or [B, 1, 6*dim]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
-
+        scale_msa = torch.tanh(scale_msa)
+        scale_mlp = torch.tanh(scale_mlp)
         # Attention branch — all tokens (CLS + spatial) participate
         x_norm1 = self.norm1(x)
         x_norm1 = x_norm1 * (1 + scale_msa) + shift_msa
-        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens=num_cls_tokens)
+        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens=num_cls_tokens, src_key_padding_mask=src_key_padding_mask)
         x = x + gate_msa * attn_out
 
         # MLP branch — only spatial tokens, CLS tokens bypass
@@ -344,7 +346,7 @@ class TokenformerDiT(nn.Module):
     """
 
     def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
-                 num_classes=12476, use_checkpoint=False, num_cls_tokens=4):
+                 num_classes=12477, use_checkpoint=False, num_cls_tokens=4):
         super().__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
@@ -428,9 +430,9 @@ class TokenformerDiT(nn.Module):
                 x = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens)
             
             # Capture spatial-only features for layer match loss
-            if idx == 2:  # Layer 3
+            if idx == 3:  # Layer 3
                 x3 = x[:, self.num_cls_tokens:].clone()
-            if idx == 8:  # Layer 9
+            if idx == 11:  # Layer 9
                 x9 = x[:, self.num_cls_tokens:].clone()
 
         # 7. Strip CLS tokens — only spatial tokens go through the final layer
@@ -461,10 +463,10 @@ class TokenformerDiT(nn.Module):
                 x9_detached = x9.detach()
                 B_m, N_m, D_m = x3.shape
                 if D_m % 64 == 0:
-                    x3_reshaped = x3.view(B_m, N_m, D_m // 64, 64)
-                    x9_reshaped = x9_detached.view(B_m, N_m, D_m // 64, 64)
+                    x3_reshaped = x3.view(B_m, N_m, D_m // 256, 256)
+                    x9_reshaped = x9_detached.view(B_m, N_m, D_m // 256, 256)
                     cos_sim = F.cosine_similarity(x3_reshaped, x9_reshaped, dim=-1)
-                    match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
+                    match_loss = 1 -(cos_sim).mean()
                 else:
                     cos_sim = F.cosine_similarity(x3, x9_detached, dim=-1)
                     match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
@@ -512,7 +514,7 @@ class TagProcessor:
 @torch.no_grad()
 def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
                 steps=50, guidance_scale=1.5, noise=None, cfg_scale=0,
-                sampler_type="look-ahead", p_percentile=0.4, alpha=2.0):
+                sampler_type="euler", p_percentile=0.4, alpha=2.0):
     in_channels = model.in_channels if hasattr(model, 'in_channels') else (
         model.module.in_channels if hasattr(model, 'module') else 32)
     model.eval()
@@ -528,7 +530,7 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
             x = noise.clone().to(device)
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
-
+    #x = x.to(torch.bfloat16)
     y_indices, y_offsets = tag_processor.process_prompts(prompts[:batch_size], device)
     null_prompts = [""] * batch_size
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)

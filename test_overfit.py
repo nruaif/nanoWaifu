@@ -51,7 +51,7 @@ def main():
     print(f"Using device: {device}")
 
     # --- Configuration ---
-    NUM_IMAGES = 4  # Number of images to load and overfit on
+    NUM_IMAGES = 8  # Number of images to load and overfit on
 
     # 1. Load images from D:\out2\goodness
     img_dir = r"D:\out2\goodness"
@@ -108,7 +108,7 @@ def main():
     # 3. Model Setup
     # DiT (TokenformerDiT)
     # in_channels=128 (Tiny VAE latent dim), dim=256, depth=12, num_heads=8
-    NUM_CLASSES = 4
+    NUM_CLASSES = 8
     model_dit = TokenformerDiT(
         in_channels=128,
         dim=256,

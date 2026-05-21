@@ -58,6 +58,7 @@ def cleanup_ddp():
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0:
         return
+    max_checkpoints = 16
     checkpoints = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
     checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
     if len(checkpoints) > max_checkpoints:
@@ -137,15 +138,33 @@ def train(config_path):
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
 
-    wds_loader = WDSLoader(
-        url=config['data']['webdataset_url'],
-        csv_path=config['data'].get('csv_path'),
-        image_size=config['training']['image_size'],
-        batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers'],
-        use_advanced_captions=config['data'].get('use_advanced_captions', True)
-    )
-    dataloader = wds_loader.make_loader()
+    use_cached_latents = config['data'].get('use_cached_latents', False)
+    if use_cached_latents:
+        from dataset import CachedLatentDataset
+        print(f">>> Using Cached Latents mode (loading pre-computed latents from {config['data']['cache_dir']})...")
+        dataset = CachedLatentDataset(
+            cache_dir=config['data']['cache_dir'],
+            batch_size=config['training']['batch_size'],
+            shuffle=True,
+            world_size=world_size,
+            rank=rank
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=config['training']['num_workers'],
+            pin_memory=True,
+        )
+    else:
+        wds_loader = WDSLoader(
+            url=config['data']['webdataset_url'],
+            csv_path=config['data'].get('csv_path'),
+            image_size=config['training']['image_size'],
+            batch_size=config['training']['batch_size'],
+            num_workers=config['training']['num_workers'],
+            use_advanced_captions=config['data'].get('use_advanced_captions', True)
+        )
+        dataloader = wds_loader.make_loader()
 
     image_size = config['training']['image_size']
 
@@ -266,20 +285,62 @@ def train(config_path):
     # Reference to the unwrapped model for accessing k-diff parameters
     model_raw = model.module if hasattr(model, 'module') else model
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        # cautious_wd = True,
-        lr=config['training']['learning_rate'],
-        weight_decay=0.1,
-        betas=(0.9, 0.95)
-    )
+    # Mock Optimizers for safety if file is missing locally
+    try:
+        from adv_optm import Muon_adv as NorMuon
+        from adv_optm import AdamW_adv as DionAdamW
+    except ImportError:
+        print("Warning: Advanced optimizers missing, falling back to torch.optim.AdamW")
+        NorMuon, DionAdamW = torch.optim.AdamW, torch.optim.AdamW
+
+    adamw_params, normuon_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_1d = p.ndim <= 1
+        is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
+        is_embedding = ('embed' in name or isinstance(p, torch.nn.Embedding)
+                        or isinstance(p, torch.nn.EmbeddingBag) or 'token_embed' in name)
+        if is_1d or is_dwconv or is_embedding:
+            adamw_params.append(p)
+        else:
+            normuon_params.append(p)
+
+    try:
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95), cautious_wd=True)
+        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0.1, cautious_wd=True, normuon_variant=True)
+    except Exception:
+        opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
+        opt_normuon = torch.optim.AdamW(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
+
+    class DualOptimizer:
+        def __init__(self, opt1, opt2):
+            self.opt1 = opt1
+            self.opt2 = opt2
+
+        def step(self):
+            self.opt1.step()
+            self.opt2.step()
+
+        def zero_grad(self, set_to_none=True):
+            self.opt1.zero_grad(set_to_none)
+            self.opt2.zero_grad(set_to_none)
+
+        def state_dict(self):
+            return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
+
+        def load_state_dict(self, state):
+            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
+            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
+
+    optimizer = DualOptimizer(opt_adamw, opt_normuon)
 
     # FIX: restore optimizer state after it's constructed
     if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
@@ -289,7 +350,7 @@ def train(config_path):
         pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
-
+    vae.compile()
     data_iter = iter(dataloader)
     running_loss = 0.0
     running_match_loss = 0.0
@@ -310,13 +371,15 @@ def train(config_path):
                 batch = next(data_iter)
 
             images, prompts, _ = batch
-            images = images.to(device, memory_format=torch.channels_last)
             y_indices, y_offsets = tag_processor.process_prompts(
                 prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
             )
 
             # VAE Encoding
-            if use_tiny_vae:
+            if use_cached_latents:
+                inputs = images.to(device=device, dtype=torch.bfloat16)
+            elif use_tiny_vae:
+                images = images.to(device, memory_format=torch.channels_last)
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     out = vae.encode(v_images, return_dict=False)
@@ -326,6 +389,7 @@ def train(config_path):
                     inputs = latents.to(dtype=torch.bfloat16)
 
             elif use_vae:
+                images = images.to(device, memory_format=torch.channels_last)
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     latents = vae.encode(v_images).latent_dist.mode()
@@ -333,6 +397,7 @@ def train(config_path):
                     inputs = (latents - latents_mean) / latents_std
                     # FIX: keep in bfloat16 — no reason to cast to fp32
             else:
+                images = images.to(device, memory_format=torch.channels_last)
                 inputs = images.to(dtype=torch.bfloat16)
 
             if rank == 0 and fixed_prompts is None:
@@ -391,7 +456,7 @@ def train(config_path):
 
             # Compute velocity-space loss (flow matching target: noise - inputs)
             v_target = noise - inputs
-            loss = F.mse_loss(v_pred, v_target) + 0.2 * match_loss
+            loss = F.mse_loss(v_pred, v_target) 
 
             loss = loss / accum_steps
             loss.backward()
@@ -433,7 +498,8 @@ def train(config_path):
                         16,
                         fixed_prompts,
                         device,
-                        cfg_scale=config['training'].get('cfg_scale', 1.4),
+                        guidance_scale=config['training'].get('cfg_scale', 1.4),
+                        sampler_type="euler"
                     )
 
                     if use_tiny_vae:
