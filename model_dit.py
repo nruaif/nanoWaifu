@@ -71,14 +71,16 @@ class TagTransformer(nn.Module):
         
         # Pad tag represents the null token/dropout tag at self.embedding.num_embeddings - 1
         padding_val = self.embedding.num_embeddings - 1
-        padded_tags = torch.full((B, max_len), padding_val, dtype=torch.long, device=device)
+        target_len = 32
+        padded_tags = torch.full((B, target_len), padding_val, dtype=torch.long, device=device)
         
         for i in range(B):
             start = offsets_list[i]
             end = offsets_list[i+1] if i + 1 < B else total_len
             item_len = end - start
             if item_len > 0:
-                padded_tags[i, :item_len] = y_indices[start:end]
+                copy_len = min(item_len, target_len)
+                padded_tags[i, :copy_len] = y_indices[start:start+copy_len]
                 
         # Embed tags and prepend learnable CLS token
         tag_embeds = self.embedding(padded_tags)  # [B, max_len, dim]
