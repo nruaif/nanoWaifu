@@ -89,8 +89,9 @@ class TagTransformer(nn.Module):
         
         c = torch.zeros(B, 1, x.shape[-1], device=device, dtype=x.dtype)
         # Run through tag transformer encoder stack
+        qkv_res = None
         for block in self.blocks:
-            x = block(x, c)
+            x, qkv_res = block(x, c, qkv_res=qkv_res)
             
         x = self.norm(x)
         return x[:, 0, :]  # Extract CLS token representation [B, dim]
