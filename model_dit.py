@@ -212,9 +212,12 @@ class SelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
         self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
-    def forward(self, x, H=None, W=None, rope=None, num_context_tokens=0, seq_indices=None, src_key_padding_mask=None):
+    def forward(self, x, H=None, W=None, rope=None, num_context_tokens=0, seq_indices=None, src_key_padding_mask=None, qkv_res=None):
         B, N_seq, C = x.shape
-        qkv = self.qkv(x).chunk(3, dim=-1)
+        qkv_proj = self.qkv(x)
+        if qkv_res is not None:
+            qkv_proj = qkv_res + qkv_proj
+        qkv = qkv_proj.chunk(3, dim=-1)
         q, k, v = map(lambda t: t.view(B, N_seq, self.num_heads, self.head_dim).transpose(1, 2), qkv)
 
         q = self.q_norm(q)
@@ -245,7 +248,7 @@ class SelfAttention(nn.Module):
         Z = Y - (Y * Vn).sum(dim=-1, keepdim=True) * Vn
 
         x_att = Z.to(q.dtype).transpose(1, 2).reshape(B, N_seq, C)
-        return self.proj(x_att)
+        return self.proj(x_att), qkv_proj
 
 
 class DiTBlock(nn.Module):
@@ -269,7 +272,7 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
     @torch.compile
-    def forward(self, x, c, H=None, W=None, rope=None, num_cls_tokens=0, src_key_padding_mask=None):
+    def forward(self, x, c, H=None, W=None, rope=None, num_cls_tokens=0, src_key_padding_mask=None, qkv_res=None):
         # Handle 2D conditioning tensor: c is [B, dim] -> [B, 1, dim]
         if c.dim() == 2:
             c = c.unsqueeze(1)
@@ -281,7 +284,7 @@ class DiTBlock(nn.Module):
         # Attention branch — all tokens (CLS + spatial) participate
         x_norm1 = self.norm1(x)
         x_norm1 = x_norm1 * (1 + scale_msa) + shift_msa
-        attn_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens=num_cls_tokens, src_key_padding_mask=src_key_padding_mask)
+        attn_out, qkv_res_out = self.self_attn(x_norm1, H, W, rope, num_context_tokens=num_cls_tokens, src_key_padding_mask=src_key_padding_mask, qkv_res=qkv_res)
         x = x + gate_msa * attn_out
 
         # MLP branch — only spatial tokens, CLS tokens bypass
@@ -306,7 +309,7 @@ class DiTBlock(nn.Module):
         else:
             x = spatial
 
-        return x
+        return x, qkv_res_out
 
 
 class TimestepEmbedder(nn.Module):
@@ -402,12 +405,13 @@ class TokenformerDiT(nn.Module):
         # 6. Process through DiTBlock sequence
         x3 = None
         x9 = None
+        qkv_res = None
         for idx, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training:
-                x = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens,
+                x, qkv_res = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens, None, qkv_res,
                                use_reentrant=False, context_fn=context_fn)
             else:
-                x = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens)
+                x, qkv_res = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens, qkv_res=qkv_res)
             
             # Capture spatial-only features for layer match loss
             if idx == 3:  # Layer 3
