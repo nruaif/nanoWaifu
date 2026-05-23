@@ -27,17 +27,18 @@ def policy_fn(ctx, op, *args, **kwargs):
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
-
-
 class TagTransformer(nn.Module):
     """
     Processes variable-length tags separately using a simple 3-layer Transformer blocks stack
-    and extracts the processed [CLS] token as the global tag embedding.
+    and extracts 4 processed [CLS] tokens as multi-resolution tag embeddings.
+    - Stage 1 (encoder/decoder level 1): CLS[0] → dim
+    - Stage 2 (encoder/decoder level 2): cat(CLS[0], CLS[1]) → 2*dim
+    - Stage 3 (bottleneck):              cat(CLS[0:4]) → 4*dim
     """
     def __init__(self, num_classes: int, dim: int, num_heads: int = 16, depth: int = 3):
         super().__init__()
         self.embedding = nn.Embedding(num_classes + 1, dim)  # +1 for padding/null class
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 4, dim))
         
         self.blocks = nn.ModuleList([
             DiTBlock(dim, num_heads, use_dwconv=False) for _ in range(depth)
@@ -82,10 +83,10 @@ class TagTransformer(nn.Module):
                 copy_len = min(item_len, target_len)
                 padded_tags[i, :copy_len] = y_indices[start:start+copy_len]
                 
-        # Embed tags and prepend learnable CLS token
-        tag_embeds = self.embedding(padded_tags)  # [B, max_len, dim]
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, dim]
-        x = torch.cat([cls_tokens, tag_embeds], dim=1)  # [B, max_len + 1, dim]
+        # Embed tags and prepend learnable CLS tokens
+        tag_embeds = self.embedding(padded_tags)  # [B, target_len, dim]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 4, dim]
+        x = torch.cat([cls_tokens, tag_embeds], dim=1)  # [B, 4 + target_len, dim]
         
         c = torch.zeros(B, 1, x.shape[-1], device=device, dtype=x.dtype)
         # Run through tag transformer encoder stack
@@ -94,7 +95,7 @@ class TagTransformer(nn.Module):
             x, qkv_res = block(x, c, qkv_res=qkv_res)
             
         x = self.norm(x)
-        return x[:, 0, :]  # Extract CLS token representation [B, dim]
+        return x[:, :4, :]  # Extract 4 CLS token representations [B, 4, dim]
 
 
 class GGRoPE2d(nn.Module):
@@ -272,7 +273,6 @@ class DiTBlock(nn.Module):
         # Zero-initialize the linear modulation parameters
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-    @torch.compile
     def forward(self, x, c, H=None, W=None, rope=None, num_cls_tokens=0, src_key_padding_mask=None, qkv_res=None):
         # Handle 2D conditioning tensor: c is [B, dim] -> [B, 1, dim]
         if c.dim() == 2:
@@ -333,130 +333,333 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(emb)
 
 
+#################################################################################
+#                     FCDM Components (ConvNeXt U-Net)                          #
+#################################################################################
+
+class LayerNorm2d(nn.LayerNorm):
+    """LayerNorm applied to 2D feature maps (channels-first format)."""
+    def __init__(self, num_channels, eps=1e-6, affine=True):
+        super().__init__(num_channels, eps=eps, elementwise_affine=affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
+class GRN(nn.Module):
+    """GRN (Global Response Normalization) layer from ConvNeXt V2."""
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, dim, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x):
+        Gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + 1e-6)
+        return self.gamma * (x * Nx) + self.beta + x
+
+
+class ConvNeXtBlock(nn.Module):
+    """
+    ConvNeXt-style block with adaptive LayerNorm-Zero (adaLN-Zero) conditioning.
+    Combines depthwise conv and pointwise MLP with adaLN modulation on the channel dimension.
+    """
+    def __init__(self, dim, mlp_ratio=3.0):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = LayerNorm2d(dim, affine=False, eps=1e-6)
+        self.pwconv1 = nn.Conv2d(dim, int(dim * mlp_ratio), 1)
+        self.act = nn.GELU()
+        self.grn = GRN(int(dim * mlp_ratio))
+        self.pwconv2 = nn.Conv2d(int(dim * mlp_ratio), dim, 1)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 3 * dim, bias=True)
+        )
+
+    def forward(self, x, c):
+        """
+        x: (B, C, H, W) spatial features
+        c: (B, C) conditioning vector
+        """
+        h = self.dwconv(x)
+        # Compute adaLN parameters: shift, scale, gate
+        shift, scale, gate = self.adaLN_modulation(c).unsqueeze(2).unsqueeze(3).chunk(3, dim=1)
+        # Apply adaptive LayerNorm-Zero
+        h = self.norm(h)
+        h = torch.addcmul(shift, h, scale + 1)
+        # Pointwise MLP
+        h = self.pwconv1(h)
+        h = self.act(h)
+        h = self.grn(h)
+        h = self.pwconv2(h)
+        # Apply gate and residual
+        h = h * gate
+        return x + h
+
+
+class ConvFinalLayer(nn.Module):
+    """Final output layer with adaLN modulation + Conv2d."""
+    def __init__(self, hidden_size, out_channels):
+        super().__init__()
+        self.norm = LayerNorm2d(hidden_size, affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+        self.conv = nn.Conv2d(hidden_size, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = self.norm(x)
+        x = x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
+        x = self.conv(x)
+        return x
+
+
+class Downsample(nn.Module):
+    """Spatial downsample via Conv2d + PixelUnshuffle(2)."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch // 4, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelUnshuffle(2)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    """Spatial upsample via Conv2d + PixelShuffle(2)."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelShuffle(2)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+#################################################################################
+#                     FCDM-L: Fully Convolutional Diffusion Model               #
+#################################################################################
+
 class TokenformerDiT(nn.Module):
     """
-    Diffusion Transformer (DiT) with XSA, DW-Conv MLP, and learnable CLS tokens.
-    CLS tokens participate in attention but bypass MLP for global context aggregation.
+    FCDM-L: Fully Convolutional Diffusion Model with TagTransformer conditioning.
+    ConvNeXt-based U-Net backbone adapted from 'Reviving ConvNeXt for Efficient
+    Convolutional Diffusion Models' (CVPR 2026).
+
+    Conditioning uses TagTransformer's 4 CLS tokens stacked on channel dim:
+    - Stage 1 (512d):  CLS[0]
+    - Stage 2 (1024d): cat(CLS[0], CLS[1])
+    - Stage 3 (2048d): cat(CLS[0:4])
     """
 
-    def __init__(self, in_channels=32, dim=768, depth=12, num_heads=12,
-                 num_classes=12477, use_checkpoint=False, num_cls_tokens=4):
+    def __init__(self, in_channels=32, dim=512, depth=None, num_heads=16,
+                 num_classes=12477, use_checkpoint=False, **kwargs):
         super().__init__()
-        self.dim = dim
-        self.use_checkpoint = use_checkpoint
+        hidden_size = dim
         self.in_channels = in_channels
-        self.num_cls_tokens = num_cls_tokens
+        self.use_checkpoint = use_checkpoint
 
-        self.patch_embed = nn.Linear(in_channels, dim)
+        # FCDM-L config
+        fcdm_depth = [2, 4, 8, 4, 2]
+        mlp_ratio = 3
 
-        # Learnable CLS tokens (attend but skip MLP)
-        self.cls_tokens = nn.Parameter(torch.zeros(1, num_cls_tokens, dim))
-        nn.init.normal_(self.cls_tokens, std=0.02)
-
-        self.t_embedder = TimestepEmbedder(dim)
-        self.y_embedder = TagTransformer(num_classes, dim)
-
-        self.rope = GGRoPE2d(
-            n_heads=num_heads,
-            head_dim=dim // num_heads,
-            min_freq=1.0,
-            max_freq=100.0
+        # --- Conditioning ---
+        # TagTransformer returns 4 CLS tokens, each of dim=hidden_size
+        self.y_embedder = TagTransformer(
+            num_classes, hidden_size,
+            num_heads=min(num_heads, hidden_size // 64),
+            depth=3
         )
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(dim, num_heads) for _ in range(depth)
+        # Per-resolution timestep embedders
+        self.t_embedder_1 = TimestepEmbedder(hidden_size)       # D
+        self.t_embedder_2 = TimestepEmbedder(hidden_size * 2)   # 2D
+        self.t_embedder_3 = TimestepEmbedder(hidden_size * 4)   # 4D
+
+        # --- Input embedding ---
+        self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=3, stride=1, padding=1)
+
+        # --- Encoder Level 1 ---
+        self.encoder_level_1 = nn.ModuleList([
+            ConvNeXtBlock(hidden_size, mlp_ratio=mlp_ratio)
+            for _ in range(fcdm_depth[0])
+        ])
+        self.down1_2 = Downsample(hidden_size, hidden_size * 2)
+
+        # --- Encoder Level 2 ---
+        self.encoder_level_2 = nn.ModuleList([
+            ConvNeXtBlock(hidden_size * 2, mlp_ratio=mlp_ratio)
+            for _ in range(fcdm_depth[1])
+        ])
+        self.down2_3 = Downsample(hidden_size * 2, hidden_size * 4)
+
+        # --- Bottleneck ---
+        self.latent = nn.ModuleList([
+            ConvNeXtBlock(hidden_size * 4, mlp_ratio=mlp_ratio)
+            for _ in range(fcdm_depth[2])
         ])
 
-        # Final Layer Modulation and Projection
-        self.final_norm = RMSNorm(dim, elementwise_affine=False)
-        self.final_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 2 * dim, bias=True)
-        )
-        self.final_proj = nn.Linear(dim, in_channels)
+        # --- Decoder Level 2 ---
+        self.up3_2 = Upsample(hidden_size * 4, hidden_size * 2)
+        self.reduce_chans_2 = nn.Conv2d(hidden_size * 4, hidden_size * 2, kernel_size=1)
+        self.decoder_level_2 = nn.ModuleList([
+            ConvNeXtBlock(hidden_size * 2, mlp_ratio=mlp_ratio)
+            for _ in range(fcdm_depth[3])
+        ])
 
-        # Zero-initialize the final modulation parameters
-        nn.init.zeros_(self.final_modulation[1].weight)
-        nn.init.zeros_(self.final_modulation[1].bias)
+        # --- Decoder Level 1 ---
+        self.up2_1 = Upsample(hidden_size * 2, hidden_size)
+        self.reduce_chans_1 = nn.Conv2d(hidden_size * 2, hidden_size, kernel_size=1)
+        self.decoder_level_1 = nn.ModuleList([
+            ConvNeXtBlock(hidden_size, mlp_ratio=mlp_ratio)
+            for _ in range(fcdm_depth[4])
+        ])
+
+        # --- Output ---
+        self.output_layer = nn.Conv2d(hidden_size, hidden_size, kernel_size=3, stride=1, padding=1)
+        self.final_layer = ConvFinalLayer(hidden_size, in_channels)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Input embedding
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        nn.init.constant_(self.x_embedder.bias, 0)
+
+        # Timestep embedder MLPs
+        for t_emb in [self.t_embedder_1, self.t_embedder_2, self.t_embedder_3]:
+            nn.init.normal_(t_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(t_emb.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation in all ConvNeXt blocks
+        all_blocks = (
+            list(self.encoder_level_1) + list(self.encoder_level_2) +
+            list(self.latent) +
+            list(self.decoder_level_2) + list(self.decoder_level_1)
+        )
+        for block in all_blocks:
+            if hasattr(block, 'adaLN_modulation'):
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out final layer
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.conv.weight, 0)
+        nn.init.constant_(self.final_layer.conv.bias, 0)
 
     def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False,
                 return_layer_match=False, **kwargs):
+        """
+        Forward pass of FCDM-L.
+        x_in: (B, C, H, W) spatial input (latent representation)
+        t:    (B,) diffusion timesteps
+        y_indices: flat tag index tensor
+        y_offsets: per-sample offsets into y_indices
+        """
         B, C, H, W = x_in.shape
-        N = H * W
-        
-        # 1. Patch embedding
-        x = x_in.flatten(2).transpose(1, 2)
-        x = self.patch_embed(x)  # [B, N, dim]
 
-        # 2. Prepend learnable CLS tokens
-        cls = self.cls_tokens.expand(B, -1, -1)  # [B, num_cls, dim]
-        x = torch.cat([cls, x], dim=1)  # [B, num_cls + N, dim]
+        # --- Input embedding ---
+        x_emb = self.x_embedder(x_in)
 
-        # 3. Timestep embedding
-        t_emb = self.t_embedder(t)  # [B, dim]
-        t_emb = t_emb.unsqueeze(1)  # [B, 1, dim]
+        # --- Tag conditioning: (B, 4, dim) ---
+        y_cls = self.y_embedder(y_indices, y_offsets)
 
-        # 4. Class/Tag embedding CLS extraction
-        y_embed = self.y_embedder(y_indices, y_offsets)  # [B, dim]
-        y_emb = y_embed.unsqueeze(1)  # [B, 1, dim]
+        # --- Per-resolution conditioning ---
+        # Stage 1: 1 CLS token → dim
+        t1 = self.t_embedder_1(t)                                  # (B, D)
+        c1 = t1 + y_cls[:, 0, :]                                   # (B, D)
 
-        # 5. Conditioning Vector
-        c = t_emb + y_emb  # [B, 1, dim]
+        # Stage 2: 2 CLS tokens stacked → 2*dim
+        t2 = self.t_embedder_2(t)                                  # (B, 2D)
+        y2 = torch.cat([y_cls[:, 0, :], y_cls[:, 1, :]], dim=-1)   # (B, 2D)
+        c2 = t2 + y2
 
-        # 6. Process through DiTBlock sequence
-        x3 = None
-        x9 = None
-        qkv_res = None
-        for idx, block in enumerate(self.blocks):
+        # Stage 3 (bottleneck): 4 CLS tokens stacked → 4*dim
+        t3 = self.t_embedder_3(t)                                  # (B, 4D)
+        y3 = y_cls.reshape(B, -1)                                   # (B, 4D)
+        c3 = t3 + y3
+
+        # --- Encoder Level 1 ---
+        out_enc_level1 = x_emb
+        for block in self.encoder_level_1:
             if self.use_checkpoint and self.training:
-                x, qkv_res = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens, None, qkv_res,
-                               use_reentrant=False, context_fn=context_fn)
+                out_enc_level1 = torch.utils.checkpoint.checkpoint(
+                    block, out_enc_level1, c1, use_reentrant=False)
             else:
-                x, qkv_res = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens, qkv_res=qkv_res)
-            
-            # Capture spatial-only features for layer match loss
-            if idx == 3:  # Layer 3
-                x3 = x[:, self.num_cls_tokens:].clone()
-            if idx == 11:  # Layer 9
-                x9 = x[:, self.num_cls_tokens:].clone()
+                out_enc_level1 = block(out_enc_level1, c1)
+        inp_enc_level2 = self.down1_2(out_enc_level1)
 
-        # 7. Strip CLS tokens — only spatial tokens go through the final layer
-        x = x[:, self.num_cls_tokens:]  # [B, N, dim]
-
-        # 8. Final layer modulation
-        final_mod = self.final_modulation(c)  # [B, N, 2*dim] or [B, 1, 2*dim]
-        shift, scale = final_mod.chunk(2, dim=-1)
-        
-        x_norm = self.final_norm(x)
-        x_norm = x_norm * (1 + scale) + shift
-        x_out = self.final_proj(x_norm)
-
-        # Project back to image spatial format
-        v_pred = x_out.transpose(1, 2).reshape(B, self.in_channels, H, W)
-
-        # 9. Layer match loss calculation (if requested)
-        match_loss = None
-        if return_layer_match:
-            if x3 is None or x9 is None:
-                match_loss = torch.tensor(0.0, device=x.device)
+        # --- Encoder Level 2 ---
+        out_enc_level2 = inp_enc_level2
+        for block in self.encoder_level_2:
+            if self.use_checkpoint and self.training:
+                out_enc_level2 = torch.utils.checkpoint.checkpoint(
+                    block, out_enc_level2, c2, use_reentrant=False)
             else:
-                # x3 and x9 have shape [B, N, D] (spatial only)
-                x9_detached = x9.detach()
-                B_m, N_m, D_m = x3.shape
-                if D_m % 64 == 0:
-                    x3_reshaped = x3.view(B_m, N_m, D_m // 256, 256)
-                    x9_reshaped = x9_detached.view(B_m, N_m, D_m // 256, 256)
-                    cos_sim = F.cosine_similarity(x3_reshaped, x9_reshaped, dim=-1)
-                    match_loss = 1 -(cos_sim).mean()
-                else:
-                    cos_sim = F.cosine_similarity(x3, x9_detached, dim=-1)
-                    match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
+                out_enc_level2 = block(out_enc_level2, c2)
+        inp_enc_level3 = self.down2_3(out_enc_level2)
 
+        # --- Bottleneck ---
+        latent = inp_enc_level3
+        for block in self.latent:
+            if self.use_checkpoint and self.training:
+                latent = torch.utils.checkpoint.checkpoint(
+                    block, latent, c3, use_reentrant=False)
+            else:
+                latent = block(latent, c3)
+
+        # --- Decoder Level 2 ---
+        inp_dec_level2 = self.up3_2(latent)
+        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], dim=1)
+        out_dec_level2 = self.reduce_chans_2(inp_dec_level2)
+        for block in self.decoder_level_2:
+            if self.use_checkpoint and self.training:
+                out_dec_level2 = torch.utils.checkpoint.checkpoint(
+                    block, out_dec_level2, c2, use_reentrant=False)
+            else:
+                out_dec_level2 = block(out_dec_level2, c2)
+
+        # --- Decoder Level 1 ---
+        inp_dec_level1 = self.up2_1(out_dec_level2)
+        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], dim=1)
+        out_dec_level1 = self.reduce_chans_1(inp_dec_level1)
+        for block in self.decoder_level_1:
+            if self.use_checkpoint and self.training:
+                out_dec_level1 = torch.utils.checkpoint.checkpoint(
+                    block, out_dec_level1, c1, use_reentrant=False)
+            else:
+                out_dec_level1 = block(out_dec_level1, c1)
+
+        # --- Output ---
+        x = self.output_layer(out_dec_level1)
+        v_pred = self.final_layer(x, c1)
+
+        # --- Interface compatibility ---
         res = [v_pred]
         if return_features:
-            res.append(x)
+            res.append(None)
         if return_layer_match:
-            res.append(match_loss)
+            res.append(torch.tensor(0.0, device=v_pred.device))
 
         if len(res) == 1:
             return res[0]
@@ -538,13 +741,12 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
 
 
 if __name__ == "__main__":
-    print("Initializing DiT on CPU...")
+    print("Initializing FCDM-L on CPU...")
     device = torch.device("cpu")
 
     model = TokenformerDiT(
         in_channels=32,
-        dim=256,
-        depth=12,
+        dim=512,
         num_heads=8,
         num_classes=100,
     ).to(device)
@@ -553,14 +755,14 @@ if __name__ == "__main__":
     print(f"Model Parameters: {num_params / 1e6:.2f} M")
 
     batch_size = 2
-    H, W = 8, 8
+    H, W = 32, 32  # f8 latent at 256px
 
     x_in = torch.randn(batch_size, 32, H, W, device=device)
     y_indices = torch.randint(0, 100, (batch_size * 3,), device=device)
     y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
 
-    # --- Test 1: Global timestep (1D) ---
-    print("\n[Test 1] Global timestep (1D)...")
+    # --- Test 1: Forward pass ---
+    print("\n[Test 1] Forward pass...")
     t_global = torch.rand(batch_size, device=device)
     model.eval()
     v_pred, match_loss = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)

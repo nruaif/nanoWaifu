@@ -103,17 +103,16 @@ def main():
         if latents_mean is not None and latents_std is not None:
             latents = (latents - latents_mean) / latents_std
             print("Normalized encoded latents using VAE running stats.")
+        latents = F.pixel_shuffle(latents, 2)
     print(f"Latents shape: {latents.shape}")
 
     # 3. Model Setup
-    # DiT (TokenformerDiT)
-    # in_channels=128 (Tiny VAE latent dim), dim=256, depth=12, num_heads=8
+    # FCDM-L Model
+    # in_channels=32 (f8 representation), dim=512 (FCDM-L specification)
     NUM_CLASSES = 8
     model_dit = TokenformerDiT(
-        in_channels=128,
-        dim=256,
-        depth=12,
-        num_heads=8,
+        in_channels=32,
+        dim=64,
         num_classes=NUM_CLASSES,
     ).to(device)
 
@@ -132,8 +131,8 @@ def main():
         # --- DiT Training ---
         model_dit.train()
         B, C, H, W = latents.shape
-        t = torch.rand((B, H * W), device=device)
-        t_reshaped = t.view(B, 1, H, W)
+        t = torch.rand((B, ), device=device)
+        t_reshaped = t.view(B, 1, 1, 1)
         noise = torch.randn_like(latents)
         
         # DiT uses (1-t)*x + t*noise
@@ -163,6 +162,7 @@ def main():
                     model_dit, tp, (H, W), NUM_IMAGES, sample_prompts, device, steps=50, sampler_type="euler"
                 )
                 
+                samples_dit = F.pixel_unshuffle(samples_dit, 2)
                 # De-normalize samples if stats are available
                 if latents_mean is not None and latents_std is not None:
                     samples_dit = (samples_dit * latents_std) + latents_mean

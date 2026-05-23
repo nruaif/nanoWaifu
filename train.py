@@ -209,7 +209,7 @@ def train(config_path):
                 "fal/FLUX.2-Tiny-AutoEncoder",
             ).to(device=device, dtype=torch.bfloat16).eval()
 
-            in_channels = 128
+            in_channels = 32
             print(f">>> Tiny VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
         else:
             if standard_vae is None:
@@ -221,11 +221,11 @@ def train(config_path):
                     torch_dtype=torch.bfloat16
                 ).to(device=device).eval()
             vae = standard_vae
-            in_channels = 128
+            in_channels = 32
             print(f">>> VAE Mode Enabled: Model in_channels adjusted to {in_channels}")
 
-    latent_size = (image_size // 16) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size',
-                                                                                                         16)
+    latent_size = (image_size // 8) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size',
+                                                                                                        16)
 
     model = ModelClass(
         in_channels=in_channels,
@@ -384,18 +384,20 @@ def train(config_path):
                     v_images = images.to(dtype=torch.bfloat16)
                     out = vae.encode(v_images, return_dict=False)
                     latents = out[0] if isinstance(out, tuple) else out
+                    # Normalize at native 128ch, then reshape to f8 32ch
                     latents = (latents - latents_mean) / latents_std
-                    # FIX: keep in bfloat16 — no reason to cast to fp32
-                    inputs = latents.to(dtype=torch.bfloat16)
+                    inputs = F.pixel_shuffle(latents, 2).to(dtype=torch.bfloat16)
 
             elif use_vae:
                 images = images.to(device, memory_format=torch.channels_last)
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     latents = vae.encode(v_images).latent_dist.mode()
+                    # Reshape to 128ch for normalization (stats are in 2x2 patch format)
                     latents = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
-                    inputs = (latents - latents_mean) / latents_std
-                    # FIX: keep in bfloat16 — no reason to cast to fp32
+                    latents = (latents - latents_mean) / latents_std
+                    # Reshape back to f8 32ch for the model
+                    inputs = F.pixel_shuffle(latents, 2)
             else:
                 images = images.to(device, memory_format=torch.channels_last)
                 inputs = images.to(dtype=torch.bfloat16)
@@ -489,7 +491,9 @@ def train(config_path):
 
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        latents = (samples * latents_std) + latents_mean
+                        # Reverse: f8 32ch → f16 128ch → un-normalize → decode
+                        latents = F.pixel_unshuffle(samples, 2)
+                        latents = latents * latents_std + latents_mean
                         out = vae.decode(latents, return_dict=False)
                         recon = out[0] if isinstance(out, tuple) else out
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
@@ -497,8 +501,10 @@ def train(config_path):
 
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        samples = (samples * latents_std) + latents_mean
-                        latents = F.pixel_shuffle(samples, 2)
+                        # Reverse: f8 32ch → f16 128ch → un-normalize → f8 32ch → decode
+                        latents = F.pixel_unshuffle(samples, 2)
+                        latents = latents * latents_std + latents_mean
+                        latents = F.pixel_shuffle(latents, 2)
                         recon = vae.decode(latents).sample
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)

@@ -27,8 +27,8 @@ model:
   type: "dit"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
   use_tiny_vae: true
-  fcdm_dim: 1024    # Hidden dimension (Transformer)
-  fcdm_depth: 16   # Number of layers
+  fcdm_dim: 512    # Hidden dimension (FCDM-L: 512, depth=[2,4,8,4,2] hardcoded)
+  fcdm_depth: 16   # Legacy — depth is now hardcoded as [2,4,8,4,2] in model
   num_heads: 16    # Number of attention heads
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
