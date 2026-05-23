@@ -140,21 +140,17 @@ def train(config_path):
 
     use_cached_latents = config['data'].get('use_cached_latents', False)
     if use_cached_latents:
-        from dataset import CachedLatentDataset
         print(f">>> Using Cached Latents mode (loading pre-computed latents from {config['data']['cache_dir']})...")
-        dataset = CachedLatentDataset(
-            cache_dir=config['data']['cache_dir'],
+        url = os.path.join(config['data']['cache_dir'], "*.tar")
+        wds_loader = WDSLoader(
+            url=url,
+            csv_path=config['data'].get('csv_path'),
+            image_size=config['training']['image_size'],
             batch_size=config['training']['batch_size'],
-            shuffle=True,
-            world_size=world_size,
-            rank=rank
-        )
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=None,
             num_workers=config['training']['num_workers'],
-            pin_memory=True,
+            use_advanced_captions=config['data'].get('use_advanced_captions', True)
         )
+        dataloader = wds_loader.make_loader()
     else:
         wds_loader = WDSLoader(
             url=config['data']['webdataset_url'],

@@ -1,11 +1,11 @@
 """
-Encode images from WebDataset tars into cached latents, grouped by aspect ratio bucket.
+Encode images from WebDataset tars into cached latents, grouped into 1GB WebDataset .tar shards.
 
-Each output file is a single .npz containing:
-  - "latents": float16 array of shape [N, 128, H', W'] (N = bucket_size images)
-  - "prompts": JSON-encoded list of N prompt strings
+Each output file is a .tar shard containing samples with:
+  - "latent.npy": float16 array of shape [128, H', W']
+  - "prompt.txt": The prompt string
 
-Files are named: bucket_{H}x{W}_{shard_idx:05d}.npz
+Files are named: latents-00000.tar, latents-00001.tar, etc.
 
 Usage:
     python cache_latents.py --input "/path/to/shards/00{001..020}.tar" \
@@ -177,10 +177,10 @@ def main():
 
     # Accumulators: bucket_key -> {"tensors": [...], "prompts": [...]}
     bucket_data = {b: {"tensors": [], "prompts": []} for b in buckets}
-    # Track shard index per bucket
-    bucket_shard_idx = {b: 0 for b in buckets}
 
     os.makedirs(args.output_dir, exist_ok=True)
+    pattern = os.path.join(args.output_dir, "latents-%05d.tar")
+    writer = wds.ShardWriter(pattern, maxsize=10**9) # 1GB shards
 
     # ── Encode and flush a full bucket ──────────────────────────────────────
     total_files_written = 0
@@ -223,22 +223,16 @@ def main():
 
         stacked = torch.cat(all_latents, dim=0).numpy()  # [N, 128, H', W']
 
-        # Save as .npz
-        shard_idx = bucket_shard_idx[bucket_key]
-        filename = f"bucket_{bh}x{bw}_{shard_idx:05d}.npz"
-        filepath = os.path.join(args.output_dir, filename)
-        np.savez_compressed(
-            filepath,
-            latents=stacked,
-            prompts=json.dumps(prompts, ensure_ascii=False),
-        )
+        # Save to ShardWriter
+        for idx in range(n):
+            writer.write({
+                "__key__": f"{total_samples + idx:09d}",
+                "latent.npy": stacked[idx],
+                "prompt.txt": prompts[idx]
+            })
 
-        file_size_mb = os.path.getsize(filepath) / (1024 ** 2)
-        print(f"  Saved {filepath} ({n} samples, {file_size_mb:.1f} MB)")
-
-        bucket_shard_idx[bucket_key] = shard_idx + 1
-        total_files_written += 1
         total_samples += n
+        total_files_written += 1 # We'll count bucket flushes just for logging
 
         # Reset accumulator
         data["tensors"].clear()
@@ -292,19 +286,13 @@ def main():
         if bucket_data[bk]["tensors"]:
             flush_bucket(bk)
 
+    writer.close()
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"Done!  {total_samples} latents in {total_files_written} files")
+    print(f"Done!  {total_samples} latents written to tar shards.")
     print(f"Skipped: {skipped}")
     print(f"Time: {elapsed:.1f}s  ({total_samples / max(elapsed, 1):.1f} img/s)")
     print(f"Output: {args.output_dir}")
-
-    # Print summary per bucket
-    print(f"\nPer-bucket breakdown:")
-    for bk in buckets:
-        count = bucket_shard_idx[bk]
-        if count > 0:
-            print(f"  {bk[0]}x{bk[1]}: {count} file(s)")
 
 
 if __name__ == "__main__":
