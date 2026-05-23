@@ -137,6 +137,8 @@ def main():
                         help="VAE encoding batch size (VRAM dependent)")
     parser.add_argument("--vae_model", type=str, default="fal/FLUX.2-Tiny-AutoEncoder",
                         help="HuggingFace model ID for the Tiny VAE")
+    parser.add_argument("--use_standard_vae", action="store_true",
+                        help="Use standard FLUX.2 VAE instead of Tiny VAE")
     parser.add_argument("--stats_path", type=str, default="vae_stats.pt",
                         help="Path to vae_stats.pt for latent normalization")
     args = parser.parse_args()
@@ -145,10 +147,17 @@ def main():
     print(f"Device: {device}")
 
     # ── Load VAE ────────────────────────────────────────────────────────────
-    from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
-
-    print(f"Loading Tiny VAE from {args.vae_model}...")
-    vae = Flux2TinyAutoEncoder.from_pretrained(args.vae_model)
+    if args.use_standard_vae:
+        from diffusers import AutoencoderKLFlux2
+        print("Loading Standard FLUX.2 VAE...")
+        vae = AutoencoderKLFlux2.from_pretrained(
+            "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+        )
+    else:
+        from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
+        print(f"Loading Tiny VAE from {args.vae_model}...")
+        vae = Flux2TinyAutoEncoder.from_pretrained(args.vae_model)
+        
     vae = vae.to(device=device, dtype=torch.bfloat16).eval()
 
     # ── Load normalization stats ────────────────────────────────────────────
@@ -198,8 +207,14 @@ def main():
             batch = batch.to(device=device, dtype=torch.bfloat16)
 
             with torch.no_grad():
-                out = vae.encode(batch, return_dict=False)
-                latents = out[0] if isinstance(out, tuple) else out
+                if args.use_standard_vae:
+                    import torch.nn.functional as F
+                    latents = vae.encode(batch).latent_dist.mode()
+                    # Reshape to 128ch for normalization since stats are in 2x2 patch format
+                    latents = F.pixel_unshuffle(latents, 2)
+                else:
+                    out = vae.encode(batch, return_dict=False)
+                    latents = out[0] if isinstance(out, tuple) else out
 
                 if latents_mean is not None and latents_std is not None:
                     latents = (latents - latents_mean) / latents_std

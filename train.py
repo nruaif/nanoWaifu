@@ -378,8 +378,7 @@ def train(config_path):
             # VAE Encoding
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
-                if latents_mean is not None and latents_std is not None:
-                    latents = (latents - latents_mean) / latents_std
+                # Note: latents are already normalized by cache_latents.py
                 inputs = F.pixel_shuffle(latents, 2)
             elif use_tiny_vae:
                 images = images.to(device, memory_format=torch.channels_last)
