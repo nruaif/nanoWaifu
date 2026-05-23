@@ -169,7 +169,6 @@ def train(config_path):
     in_channels = config['model'].get('in_channels', 3)
 
     if use_vae or use_tiny_vae:
-        import os
         stats_path = "vae_stats.pt"
         if os.path.exists(stats_path):
             print(f">>> Loading VAE normalization stats from {stats_path}...")

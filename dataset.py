@@ -291,8 +291,12 @@ class WDSLoader:
         try:
             # ── Fast path for Cached Latents ──
             if "latent.npy" in sample:
-                latent = sample["latent.npy"]
-                latent = torch.from_numpy(latent).to(dtype=torch.bfloat16)
+                latent_data = sample["latent.npy"]
+                if isinstance(latent_data, bytes):
+                    import io
+                    import numpy as np
+                    latent_data = np.load(io.BytesIO(latent_data))
+                latent = torch.from_numpy(latent_data).to(dtype=torch.bfloat16)
                 prompt = ""
                 if "prompt.txt" in sample:
                     prompt = sample["prompt.txt"]

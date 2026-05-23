@@ -19,6 +19,8 @@ import json
 import math
 import os
 import time
+import glob
+import uuid
 
 import numpy as np
 import torch
@@ -141,6 +143,8 @@ def main():
                         help="Use standard FLUX.2 VAE instead of Tiny VAE")
     parser.add_argument("--stats_path", type=str, default="vae_stats.pt",
                         help="Path to vae_stats.pt for latent normalization")
+    parser.add_argument("--num_workers", type=int, default=16,
+                        help="Number of CPU workers for image decoding")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -179,8 +183,24 @@ def main():
     bucket_data = {b: {"tensors": [], "prompts": []} for b in buckets}
 
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Auto-resume shard indexing
+    existing_shards = glob.glob(os.path.join(args.output_dir, "latents-*.tar"))
+    start_shard = 0
+    if existing_shards:
+        indices = []
+        for f in existing_shards:
+            try:
+                idx = int(os.path.basename(f).split('-')[1].split('.')[0])
+                indices.append(idx)
+            except Exception:
+                pass
+        if indices:
+            start_shard = max(indices) + 1
+            print(f"Found {len(indices)} existing shards. Continuing at shard index {start_shard}...")
+
     pattern = os.path.join(args.output_dir, "latents-%05d.tar")
-    writer = wds.ShardWriter(pattern, maxsize=10**9) # 1GB shards
+    writer = wds.ShardWriter(pattern, maxsize=10**9, start_shard=start_shard) # 1GB shards
 
     # ── Encode and flush a full bucket ──────────────────────────────────────
     total_files_written = 0
@@ -226,7 +246,7 @@ def main():
         # Save to ShardWriter
         for idx in range(n):
             writer.write({
-                "__key__": f"{total_samples + idx:09d}",
+                "__key__": uuid.uuid4().hex,
                 "latent.npy": stacked[idx],
                 "prompt.txt": prompts[idx]
             })
@@ -238,17 +258,7 @@ def main():
         data["tensors"].clear()
         data["prompts"].clear()
 
-    # ── Open source dataset ─────────────────────────────────────────────────
-    dataset = (
-        wds.WebDataset(args.input, handler=wds.warn_and_continue)
-        .decode("pil", handler=wds.warn_and_continue)
-    )
-
-    t0 = time.time()
-    skipped = 0
-    print("\nProcessing images...\n")
-
-    for sample in tqdm(dataset, desc="Reading", unit="img"):
+    def process_sample(sample):
         # Find image
         image = None
         for ext in ["jpg", "png", "webp", "jpeg"]:
@@ -257,8 +267,7 @@ def main():
                 break
 
         if image is None or not isinstance(image, Image.Image):
-            skipped += 1
-            continue
+            return None
 
         image = image.convert("RGB")
         w, h = image.size
@@ -267,12 +276,51 @@ def main():
 
         try:
             tensor = preprocess_image(image, target_h, target_w)
-        except Exception as e:
-            print(f"  Skipping {sample.get('__key__', '?')}: {e}")
-            skipped += 1
-            continue
+        except Exception:
+            return None
 
         prompt = extract_prompt(sample)
+        return {
+            "bucket_key": bucket_key,
+            "tensor": tensor,
+            "prompt": prompt
+        }
+
+    # ── Open source dataset ─────────────────────────────────────────────────
+    dataset = (
+        wds.WebDataset(
+            args.input,
+            nodesplitter=wds.split_by_node,
+            workersplitter=wds.split_by_worker,
+            handler=wds.warn_and_continue
+        )
+        .decode("pil", handler=wds.warn_and_continue)
+        .map(process_sample, handler=wds.warn_and_continue)
+        .select(lambda x: x is not None)
+    )
+
+    if args.num_workers > 0:
+        loader = wds.WebLoader(
+            dataset,
+            batch_size=None,
+            num_workers=args.num_workers,
+            prefetch_factor=4
+        )
+    else:
+        loader = dataset
+
+    t0 = time.time()
+    print("\nProcessing images...\n")
+
+    for sample in tqdm(loader, desc="Reading", unit="img"):
+        bucket_key = sample["bucket_key"]
+        # Handle potential tuple->list conversion from multiprocessing boundary
+        if isinstance(bucket_key, list):
+            bucket_key = tuple(bucket_key)
+
+        tensor = sample["tensor"]
+        prompt = sample["prompt"]
+
         bucket_data[bucket_key]["tensors"].append(tensor)
         bucket_data[bucket_key]["prompts"].append(prompt)
 
@@ -290,7 +338,6 @@ def main():
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
     print(f"Done!  {total_samples} latents written to tar shards.")
-    print(f"Skipped: {skipped}")
     print(f"Time: {elapsed:.1f}s  ({total_samples / max(elapsed, 1):.1f} img/s)")
     print(f"Output: {args.output_dir}")
 
