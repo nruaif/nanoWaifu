@@ -410,7 +410,7 @@ def train(config_path):
                 return torch.sigmoid(m_loc + s_scale * eps)
 
             # Global Logit-Normal Timestep Sampler
-            t = sample_logit_normal(m_loc=0.0, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
+            t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
 
             t_reshaped = t.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)

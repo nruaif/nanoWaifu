@@ -131,7 +131,13 @@ def main():
         # --- DiT Training ---
         model_dit.train()
         B, C, H, W = latents.shape
-        t = torch.rand((B, ), device=device)
+
+        def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
+            eps = torch.randn(bs, device=device, dtype=dtype)
+            return torch.sigmoid(m_loc + s_scale * eps)
+
+        # Global Logit-Normal Timestep Sampler
+        t = sample_logit_normal(m_loc=-0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
         t_reshaped = t.view(B, 1, 1, 1)
         noise = torch.randn_like(latents)
         
