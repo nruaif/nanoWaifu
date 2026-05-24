@@ -748,7 +748,7 @@ if __name__ == "__main__":
         in_channels=32,
         dim=512,
         num_heads=8,
-        num_classes=100,
+        num_classes=1000,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
