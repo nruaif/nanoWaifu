@@ -300,7 +300,7 @@ class WDSLoader:
                     prompt = sample["prompt.txt"]
                     if isinstance(prompt, bytes):
                         prompt = prompt.decode("utf-8")
-                
+
                 return {
                     "image": latent,  # named 'image' to seamlessly pass through bucket_batch
                     "prompt": prompt,
