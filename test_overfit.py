@@ -132,14 +132,17 @@ def main():
         model_dit.train()
         B, C, H, W = latents.shape
         t = torch.rand((B, ), device=device)
+        t2 = t + torch.rand((B, ), device=device) * (1 - t)
         t_reshaped = t.view(B, 1, 1, 1)
+        t2_reshaped = t2.view(B, 1, 1, 1)
         noise = torch.randn_like(latents)
         
         # DiT uses (1-t)*x + t*noise
         xt_dit = (1 - t_reshaped) * latents + t_reshaped * noise
+        xt2_dit = (1 - t2_reshaped) * latents + t2_reshaped * noise
         v_target = noise - latents
         
-        v_pred, match_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True)
+        v_pred, match_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True, xt2=xt2_dit, t2=t2)
         loss_dit = F.mse_loss(v_pred, v_target)
         
         total_loss = loss_dit + 0.2 * match_loss

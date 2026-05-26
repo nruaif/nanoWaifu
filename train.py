@@ -58,7 +58,7 @@ def cleanup_ddp():
 def cleanup_checkpoints(output_dir, max_checkpoints, rank):
     if rank != 0:
         return
-    max_checkpoints = 16
+    max_checkpoints = 3
     checkpoints = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
     checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
     if len(checkpoints) > max_checkpoints:
@@ -141,7 +141,7 @@ def train(config_path):
     use_cached_latents = config['data'].get('use_cached_latents', False)
     if use_cached_latents:
         print(f">>> Using Cached Latents mode (loading pre-computed latents from {config['data']['cache_dir']})...")
-        url = os.path.join(config['data']['cache_dir'], "*.tar")
+        url = config['data']['cache_dir']
         wds_loader = WDSLoader(
             url=url,
             csv_path=config['data'].get('csv_path'),
@@ -169,7 +169,6 @@ def train(config_path):
     in_channels = config['model'].get('in_channels', 3)
 
     if use_vae or use_tiny_vae:
-        import os
         stats_path = "vae_stats.pt"
         if os.path.exists(stats_path):
             print(f">>> Loading VAE normalization stats from {stats_path}...")
@@ -224,7 +223,7 @@ def train(config_path):
                                                                                                         16)
 
     model = ModelClass(
-        in_channels=in_channels,
+        in_channels=128,
         dim=config['model'].get('fcdm_dim', 768),
         depth=config['model'].get('fcdm_depth', 12),
         num_heads=config['model'].get('num_heads', 12),
@@ -281,6 +280,7 @@ def train(config_path):
     # Reference to the unwrapped model for accessing k-diff parameters
     model_raw = model.module if hasattr(model, 'module') else model
 
+
     # Mock Optimizers for safety if file is missing locally
     try:
         from adv_optm import Muon_adv as NorMuon
@@ -336,7 +336,7 @@ def train(config_path):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                #optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
@@ -375,7 +375,7 @@ def train(config_path):
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
                 # Note: latents are already normalized by cache_latents.py
-                inputs = F.pixel_shuffle(latents, 2)
+                inputs = latents
             elif use_tiny_vae:
                 images = images.to(device, memory_format=torch.channels_last)
                 with torch.no_grad():
@@ -409,20 +409,27 @@ def train(config_path):
             def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
                 eps = torch.randn(bs, device=device, dtype=dtype)
                 return torch.sigmoid(m_loc + s_scale * eps)
-
+            def sample_uniform(bs, device, dtype):
+                return torch.rand(bs, device=device, dtype=dtype)
             # Global Logit-Normal Timestep Sampler
-            t = sample_logit_normal(m_loc=0.0, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
+            #t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
+            t = sample_uniform(bs=B, device=device, dtype=torch.bfloat16)
+            t2 = t + sample_uniform(bs=B, device=device, dtype=torch.bfloat16) * (1 - t)
 
             t_reshaped = t.view(B, 1, 1, 1)
+            t2_reshaped = t2.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
+            xt2 = (1 - t2_reshaped) * inputs + t2_reshaped * noise
 
             # --- Training Augmentations (each applied independently w/ 50% chance) ---
             # 1. Gaussian noise injection to xt to simulate drift during inference
             noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
             if noise_inject_ratio > 0:
                 noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                xt = xt + noise_mask * noise_inject_ratio * torch.randn_like(xt)
+                noise_injection = torch.randn_like(xt)
+                xt = xt + noise_mask * noise_inject_ratio * noise_injection
+                xt2 = xt2 + noise_mask * noise_inject_ratio * noise_injection
 
             # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
             #    from a different clean sample to simulate mean-seeking drift
@@ -431,20 +438,24 @@ def train(config_path):
                 cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
                 inputs_neg = inputs.roll(shifts=1, dims=0)
                 noise_neg = torch.randn_like(inputs)
+                
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
+                
+                xt2_neg = (1 - t2_reshaped) * inputs_neg + t2_reshaped * noise_neg
+                xt2 = xt2 + cross_mask * cross_ratio * (xt2_neg - xt2)
 
             # Model outputs direct v-prediction and layer match loss
             v_pred, match_loss = model(xt, t, y_indices, y_offsets,
-                                       return_layer_match=True)
+                                       return_layer_match=True, xt2=xt2, t2=t2)
 
             # Compute velocity-space loss (flow matching target: noise - inputs)
             v_target = noise - inputs
-            loss = F.mse_loss(v_pred, v_target) 
+            loss = F.mse_loss(v_pred, v_target)  + 0.2 * match_loss
 
             loss = loss / accum_steps
             loss.backward()
-            loss_accum += loss.item()
+            loss_accum += F.mse_loss(v_pred, v_target).item()
             match_loss_accum += match_loss.item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -490,7 +501,8 @@ def train(config_path):
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
                         # Reverse: f8 32ch → f16 128ch → un-normalize → decode
-                        latents = F.pixel_unshuffle(samples, 2)
+                        #latents = F.pixel_unshuffle(samples, 2)
+                        
                         latents = latents * latents_std + latents_mean
                         out = vae.decode(latents, return_dict=False)
                         recon = out[0] if isinstance(out, tuple) else out
@@ -500,7 +512,8 @@ def train(config_path):
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
                         # Reverse: f8 32ch → f16 128ch → un-normalize → f8 32ch → decode
-                        latents = F.pixel_unshuffle(samples, 2)
+                        #latents = F.pixel_unshuffle(samples, 2)
+                        latents = samples
                         latents = latents * latents_std + latents_mean
                         latents = F.pixel_shuffle(latents, 2)
                         recon = vae.decode(latents).sample

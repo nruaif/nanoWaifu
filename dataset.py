@@ -267,8 +267,8 @@ class WDSLoader:
             h = int(math.sqrt(target_area / ar))
             w = int(h * ar)
             # Round to nearest multiple of 16 for FCDM/MAR/Patching compatibility
-            h = (h // 16) * 16
-            w = (w // 16) * 16
+            h = (h // 32) * 32
+            w = (w // 32) * 32
             if h > 0 and w > 0:
                 self.buckets.append((h, w))
 
@@ -291,8 +291,10 @@ class WDSLoader:
         try:
             # ── Fast path for Cached Latents ──
             if "latent.npy" in sample:
-                latent = sample["latent.npy"]
-                latent = torch.from_numpy(latent).to(dtype=torch.bfloat16)
+                latent_data = sample["latent.npy"]
+                if isinstance(latent_data, bytes):
+                    latent_data = np.load(io.BytesIO(latent_data))
+                latent = torch.from_numpy(latent_data).to(dtype=torch.bfloat16)
                 prompt = ""
                 if "prompt.txt" in sample:
                     prompt = sample["prompt.txt"]
