@@ -74,6 +74,25 @@ class SwiGLUMlp(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+class SwiGLUMlpWithDWConv(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int):
+        super().__init__()
+        hidden_dim = (hidden_features + 7) // 8 * 8
+        self.w1 = nn.Linear(in_features, hidden_dim, bias=False)
+        self.w3 = nn.Linear(in_features, hidden_dim, bias=False)
+        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, in_features, bias=False)
+
+    def forward(self, x, h, w):
+        hidden = F.silu(self.w1(x)) * self.w3(x)
+        b, n, c = hidden.shape
+        hidden = hidden.transpose(1, 2).reshape(b, c, h, w)
+        hidden = hidden + self.dwconv(hidden)
+        hidden = hidden.reshape(b, c, n).transpose(1, 2)
+        return self.w2(hidden)
+
+
+
 class TextRotaryEmbedding1D(nn.Module):
     def __init__(self, head_dim: int, theta: float = 10000.0):
         super().__init__()
@@ -174,7 +193,7 @@ class DoubleStreamDiTBlock(nn.Module):
         self.rope = MultiModalRotaryEmbeddingFast(head_dim)
         self.img_attn_proj = nn.Linear(inner_dim, hidden_size)
         self.txt_attn_proj = nn.Linear(inner_dim, txt_hidden_size)
-        self.img_mlp = SwiGLUMlp(hidden_size, int(hidden_size * mlp_ratio))
+        self.img_mlp = SwiGLUMlpWithDWConv(hidden_size, int(hidden_size * mlp_ratio))
         self.txt_mlp = SwiGLUMlp(txt_hidden_size, int(txt_hidden_size * mlp_ratio))
 
     def forward(self, x, txt, vec, h, w):
@@ -195,7 +214,7 @@ class DoubleStreamDiTBlock(nn.Module):
         out = torch.einsum("bhqk,bkhd->bqhd", attn.softmax(dim=-1), v)
         x = x + self.img_attn_proj(out[:, lt:].reshape(b, li, -1))
         txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, -1))
-        x = x + self.img_mlp(self.img_norm2(x))
+        x = x + self.img_mlp(self.img_norm2(x), h, w)
         txt = txt + self.txt_mlp(self.txt_norm2(txt))
         return x, txt
 
