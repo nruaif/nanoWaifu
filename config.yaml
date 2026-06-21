@@ -9,7 +9,7 @@ training:
   log_every_steps: 10
 
   save_image_every_steps: 5000
-  image_size: 256
+  image_size: 512
   num_workers: 4
   class_dropout_prob: 0.1
   cfg_scale: 4
@@ -25,7 +25,7 @@ training:
 
 model:
   type: "dit"      # Use TokenformerDiT
-  use_vae: true    # Recommended for 256x256
+  use_vae: false    # MiniT2I uses RGB directly
   use_tiny_vae: false
   fcdm_dim: 1024    # Hidden dimension (FCDM-L: 512, depth=[2,4,8,4,2] hardcoded)
   fcdm_depth: 16   # Legacy — depth is now hardcoded as [2,4,8,4,2] in model

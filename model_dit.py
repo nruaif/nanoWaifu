@@ -51,7 +51,21 @@ class MiniT2IWrapper(nn.Module):
                 custom_pipeline=model_id, 
                 trust_remote_code=True
             )
-            self.transformer = pipe.transformer
+            if hasattr(pipe, 'transformer'):
+                self.transformer = pipe.transformer
+            elif hasattr(pipe, 'unet'):
+                self.transformer = pipe.unet
+            elif hasattr(pipe, 'model'):
+                self.transformer = pipe.model
+            else:
+                self.transformer = None
+                for name, comp in pipe.components.items():
+                    if hasattr(comp, 'mmjit_config') or hasattr(comp, 'cfg'):
+                        self.transformer = comp
+                        break
+                if self.transformer is None:
+                    raise RuntimeError(f"Could not find the MMJiT transformer component in the pipeline. Available components: {list(pipe.components.keys())}")
+                
             del pipe
         
         if hasattr(self.transformer, "mmjit_config"):
