@@ -313,6 +313,9 @@ def train(config_path):
 
                     samples = samples.to(dtype=torch.float32)
 
+                    # Denormalize from [-1, 1] to [0, 1] for display
+                    samples = (samples * 0.5 + 0.5).clamp(0, 1)
+
                     grid = make_grid(samples, nrow=4)
                     wandb.log({
                         "val/samples": wandb.Image(grid, caption=f"Step {global_step}")
