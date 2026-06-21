@@ -38,7 +38,7 @@ def test():
     
     # Dummy data
     B = 2
-    images = torch.randn(B, 3, 64, 64, device=device)
+    images = torch.randn(B, 3, 64, 128, device=device)
     t = torch.rand(B, device=device)
     
     # Dummy tags: 3 tags for first image, 2 tags for second
@@ -58,7 +58,7 @@ def test():
     print("Running generation (sample)...")
     wrapper.eval()
     with torch.no_grad():
-        samples = wrapper.sample(y_indices, y_offsets, image_size=64, num_inference_steps=2)
+        samples = wrapper.sample(y_indices, y_offsets, image_height=64, image_width=128, num_inference_steps=2)
     print(f"Sample generation successful. Output shape: {samples.shape}")
     
     print("All tests passed successfully!")

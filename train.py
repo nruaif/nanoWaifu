@@ -341,7 +341,8 @@ def train(config_path):
                     samples = model_raw.sample(
                         y_indices_fixed, 
                         y_offsets_fixed, 
-                        image_size=config['training']['image_size'],
+                        image_height=config['training']['image_size'],
+                        image_width=config['training']['image_size'],
                         cfg_scale=config['training'].get('cfg_scale', 6.0),
                         generator=torch.Generator(device=device).manual_seed(42),
                         num_inference_steps=min(config['training'].get('n_T', 50), 50)

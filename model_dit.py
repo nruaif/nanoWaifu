@@ -38,35 +38,30 @@ class MiniT2IWrapper(nn.Module):
         if transformer is not None:
             self.transformer = transformer
         else:
-            from diffusers import DiffusionPipeline
+            import sys
             import os
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
             
-            # Set env variables for transformers just in case
-            os.environ["USE_FLAX"] = "0"
-            os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+            diffusers_dir = os.path.join(os.path.dirname(__file__), 'minit2i-torch', 'diffusers')
+            if diffusers_dir not in sys.path:
+                sys.path.append(diffusers_dir)
+            from mmdit import DiffusionModel, MMJiTConfig
             
-            print(f">>> Loading {model_id} from Hugging Face...")
-            pipe = DiffusionPipeline.from_pretrained(
-                model_id, 
-                custom_pipeline=model_id, 
-                trust_remote_code=True
-            )
-            if hasattr(pipe, 'transformer'):
-                self.transformer = pipe.transformer
-            elif hasattr(pipe, 'unet'):
-                self.transformer = pipe.unet
-            elif hasattr(pipe, 'model'):
-                self.transformer = pipe.model
-            else:
-                self.transformer = None
-                for name, comp in pipe.components.items():
-                    if hasattr(comp, 'mmjit_config') or hasattr(comp, 'cfg'):
-                        self.transformer = comp
-                        break
-                if self.transformer is None:
-                    raise RuntimeError(f"Could not find the MMJiT transformer component in the pipeline. Available components: {list(pipe.components.keys())}")
-                
-            del pipe
+            print(f">>> Loading {model_id} via huggingface_hub...")
+            ckpt_path = hf_hub_download(repo_id=model_id, filename="minit2i-b-16/transformer/diffusion_pytorch_model.safetensors")
+            
+            cfg = MMJiTConfig()
+            self.transformer = DiffusionModel(cfg)
+            
+            state_dict = load_file(ckpt_path)
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("model."):
+                    new_state_dict[k[6:]] = v
+                else:
+                    new_state_dict[k] = v
+            self.transformer.load_state_dict(new_state_dict, strict=False)
         
         if hasattr(self.transformer, "mmjit_config"):
             t5_hidden_size = self.transformer.mmjit_config.txt_input_size
@@ -107,7 +102,7 @@ class MiniT2IWrapper(nn.Module):
             return v_pred, match_loss
         return v_pred
 
-    def sample(self, y_indices, y_offsets, image_size=512, cfg_scale=6.0, generator=None, num_inference_steps=100):
+    def sample(self, y_indices, y_offsets, image_height=512, image_width=512, cfg_scale=6.0, generator=None, num_inference_steps=100):
         B = len(y_offsets)
         device = y_indices.device
         dtype = next(self.transformer.parameters()).dtype
@@ -138,7 +133,7 @@ class MiniT2IWrapper(nn.Module):
         
         try:
             images = self.transformer.sample(
-                context, attn_mask, cfg_scale=cfg_scale, generator=generator, progress=False
+                context, attn_mask, image_height=image_height, image_width=image_width, cfg_scale=cfg_scale, generator=generator, progress=False
             )
         finally:
             if hasattr(self.transformer, "mmjit_config"):
