@@ -187,56 +187,19 @@ def train(config_path):
 
     model_raw = model.module if hasattr(model, 'module') else model
 
-    try:
-        from adv_optm import Muon_adv as NorMuon
-        from adv_optm import AdamW_adv as DionAdamW
-    except ImportError:
-        print("Warning: Advanced optimizers missing, falling back to torch.optim.AdamW")
-        NorMuon, DionAdamW = torch.optim.AdamW, torch.optim.AdamW
-
-    adamw_params, normuon_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        is_1d = p.ndim <= 1
-        is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
-        is_embedding = ('embed' in name or isinstance(p, torch.nn.Embedding)
-                        or isinstance(p, torch.nn.EmbeddingBag) or 'token_embed' in name)
-        if is_1d or is_dwconv or is_embedding:
-            adamw_params.append(p)
-        else:
-            normuon_params.append(p)
-
-    try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95), cautious_wd=True)
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0.1, cautious_wd=True, normuon_variant=True)
-    except Exception:
-        opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
-        opt_normuon = torch.optim.AdamW(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
-
-    class DualOptimizer:
-        def __init__(self, opt1, opt2):
-            self.opt1 = opt1
-            self.opt2 = opt2
-        def step(self):
-            self.opt1.step()
-            self.opt2.step()
-        def zero_grad(self, set_to_none=True):
-            self.opt1.zero_grad(set_to_none)
-            self.opt2.zero_grad(set_to_none)
-        def state_dict(self):
-            return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
-        def load_state_dict(self, state):
-            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
-            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
-
-    optimizer = DualOptimizer(opt_adamw, opt_normuon)
+    # Single Optimizer Setup
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config['training']['learning_rate'], 
+        betas=(0.9, 0.95),
+        weight_decay=0.01
+    )
 
     if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
