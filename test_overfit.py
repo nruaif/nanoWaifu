@@ -112,7 +112,6 @@ def main():
     NUM_CLASSES = 8
     model_dit = TokenformerDiT(
         in_channels=32,
-        dim=64,
         num_classes=NUM_CLASSES,
     ).to(device)
 
@@ -140,12 +139,36 @@ def main():
         # DiT uses (1-t)*x + t*noise
         xt_dit = (1 - t_reshaped) * latents + t_reshaped * noise
         xt2_dit = (1 - t2_reshaped) * latents + t2_reshaped * noise
+        
+        # --- Training Augmentations (each applied independently w/ 50% chance) ---
+        # 1. Gaussian noise injection to xt to simulate drift during inference
+        noise_inject_ratio = 0.1
+        if noise_inject_ratio > 0:
+            noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt_dit.dtype)
+            noise_injection = torch.randn_like(xt_dit)
+            xt_dit = xt_dit + noise_mask * noise_inject_ratio * noise_injection
+            xt2_dit = xt2_dit + noise_mask * noise_inject_ratio * noise_injection
+
+        # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
+        #    from a different clean sample to simulate mean-seeking drift
+        cross_ratio = 0.1
+        if cross_ratio > 0:
+            cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt_dit.dtype)
+            latents_neg = latents.roll(shifts=1, dims=0)
+            noise_neg = torch.randn_like(latents)
+            
+            xt_neg = (1 - t_reshaped) * latents_neg + t_reshaped * noise_neg
+            xt_dit = xt_dit + cross_mask * cross_ratio * (xt_neg - xt_dit)
+            
+            xt2_neg = (1 - t2_reshaped) * latents_neg + t2_reshaped * noise_neg
+            xt2_dit = xt2_dit + cross_mask * cross_ratio * (xt2_neg - xt2_dit)
+
         v_target = noise - latents
         
         v_pred, match_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True, xt2=xt2_dit, t2=t2)
         loss_dit = F.mse_loss(v_pred, v_target)
         
-        total_loss = loss_dit + 0.2 * match_loss
+        total_loss = loss_dit + 0.1 * match_loss
         
         opt_dit.zero_grad()
         total_loss.backward()
