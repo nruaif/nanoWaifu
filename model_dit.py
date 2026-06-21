@@ -43,9 +43,9 @@ class MiniT2IWrapper(nn.Module):
             from huggingface_hub import hf_hub_download
             from safetensors.torch import load_file
             
-            diffusers_dir = os.path.join(os.path.dirname(__file__), 'minit2i-torch', 'diffusers')
+            diffusers_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'minit2i-torch', 'diffusers')
             if diffusers_dir not in sys.path:
-                sys.path.append(diffusers_dir)
+                sys.path.insert(0, diffusers_dir)
             from mmdit import DiffusionModel, MMJiTConfig
             
             print(f">>> Loading {model_id} via huggingface_hub...")
