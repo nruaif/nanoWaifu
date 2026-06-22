@@ -8,16 +8,16 @@ training:
   compile: false
   log_every_steps: 10
   save_image_every_steps: 5000
-  image_size: 512
+  image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
-  cfg_scale: 6.0
+  cfg_scale: 2.0
   output_dir: "outputs_dit"
   wandb_project: "nanoWaifu-MiniT2I"
   resume_from: "outputs_dit/"
   max_checkpoints: 16
 
 data:
-  cache_dir: '/workspace/down/latents-000{00..66}.tar'
+  cache_dir: '/root/data/train/000{01..99}.tar'
   use_cached_latents: true
   use_advanced_captions: true
