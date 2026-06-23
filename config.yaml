@@ -1,5 +1,5 @@
 training:
-  batch_size: 128
+  batch_size: 64
   grad_accum_steps: 1
   learning_rate: 1.0e-4
   num_epochs: 100
@@ -8,7 +8,7 @@ training:
   compile: false
   log_every_steps: 10
 
-  save_image_every_steps: 5000
+  save_image_every_steps: 2000
   image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
@@ -38,7 +38,7 @@ model:
   lambda_nll: 0.01 # Weight for the difficulty-aware NLL loss
 
 data:
-  cache_dir: '/workspace/down/latents-000{00..66}.tar'
+  cache_dir: '/workspace/nanoWaifu/cached_latents/latents-000{00..66}.tar'
   use_cached_latents: true
 
   use_advanced_captions: true

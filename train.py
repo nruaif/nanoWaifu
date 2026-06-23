@@ -263,7 +263,7 @@ def train(config_path):
 
             model_to_load.load_state_dict(state_dict, strict=False)
             # FIX: removed the arbitrary - 10 offset
-            global_step = checkpoint["global_step"]
+            global_step = checkpoint["global_step"] - 10
 
             if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
                 fixed_noise = checkpoint["fixed_noise"].to(device)
@@ -276,10 +276,9 @@ def train(config_path):
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
         model = torch.compile(model, mode="max-autotune")
-
+    # model.compile()
     # Reference to the unwrapped model for accessing k-diff parameters
     model_raw = model.module if hasattr(model, 'module') else model
-
 
     # Mock Optimizers for safety if file is missing locally
     try:
@@ -303,8 +302,10 @@ def train(config_path):
             normuon_params.append(p)
 
     try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95), cautious_wd=True)
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0.1, cautious_wd=True, normuon_variant=True)
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95),
+                              cautious_wd=True)
+        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0.1,
+                              cautious_wd=True, normuon_variant=True)
     except Exception:
         opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
         opt_normuon = torch.optim.AdamW(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
@@ -336,7 +337,7 @@ def train(config_path):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                #optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
@@ -375,6 +376,7 @@ def train(config_path):
             # VAE Encoding
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
+                # latents = (latents - latents_mean) / latents_std
                 # Note: latents are already normalized by cache_latents.py
                 inputs = latents
             elif use_tiny_vae:
@@ -410,10 +412,12 @@ def train(config_path):
             def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
                 eps = torch.randn(bs, device=device, dtype=dtype)
                 return torch.sigmoid(m_loc + s_scale * eps)
+
             def sample_uniform(bs, device, dtype):
                 return torch.rand(bs, device=device, dtype=dtype)
+
             # Global Logit-Normal Timestep Sampler
-            #t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
+            # t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
             t = sample_uniform(bs=B, device=device, dtype=torch.bfloat16)
             t2 = t + sample_uniform(bs=B, device=device, dtype=torch.bfloat16) * (1 - t)
 
@@ -439,10 +443,10 @@ def train(config_path):
                 cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
                 inputs_neg = inputs.roll(shifts=1, dims=0)
                 noise_neg = torch.randn_like(inputs)
-                
+
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
-                
+
                 xt2_neg = (1 - t2_reshaped) * inputs_neg + t2_reshaped * noise_neg
                 xt2 = xt2 + cross_mask * cross_ratio * (xt2_neg - xt2)
 
@@ -452,7 +456,7 @@ def train(config_path):
 
             # Compute velocity-space loss (flow matching target: noise - inputs)
             v_target = noise - inputs
-            loss = F.mse_loss(v_pred, v_target)  + 0.2 * match_loss
+            loss = F.mse_loss(v_pred, v_target) + 0.2 * match_loss
 
             loss = loss / accum_steps
             loss.backward()
@@ -502,8 +506,8 @@ def train(config_path):
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
                         # Un-normalize 128ch latents → decode with tiny VAE
-                        latents = samples * latents_std + latents_mean
-                        out = vae.decode(latents, return_dict=False)
+                        # latents = samples * latents_std + latents_mean
+                        out = vae.decode(samples, return_dict=False)
                         recon = out[0] if isinstance(out, tuple) else out
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
@@ -511,8 +515,8 @@ def train(config_path):
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
                         # Un-normalize 128ch → pixel_shuffle to 32ch → decode with standard VAE
-                        latents = samples * latents_std + latents_mean
-                        latents = F.pixel_shuffle(latents, 2)
+                        # latents = samples * latents_std + latents_mean
+                        latents = F.pixel_shuffle(samples, 2)
                         recon = vae.decode(latents).sample
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
