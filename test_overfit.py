@@ -113,6 +113,7 @@ def main():
     model_dit = TokenformerDiT(
         in_channels=32,
         dim=64,
+        num_heads=8,
         num_classes=NUM_CLASSES,
     ).to(device)
 
@@ -132,27 +133,24 @@ def main():
         model_dit.train()
         B, C, H, W = latents.shape
         t = torch.rand((B, ), device=device)
-        t2 = t + torch.rand((B, ), device=device) * (1 - t)
         t_reshaped = t.view(B, 1, 1, 1)
-        t2_reshaped = t2.view(B, 1, 1, 1)
         noise = torch.randn_like(latents)
         
         # DiT uses (1-t)*x + t*noise
         xt_dit = (1 - t_reshaped) * latents + t_reshaped * noise
-        xt2_dit = (1 - t2_reshaped) * latents + t2_reshaped * noise
         v_target = noise - latents
         
-        v_pred, match_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True, xt2=xt2_dit, t2=t2)
+        v_pred, infonce_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True)
         loss_dit = F.mse_loss(v_pred, v_target)
         
-        total_loss = loss_dit + 0.2 * match_loss
+        total_loss = loss_dit + 0.2 * infonce_loss
         
         opt_dit.zero_grad()
         total_loss.backward()
         opt_dit.step()
 
         if i % 50 == 0:
-            print(f"Step {i:4d} | DiT Loss: {loss_dit.item():.6f} | Match Loss: {match_loss.item():.6f}")
+            print(f"Step {i:4d} | DiT Loss: {loss_dit.item():.6f} | InfoNCE Loss: {infonce_loss.item():.6f}")
             
             # --- Sampling and Logging ---
             model_dit.eval()

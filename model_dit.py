@@ -378,7 +378,7 @@ class TokenformerDiT(nn.Module):
         nn.init.zeros_(self.final_modulation[1].bias)
 
     def forward(self, x_in, t, y_indices, y_offsets=None, return_features=False,
-                return_layer_match=False, xt2=None, t2=None, **kwargs):
+                return_layer_match=False, **kwargs):
         B, C, H, W = x_in.shape
         N = H * W
         
@@ -399,81 +399,72 @@ class TokenformerDiT(nn.Module):
         y_emb = y_embed.unsqueeze(1)  # [B, 1, dim]
 
         # 5. Conditioning Vector
-        c = t_emb + y_emb  # [B, 1, dim]
+        c_full = t_emb + y_emb  # [B, 1, dim]
+        c_time_only = t_emb     # [B, 1, dim]
 
         # 6. Process through DiTBlock sequence
-        x4 = None
-        x12 = None
+        cls4 = None
+        cls11 = None
         qkv_res = None
         for idx, block in enumerate(self.blocks):
+            # Condition first 4 blocks (idx 0, 1, 2, 3) with timestep only
+            c = c_time_only if idx < 4 else c_full
+            
             if self.use_checkpoint and self.training:
                 x, qkv_res = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens, None, qkv_res,
                                use_reentrant=False, context_fn=context_fn)
             else:
                 x, qkv_res = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens, qkv_res=qkv_res)
             
-            # Capture spatial-only features for layer match loss
-            if xt2 is None and t2 is None:
-                if idx == 3:  # Block 4
-                    x4 = x[:, self.num_cls_tokens:].clone()
+            # Capture CLS tokens for InfoNCE loss
+            if idx == 3:  # Block 4
+                cls4 = x[:, :self.num_cls_tokens].clone().reshape(B, -1)
             if idx == 11:  # Block 12
-                x12 = x[:, self.num_cls_tokens:].clone()
-
-        if return_layer_match and xt2 is not None and t2 is not None:
-            x2 = xt2.flatten(2).transpose(1, 2)
-            x2 = self.patch_embed(x2)
-            cls2 = self.cls_tokens.expand(B, -1, -1)
-            x2 = torch.cat([cls2, x2], dim=1)
-            t2_emb = self.t_embedder(t2).unsqueeze(1)
-            c2 = t2_emb + y_emb
-            qkv_res2 = None
-            for idx in range(4): # 0, 1, 2, 3 (up to block 4)
-                block = self.blocks[idx]
-                if self.use_checkpoint and self.training:
-                    x2, qkv_res2 = checkpoint(block, x2, c2, H, W, self.rope, self.num_cls_tokens, None, qkv_res2,
-                                   use_reentrant=False, context_fn=context_fn)
-                else:
-                    x2, qkv_res2 = block(x2, c2, H, W, self.rope, num_cls_tokens=self.num_cls_tokens, qkv_res=qkv_res2)
-                if idx == 3:
-                    x4 = x2[:, self.num_cls_tokens:].clone()
+                cls11 = x[:, :self.num_cls_tokens].clone().reshape(B, -1)
 
         # 7. Strip CLS tokens — only spatial tokens go through the final layer
         x = x[:, self.num_cls_tokens:]  # [B, N, dim]
 
         # 8. Final layer modulation
-        final_mod = self.final_modulation(c)  # [B, N, 2*dim] or [B, 1, 2*dim]
+        final_mod = self.final_modulation(c_full)  # [B, N, 2*dim] or [B, 1, 2*dim]
         shift, scale = final_mod.chunk(2, dim=-1)
         
         x_norm = self.final_norm(x)
         x_norm = x_norm * (1 + scale) + shift
         x_out = self.final_proj(x_norm)
 
-        # Project back to image spatial format
-        v_pred = x_out.transpose(1, 2).reshape(B, self.in_channels, H, W)
+        # Project back to image spatial format. The head predicts x0, then
+        # convert that x0 prediction to the velocity used by the sampler:
+        #   x_t = x0 + t * v  =>  v = (x_t - x0) / t
+        # Clamp t to avoid division instability near t=0.
+        x0_pred = x_out.transpose(1, 2).reshape(B, self.in_channels, H, W)
+        t_clamped = t.to(device=x0_pred.device, dtype=x0_pred.dtype).clamp(min=0.05)
+        t_clamped = t_clamped.view(B, *([1] * (x0_pred.ndim - 1)))
+        v_pred = (x_in.to(device=x0_pred.device, dtype=x0_pred.dtype) - x0_pred) / t_clamped
 
-        # 9. Layer match loss calculation (if requested)
-        match_loss = None
+        # 9. InfoNCE loss calculation (if requested)
+        infonce_loss = None
         if return_layer_match:
-            if x4 is None or x12 is None:
-                match_loss = torch.tensor(0.0, device=x.device)
+            if cls4 is None or cls11 is None:
+                infonce_loss = torch.tensor(0.0, device=x.device)
             else:
-                # x4 and x12 have shape [B, N, D] (spatial only)
-                x12_detached = x12.detach()
-                B_m, N_m, D_m = x4.shape
-                if D_m % 64 == 0:
-                    x4_reshaped = x4.view(B_m, N_m, D_m // 256, 256)
-                    x12_reshaped = x12_detached.view(B_m, N_m, D_m // 256, 256)
-                    cos_sim = F.cosine_similarity(x4_reshaped, x12_reshaped, dim=-1)
-                    match_loss = 1 -(cos_sim).mean()
-                else:
-                    cos_sim = F.cosine_similarity(x4, x12_detached, dim=-1)
-                    match_loss = -torch.log(torch.clamp(cos_sim, min=1e-6)).mean()
+                cls4_norm = F.normalize(cls4, dim=-1)
+                cls11_norm = F.normalize(cls11, dim=-1)
+                
+                temperature = 0.07
+                logits = torch.matmul(cls4_norm, cls11_norm.T) / temperature
+                
+                # Symmetrical InfoNCE loss
+                labels = torch.arange(B, device=x.device)
+                loss_i2j = F.cross_entropy(logits, labels)
+                loss_j2i = F.cross_entropy(logits.T, labels)
+                infonce_loss = (loss_i2j + loss_j2i) / 2
 
         res = [v_pred]
         if return_features:
             res.append(x)
         if return_layer_match:
-            res.append(match_loss)
+            res.append(infonce_loss)
 
         if len(res) == 1:
             return res[0]

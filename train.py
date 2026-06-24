@@ -304,7 +304,7 @@ def train(config_path):
     try:
         opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95),
                               cautious_wd=True)
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0.1,
+        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0,
                               cautious_wd=True, normuon_variant=True)
     except Exception:
         opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
@@ -351,15 +351,22 @@ def train(config_path):
         vae = torch.compile(vae)
     data_iter = iter(dataloader)
     running_loss = 0.0
-    running_match_loss = 0.0
+    running_fm_loss = 0.0
+    running_neg_loss = 0.0
+    running_deltafm_loss = 0.0
+    running_total_loss = 0.0
+    running_infonce_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
     is_mar = config['model'].get('type', 'v2') == 'mar'
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        loss_accum = 0.0
-        match_loss_accum = 0.0
+        fm_loss_accum = 0.0
+        neg_loss_accum = 0.0
+        deltafm_loss_accum = 0.0
+        total_loss_accum = 0.0
+        infonce_loss_accum = 0.0
 
         for _ in range(accum_steps):
             try:
@@ -419,13 +426,10 @@ def train(config_path):
             # Global Logit-Normal Timestep Sampler
             # t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
             t = sample_uniform(bs=B, device=device, dtype=torch.bfloat16)
-            t2 = t + sample_uniform(bs=B, device=device, dtype=torch.bfloat16) * (1 - t)
 
             t_reshaped = t.view(B, 1, 1, 1)
-            t2_reshaped = t2.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-            xt2 = (1 - t2_reshaped) * inputs + t2_reshaped * noise
 
             # --- Training Augmentations (each applied independently w/ 50% chance) ---
             # 1. Gaussian noise injection to xt to simulate drift during inference
@@ -434,7 +438,6 @@ def train(config_path):
                 noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
                 noise_injection = torch.randn_like(xt)
                 xt = xt + noise_mask * noise_inject_ratio * noise_injection
-                xt2 = xt2 + noise_mask * noise_inject_ratio * noise_injection
 
             # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
             #    from a different clean sample to simulate mean-seeking drift
@@ -447,42 +450,83 @@ def train(config_path):
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
-                xt2_neg = (1 - t2_reshaped) * inputs_neg + t2_reshaped * noise_neg
-                xt2 = xt2 + cross_mask * cross_ratio * (xt2_neg - xt2)
-
             # Model outputs direct v-prediction and layer match loss
-            v_pred, match_loss = model(xt, t, y_indices, y_offsets,
-                                       return_layer_match=True, xt2=xt2, t2=t2)
+            v_pred, infonce_loss = model(xt, t, y_indices, y_offsets,
+                                       return_layer_match=True)
 
             # Compute velocity-space loss (flow matching target: noise - inputs)
             v_target = noise - inputs
-            loss = F.mse_loss(v_pred, v_target) + 0.2 * match_loss
+            deltafm_lambda = config['training'].get('deltafm_lambda', 0.05)
+            if deltafm_lambda > 0 and B > 1:
+                perm = torch.arange(B, device=device).roll(1)
+            
+                inputs_neg = inputs[perm]
+                noise_neg = noise[perm]
+                v_neg_target = noise_neg - inputs_neg
+            
+                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
+                neg_loss = F.mse_loss(v_pred.float(), v_neg_target.float())
+            
+                # ∆FM flow objective
+                deltafm_loss = fm_loss - deltafm_lambda * neg_loss
+            else:
+                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
+                neg_loss = torch.zeros((), device=device)
+                deltafm_loss = fm_loss
+            
+            # Full training loss
+            total_loss = deltafm_loss + 0.2 * infonce_loss
 
-            loss = loss / accum_steps
+            loss = total_loss / accum_steps
             loss.backward()
-            loss_accum += F.mse_loss(v_pred, v_target).item()
-            match_loss_accum += match_loss.item() / accum_steps
+            fm_loss_accum += fm_loss.detach().item() / accum_steps
+            neg_loss_accum += neg_loss.detach().item() / accum_steps
+            deltafm_loss_accum += deltafm_loss.detach().item() / accum_steps
+            total_loss_accum += total_loss.detach().item() / accum_steps
+            infonce_loss_accum += infonce_loss.detach().item() / accum_steps
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         global_step += 1
-        running_loss += loss_accum
-        running_match_loss += match_loss_accum
+        running_fm_loss += fm_loss_accum
+        running_neg_loss += neg_loss_accum
+        running_deltafm_loss += deltafm_loss_accum
+        running_total_loss += total_loss_accum
+        running_infonce_loss += infonce_loss_accum
         if rank == 0:
             pbar.update(1)
 
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
-                avg_loss = running_loss / log_interval
-                avg_match_loss = running_match_loss / log_interval
+            
+                avg_fm_loss = running_fm_loss / log_interval
+                avg_neg_loss = running_neg_loss / log_interval
+                avg_deltafm_loss = running_deltafm_loss / log_interval
+                avg_total_loss = running_total_loss / log_interval
+                avg_infonce_loss = running_infonce_loss / log_interval
+            
                 wandb.log({
-                    "train/loss": avg_loss,
-                    "train/match_loss": avg_match_loss
+                    "train/fm_loss": avg_fm_loss,
+                    "train/neg_loss": avg_neg_loss,
+                    "train/deltafm_loss": avg_deltafm_loss,
+                    "train/total_loss": avg_total_loss,
+                    "train/infonce_loss": avg_infonce_loss,
+                    "train/deltafm_lambda": config['training'].get('deltafm_lambda', 0.05),
                 }, step=global_step)
-                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "match_loss": f"{avg_match_loss:.4f}"})
-                running_loss = 0.0
-                running_match_loss = 0.0
+            
+                pbar.set_postfix({
+                    "fm": f"{avg_fm_loss:.4f}",
+                    "dfm": f"{avg_deltafm_loss:.4f}",
+                    "total": f"{avg_total_loss:.4f}",
+                    "infonce": f"{avg_infonce_loss:.4f}",
+                })
+            
+                running_fm_loss = 0.0
+                running_neg_loss = 0.0
+                running_deltafm_loss = 0.0
+                running_total_loss = 0.0
+                running_infonce_loss = 0.0
 
             if global_step % config['training']['save_image_every_steps'] == 0:
                 save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
