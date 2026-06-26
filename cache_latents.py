@@ -171,9 +171,23 @@ def main():
         latents_mean = stats["mean"].to(device=device, dtype=torch.bfloat16)
         latents_std = stats["std"].to(device=device, dtype=torch.bfloat16)
     else:
-        print(f"WARNING: {args.stats_path} not found — latents will NOT be normalized!")
-        latents_mean = None
-        latents_std = None
+        print(f"Auto-extracting VAE normalization stats from Standard VAE...")
+        if args.use_standard_vae:
+            std_vae = vae
+        else:
+            from diffusers import AutoencoderKLFlux2
+            print("Loading Standard FLUX.2 VAE to extract stats...")
+            std_vae = AutoencoderKLFlux2.from_pretrained(
+                "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+            ).to(device=device).eval()
+            
+        latents_mean = std_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
+        latents_std = torch.sqrt(
+            std_vae.bn.running_var.view(1, -1, 1, 1) + std_vae.config.batch_norm_eps
+        ).to(device, dtype=torch.bfloat16)
+        
+        if not args.use_standard_vae:
+            del std_vae
 
     # ── Prepare buckets ─────────────────────────────────────────────────────
     buckets = make_buckets(args.image_size)

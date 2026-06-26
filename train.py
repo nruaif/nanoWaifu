@@ -224,8 +224,8 @@ def train(config_path):
 
     model = ModelClass(
         in_channels=128,
-        dim=config['model'].get('fcdm_dim', 768),
-        depth=config['model'].get('fcdm_depth', 12),
+        dim=config['model'].get('dim', 768),
+        depth=config['model'].get('depth', 12),
         num_heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
@@ -450,27 +450,27 @@ def train(config_path):
                 xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
                 xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
 
-            # Model outputs direct v-prediction and layer match loss
-            v_pred, infonce_loss = model(xt, t, y_indices, y_offsets,
+            # Model outputs direct x0 prediction and layer match loss
+            x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets,
                                        return_layer_match=True)
 
-            # Compute velocity-space loss (flow matching target: noise - inputs)
-            v_target = noise - inputs
+            # Compute x0-space loss with SNR weighting
+            x0_target = inputs
+            snr = (1 - t_reshaped)**2 / (t_reshaped**2 + 1e-5)
+            
             deltafm_lambda = config['training'].get('deltafm_lambda', 0.05)
             if deltafm_lambda > 0 and B > 1:
                 perm = torch.arange(B, device=device).roll(1)
             
                 inputs_neg = inputs[perm]
-                noise_neg = noise[perm]
-                v_neg_target = noise_neg - inputs_neg
             
-                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
-                neg_loss = F.mse_loss(v_pred.float(), v_neg_target.float())
+                fm_loss = (F.mse_loss(x0_pred.float(), x0_target.float(), reduction='none') * snr).mean()
+                neg_loss = (F.mse_loss(x0_pred.float(), inputs_neg.float(), reduction='none') * snr).mean()
             
                 # ∆FM flow objective
                 deltafm_loss = fm_loss - deltafm_lambda * neg_loss
             else:
-                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
+                fm_loss = (F.mse_loss(x0_pred.float(), x0_target.float(), reduction='none') * snr).mean()
                 neg_loss = torch.zeros((), device=device)
                 deltafm_loss = fm_loss
             

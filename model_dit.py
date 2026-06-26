@@ -433,14 +433,8 @@ class TokenformerDiT(nn.Module):
         x_norm = x_norm * (1 + scale) + shift
         x_out = self.final_proj(x_norm)
 
-        # Project back to image spatial format. The head predicts x0, then
-        # convert that x0 prediction to the velocity used by the sampler:
-        #   x_t = x0 + t * v  =>  v = (x_t - x0) / t
-        # Clamp t to avoid division instability near t=0.
+        # Project back to image spatial format. The head predicts x0 directly.
         x0_pred = x_out.transpose(1, 2).reshape(B, self.in_channels, H, W)
-        t_clamped = t.to(device=x0_pred.device, dtype=x0_pred.dtype).clamp(min=0.05)
-        t_clamped = t_clamped.view(B, *([1] * (x0_pred.ndim - 1)))
-        v_pred = (x_in.to(device=x0_pred.device, dtype=x0_pred.dtype) - x0_pred) / t_clamped
 
         # 9. InfoNCE loss calculation (if requested)
         infonce_loss = None
@@ -460,7 +454,7 @@ class TokenformerDiT(nn.Module):
                 loss_j2i = F.cross_entropy(logits.T, labels)
                 infonce_loss = (loss_i2j + loss_j2i) / 2
 
-        res = [v_pred]
+        res = [x0_pred]
         if return_features:
             res.append(x)
         if return_layer_match:
@@ -535,10 +529,12 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
         if sampler_type != "euler":
             raise NotImplementedError(f"Sampler type '{sampler_type}' is not supported anymore because log-variance has been removed. Use 'euler' instead.")
 
-        v_cond = model(x, t_vec, y_indices, y_offsets)
-        v_uncond = model(x, t_vec, y_null_indices, y_null_offsets)
+        x0_cond = model(x, t_vec, y_indices, y_offsets)
+        x0_uncond = model(x, t_vec, y_null_indices, y_null_offsets)
 
-        v = v_uncond + guidance_scale * (v_cond - v_uncond)
+        x0 = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+        t_reshaped = t_vec.view(-1, 1, 1, 1).clamp(min=1e-5)
+        v = (x - x0) / t_reshaped
         x = x + dt * v
 
     model.train()
@@ -571,15 +567,15 @@ if __name__ == "__main__":
     print("\n[Test 1] Global timestep (1D)...")
     t_global = torch.rand(batch_size, device=device)
     model.eval()
-    v_pred, match_loss = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
-    print(f"  v_pred: {v_pred.shape}, match_loss: {match_loss.item():.6f}")
-    assert v_pred.shape == x_in.shape, f"Shape mismatch: {v_pred.shape} vs {x_in.shape}"
+    x0_pred, match_loss = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
+    print(f"  x0_pred: {x0_pred.shape}, match_loss: {match_loss.item():.6f}")
+    assert x0_pred.shape == x_in.shape, f"Shape mismatch: {x0_pred.shape} vs {x_in.shape}"
 
     # --- Test 2: Training backward pass ---
     print("[Test 2] Training backward pass...")
     model.train()
-    v_pred3, match_loss3 = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
-    loss = F.mse_loss(v_pred3, torch.randn_like(v_pred3)) + 0.2 * match_loss3
+    x0_pred3, match_loss3 = model(x_in, t_global, y_indices, y_offsets, return_layer_match=True)
+    loss = F.mse_loss(x0_pred3, torch.randn_like(x0_pred3)) + 0.2 * match_loss3
     loss.backward()
     print(f"  loss: {loss.item():.6f}")
 

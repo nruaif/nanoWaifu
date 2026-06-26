@@ -27,15 +27,11 @@ model:
   type: "dit"      # Use TokenformerDiT
   use_vae: true    # Recommended for 256x256
   use_tiny_vae: false
-  fcdm_dim: 1024    # Hidden dimension (FCDM-L: 512, depth=[2,4,8,4,2] hardcoded)
-  fcdm_depth: 16   # Legacy — depth is now hardcoded as [2,4,8,4,2] in model
+  dim: 1024        # Hidden dimension
+  depth: 16        # Number of transformer blocks
   num_heads: 16    # Number of attention heads
   in_channels: 3   # RGB (overwritten to 32 by VAE)
   patch_size: 1    # Factor for initial projection
-  drop_ratio: 0.75 # Token drop ratio (0.0 to 1.0)
-  path_drop_prob: 0 # Probability of dropping the middle layers (0.0 to 1.0)
-  uniformity_weight: 0 # Weight for the uniformity loss
-  lambda_nll: 0.01 # Weight for the difficulty-aware NLL loss
 
 data:
   cache_dir: '/workspace/nanoWaifu/cached_latents/latents-000{00..66}.tar'
