@@ -132,25 +132,35 @@ def main():
         # --- DiT Training ---
         model_dit.train()
         B, C, H, W = latents.shape
-        t = torch.rand((B, ), device=device)
+        t = torch.rand((B,), device=device) * 0.998 + 0.001
         t_reshaped = t.view(B, 1, 1, 1)
         noise = torch.randn_like(latents)
         
-        # DiT uses (1-t)*x + t*noise
+        # DiT uses (1-t)*x + t*noise and predicts x0 directly.
         xt_dit = (1 - t_reshaped) * latents + t_reshaped * noise
-        v_target = noise - latents
         
-        v_pred, infonce_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True)
-        loss_dit = F.mse_loss(v_pred, v_target)
+        x0_pred = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1])
+        snr = (
+            (1 - t_reshaped).square()
+            / t_reshaped.square().clamp_min(1e-6)
+        ).clamp(max=5.0)
+        loss_dit = (F.mse_loss(x0_pred.float(), latents.float(), reduction='none') * snr).mean()
+        cos_loss = 1.0 - F.cosine_similarity(
+            x0_pred.float().flatten(1),
+            latents.float().flatten(1),
+            dim=1,
+            eps=1e-6,
+        ).mean()
         
-        total_loss = loss_dit + 0.2 * infonce_loss
+        total_loss = loss_dit + cos_loss
         
         opt_dit.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_dit.parameters(), 1.0)
         opt_dit.step()
 
         if i % 50 == 0:
-            print(f"Step {i:4d} | DiT Loss: {loss_dit.item():.6f} | InfoNCE Loss: {infonce_loss.item():.6f}")
+            print(f"Step {i:4d} | DiT Loss: {loss_dit.item():.6f} | Cos Loss: {cos_loss.item():.6f}")
             
             # --- Sampling and Logging ---
             model_dit.eval()

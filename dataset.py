@@ -406,7 +406,8 @@ class WDSLoader:
                 self.url,
                 nodesplitter=wds.split_by_node,
                 handler=warn_and_continue,
-                workersplitter=wds.split_by_worker
+                workersplitter=wds.split_by_worker,
+                shardshuffle=120,
             )
             .shuffle(10_000, initial=1_000)
             .map(self.preprocess, handler=warn_and_continue)

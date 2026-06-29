@@ -270,7 +270,6 @@ class DiTBlock(nn.Module):
         # Zero-initialize the linear modulation parameters
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-    @torch.compile
     def forward(self, x, c, H=None, W=None, rope=None, num_cls_tokens=0, src_key_padding_mask=None, qkv_res=None):
         # Handle 2D conditioning tensor: c is [B, dim] -> [B, 1, dim]
         if c.dim() == 2:
@@ -400,7 +399,7 @@ class TokenformerDiT(nn.Module):
 
         # 5. Conditioning Vector
         c_full = t_emb + y_emb  # [B, 1, dim]
-        c_time_only = t_emb     # [B, 1, dim]
+        c_time_only = t_emb
 
         # 6. Process through DiTBlock sequence
         cls4 = None
@@ -418,9 +417,9 @@ class TokenformerDiT(nn.Module):
             
             # Capture CLS tokens for InfoNCE loss
             if idx == 3:  # Block 4
-                cls4 = x[:, :self.num_cls_tokens].clone().reshape(B, -1)
+                cls4 = x[:, self.num_cls_tokens:].mean(dim=1)
             if idx == 11:  # Block 12
-                cls11 = x[:, :self.num_cls_tokens].clone().reshape(B, -1)
+                cls11 = x[:, self.num_cls_tokens:].mean(dim=1)
 
         # 7. Strip CLS tokens — only spatial tokens go through the final layer
         x = x[:, self.num_cls_tokens:]  # [B, N, dim]

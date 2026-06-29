@@ -81,8 +81,8 @@ class Flux2TinyAutoEncoder(ModelMixin, ConfigMixin):
         return decoded
 
     def forward(self, sample: torch.Tensor, return_dict: bool = True) -> DecoderOutput:
-        encoded = self.encode(sample, return_dict=False)[0]
-        decoded = self.decode(encoded, return_dict=False)[0]
+        encoded = self.encode(sample, return_dict=False)
+        decoded = self.decode(encoded, return_dict=False)
 
         if return_dict:
             return DecoderOutput(sample=decoded)

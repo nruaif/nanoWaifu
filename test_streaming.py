@@ -1,123 +1,136 @@
-import torch
-import torch.nn as nn
-from model_dit import TokenformerDiT
-import glob
-import os
-import yaml
+import argparse
+import io
+import tarfile
+from pathlib import Path
+
 import numpy as np
 
-def log_tensor_stats(t, name, stage):
-    if not isinstance(t, torch.Tensor) or not t.is_floating_point():
-        return
-        
-    has_nan = torch.isnan(t).any().item()
-    has_inf = torch.isinf(t).any().item()
-    max_val = t.abs().max().item() if t.numel() > 0 else 0
-    
-    sus = False
-    reasons = []
-    if has_nan:
-        sus = True
-        reasons.append("NaN")
-    if has_inf:
-        sus = True
-        reasons.append("Inf")
-    if max_val > 100.0:  # Lowered threshold to 100.0 for finer grain
-        sus = True
-        reasons.append(f"Large Max ({max_val:.2f})")
-        
-    if sus:
-        # Find index of max value for finer grain debugging
-        flat_idx = torch.argmax(t.abs()).item()
-        idx = np.unravel_index(flat_idx, t.shape) if t.numel() > 0 else None
-        
-        mean_val = t.mean().item()
-        std_val = t.std().item()
-        
-        print(f"[SUS ACT] {stage}: {name} | Reason(s): {', '.join(reasons)}")
-        print(f"          Shape: {t.shape} | Mean: {mean_val:.4f} | Std: {std_val:.4f}")
-        print(f"          Max value found at index {idx} -> {t.flatten()[flat_idx].item():.4f}")
 
-def check_sus_act_pre(module, args, name):
-    for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            log_tensor_stats(arg, f"{name} (Input arg {i})", "PRE")
-        elif isinstance(arg, tuple):
-            for j, a in enumerate(arg):
-                log_tensor_stats(a, f"{name} (Input arg {i}.{j})", "PRE")
+def new_stats():
+    return {
+        "n": 0,
+        "sum": 0.0,
+        "sum2": 0.0,
+    }
 
-def check_sus_act_post(module, input, output, name):
-    if isinstance(output, torch.Tensor):
-        outputs = [output]
-    elif isinstance(output, tuple):
-        outputs = [o for o in output if isinstance(o, torch.Tensor)]
-    else:
-        return
-        
-    for i, out in enumerate(outputs):
-        log_tensor_stats(out, f"{name} (Output {i})", "POST")
 
-def get_newest_checkpoint(output_dir):
-    ckpt_files = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
-    if not ckpt_files:
-        return None
-    return sorted(ckpt_files, key=lambda x: int(os.path.basename(x).split('_')[-1].split('.')[0]))[-1]
+def update_stats(x: np.ndarray, stats: dict):
+    x = x.astype(np.float64, copy=False)
+    stats["n"] += x.size
+    stats["sum"] += x.sum()
+    stats["sum2"] += np.square(x).sum()
+
+
+def finalize_stats(stats: dict):
+    if stats["n"] == 0:
+        return None, None
+
+    mean = stats["sum"] / stats["n"]
+    var = (stats["sum2"] / stats["n"]) - mean**2
+    std = np.sqrt(max(var, 0.0))
+
+    return float(mean), float(std)
+
+
+def iter_latents_from_shard(path: Path):
+    with tarfile.open(path, "r:") as tar:
+        found = False
+
+        for member in tar:
+            if not member.name.endswith("latent.npy"):
+                continue
+
+            found = True
+            f = tar.extractfile(member)
+
+            if f is None:
+                continue
+
+            latent = np.load(io.BytesIO(f.read()))
+
+            if latent.ndim != 3:
+                raise ValueError(
+                    f"{path.name}:{member.name} expected shape [C,H,W], got {latent.shape}"
+                )
+
+            yield latent
+
+        if not found:
+            raise RuntimeError(f"{path.name}: no latent.npy entries found")
+
+
+def check_shard(path: Path, mean_target: float, std_target: float, tol: float):
+    stats = new_stats()
+    samples = 0
+
+    for latent in iter_latents_from_shard(path):
+        update_stats(latent, stats)
+        samples += 1
+
+    mean, std = finalize_stats(stats)
+
+    mean_ok = abs(mean - mean_target) <= tol
+    std_ok = abs(std - std_target) <= tol
+    normalized = mean_ok and std_ok
+
+    return {
+        "path": path,
+        "samples": samples,
+        "values": stats["n"],
+        "mean": mean,
+        "std": std,
+        "mean_ok": mean_ok,
+        "std_ok": std_ok,
+        "normalized": normalized,
+    }
+
 
 def main():
-    print("Loading config...")
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-        
-    use_vae = config['model'].get('use_vae', False)
-    use_tiny_vae = config['model'].get('use_tiny_vae', False)
-    in_channels = config['model'].get('in_channels', 3)
-    if use_vae or use_tiny_vae:
-        in_channels = 128
-        
-    print("Initializing model...")
-    device = torch.device("cpu")
-    model = TokenformerDiT(
-        in_channels=in_channels,
-        dim=config['model'].get('fcdm_dim', 768),
-        depth=config['model'].get('fcdm_depth', 12),
-        num_heads=config['model'].get('num_heads', 12),
-        num_classes=12476, # Default from TokenformerDiT definition
-    ).to(device)
-    
-    output_dir = config['training'].get('output_dir', 'outputs_dit')
-    newest_ckpt = get_newest_checkpoint(output_dir)
-    
-    if newest_ckpt:
-        print(f"Found newest checkpoint: {newest_ckpt}")
-        checkpoint = torch.load(newest_ckpt, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        print("Checkpoint loaded successfully.")
-    else:
-        print(f"No checkpoint found in {output_dir}, using randomly initialized weights.")
-    
-    # Register hooks
-    for name, module in model.named_modules():
-        module.register_forward_pre_hook(lambda m, args, n=name: check_sus_act_pre(m, args, n))
-        module.register_forward_hook(lambda m, i, o, n=name: check_sus_act_post(m, i, o, n))
-        
-        
-    print("Creating dummy inputs...")
-    batch_size = 2
-    H, W = 8, 8
-    
-    x_in = torch.randn(batch_size, in_channels, H, W, device=device)
+    parser = argparse.ArgumentParser(
+        description="Check whether latent shard tar files are normalized."
+    )
 
-    
-    y_indices = torch.randint(0, 100, (batch_size * 3,), device=device)
-    y_offsets = torch.arange(0, batch_size * 3, 3, device=device)
-    t_global = torch.rand(batch_size, device=device)
-    
-    print("Running forward pass...")
-    try:
-        model(x_in, t_global, y_indices, y_offsets)
-        print("Forward pass completed.")
-    except Exception as e:
-        print(f"Forward pass failed: {e}")
+    parser.add_argument("shards", nargs="+", help="Shard .tar files to check")
+    parser.add_argument("--mean_target", type=float, default=0.0)
+    parser.add_argument("--std_target", type=float, default=1.0)
+    parser.add_argument("--tol", type=float, default=0.1)
 
-if __name__ == '__main__':
+    args = parser.parse_args()
+
+    any_failed = False
+
+    for shard in args.shards:
+        path = Path(shard)
+
+        try:
+            result = check_shard(
+                path=path,
+                mean_target=args.mean_target,
+                std_target=args.std_target,
+                tol=args.tol,
+            )
+
+            print("=" * 80)
+            print(f"Shard:      {result['path']}")
+            print(f"Samples:    {result['samples']}")
+            print(f"Values:     {result['values']}")
+            print(f"Mean:       {result['mean']:.8f}")
+            print(f"Std:        {result['std']:.8f}")
+            print(f"Mean OK:    {result['mean_ok']}")
+            print(f"Std OK:     {result['std_ok']}")
+            print(f"Normalized: {result['normalized']}")
+
+            if not result["normalized"]:
+                any_failed = True
+
+        except Exception as e:
+            print("=" * 80)
+            print(f"Shard:      {path}")
+            print(f"ERROR:      {e}")
+            any_failed = True
+
+    raise SystemExit(1 if any_failed else 0)
+
+
+if __name__ == "__main__":
     main()

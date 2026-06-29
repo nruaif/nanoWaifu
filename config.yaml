@@ -6,17 +6,25 @@ training:
   max_train_steps: 2000000
   gradient_checkpointing: false
   compile: false
-  log_every_steps: 10
+  log_every_steps: 1
 
   save_image_every_steps: 5000
   image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
-  cfg_scale: 6
-  output_dir: "outputs_dit"
-  wandb_project: "nanoWaifu-C2I"
-  resume_from: "outputs_dit/"
-  max_checkpoints: 16
+  cfg_scale: 1
+  output_dir: "outputs_afm"
+  wandb_project: "nanoWaifu-AFM"
+  resume_from:
+  init_from: "outputs_dit/"
+  max_checkpoints: 3
+  push_to_hf: false
+  hf_repo_id:
+  use_minibatch_ot: false
+  grad_clip_norm: 1.0
+  timestep_min: 1.0e-3
+  snr_gamma: 5.0
+  seed: 1337
   noise_inject_ratio: 0
   cross_ratio: 0
   sampler_type: "euler"
@@ -30,11 +38,39 @@ model:
   dim: 1024        # Hidden dimension
   depth: 16        # Number of transformer blocks
   num_heads: 16    # Number of attention heads
-  in_channels: 3   # RGB (overwritten to 32 by VAE)
+  in_channels: 3   # RGB (overwritten to 128 by either VAE path)
   patch_size: 1    # Factor for initial projection
 
+adversarial:
+  enabled: true
+  steps: 1
+  discriminator_steps: 1
+  discriminator_dim: 512
+  discriminator_depth: 8
+  discriminator_heads: 8
+  discriminator_gradient_checkpointing: false
+  generator_optimizer: "adamw"
+  generator_learning_rate: 1.0e-4
+  discriminator_learning_rate: 1.0e-4
+  discriminator_grad_clip_norm: 50.0
+  betas: [0.0, 0.9]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  gp_scale: 0.25
+  gp_batch_ratio: 0.25
+  gp_epsilon: 0.01
+  center_penalty: 0.01
+  gradient_normalization: true
+  gradient_norm_decay: 0.9
+  ot_scale: 0.2
+  ot_scale_end: 0.005
+  ot_decay_steps: 1000000
+  flow_matching_weight: 0.0
+  compile: false
+
 data:
-  cache_dir: '/workspace/nanoWaifu/cached_latents/latents-000{00..66}.tar'
+  cache_dir: '/workspace/nanoWaifu/cached_latents/latents-00{000..186}.tar'
+  cached_latent_scale: 0.48827572
   use_cached_latents: true
 
   use_advanced_captions: true
