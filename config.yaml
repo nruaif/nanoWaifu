@@ -13,10 +13,10 @@ training:
   image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
-  cfg_scale: 6               # Used for validation sampling
-  output_dir: "outputs_dit"
+  cfg_scale: 6
+  output_dir: "outputs_fcdm"      # <-- changed so you don't mix DiT / FCDM checkpoints
   wandb_project: "nanoWaifu-C2I"
-  resume_from: "outputs_dit/"
+  resume_from: "outputs_fcdm/"   # <-- changed
   max_checkpoints: 16
 
   # Augmentations
@@ -24,12 +24,12 @@ training:
   cross_ratio: 0
 
   # Loss
-  loss_type: "mse"           # mse | l1 | huber
+  loss_type: "mse"
   deltafm_lambda: 0.05
-  infonce_weight: 0.2
+  infonce_weight: 0
 
   # Timestep sampling
-  timestep_sampler: "uniform"  # uniform | logit_normal | cosine
+  timestep_sampler: "uniform"
 
   # EMA
   use_ema: true
@@ -48,17 +48,29 @@ training:
   hf_repo_id: "Shio-Koube/ConvNext-Diff"
 
 model:
-  type: "dit"
+  # FCDM only needs two scaling knobs:
+  #   dim   = base hidden channels C
+  #   depth = number of blocks L in the first (full-resolution) stage
+  #
+  # Paper reference:
+  #   FCDM-S : dim=128, depth=2  (~33M params, 3.1 GFLOPs)
+  #   FCDM-B : dim=256, depth=2  (~128M params, 12.2 GFLOPs)
+  #   FCDM-L : dim=512, depth=2  (~505M params, 48.3 GFLOPs)
+  #   FCDM-XL: dim=512, depth=3  (~699M params, 64.6 GFLOPs)
+  dim: 256
+  depth: 2
+
+  # VAE settings
   use_vae: true
   use_tiny_vae: false
-  dim: 1024
-  depth: 16
-  num_heads: 16
-  in_channels: 3
-  patch_size: 1
 
-  # FCDM conditioning
+  # Conditioning (small FCDM blocks run over the tag grid)
   fcdm_blocks: 2
+
+  # Legacy DiT keys — harmless, but ignored by FCDM
+  num_heads: 16
+  patch_size: 1
+  in_channels: 3
 
 data:
   cache_dir: '/workspace/nanoWaifu/cached_latents/latents-000{00..66}.tar'

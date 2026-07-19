@@ -110,11 +110,9 @@ def save_checkpoint(
         "timestamp": time.time(),
     }
 
-    # Save EMA state if available
     if ema is not None:
         checkpoint["ema_state_dict"] = ema.shadow
 
-    # Atomic write
     temp_path = ckpt_path + ".tmp"
     torch.save(checkpoint, temp_path)
     os.replace(temp_path, ckpt_path)
@@ -151,7 +149,6 @@ def load_checkpoint(
     state_dict = checkpoint["model_state_dict"]
     model_state = model_to_load.state_dict()
 
-    # Filter by shape
     filtered_state = {}
     for k, v in state_dict.items():
         if k in model_state:
@@ -169,7 +166,6 @@ def load_checkpoint(
 
     model_to_load.load_state_dict(filtered_state, strict=False)
 
-    # Restore optimizer
     if "optimizer_state_dict" in checkpoint and optimizer is not None:
         try:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -177,7 +173,6 @@ def load_checkpoint(
         except Exception as e:
             print(f">>> Could not restore optimizer state: {e}")
 
-    # Restore EMA
     if ema is not None and "ema_state_dict" in checkpoint:
         try:
             ema.shadow = {k: v.to(device) for k, v in checkpoint["ema_state_dict"].items()}
@@ -206,7 +201,6 @@ def create_optimizer(model, config: Dict[str, Any]):
 # EMA
 # =============================================================================
 class EMA:
-    """Exponential Moving Average for model parameters."""
     def __init__(self, model, decay=0.9999):
         self.model = model
         self.decay = decay
@@ -366,14 +360,12 @@ def apply_cross_sample_mixing(xt, inputs, t, cross_ratio: float):
 # LR Scheduler
 # =============================================================================
 def get_lr_scheduler(optimizer, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.1):
-    """Cosine decay with linear warmup."""
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
-    # Apply to optimizer
     schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)]
     return schedulers
 
@@ -396,8 +388,8 @@ def train(config_path: str):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    from model_dit import TokenformerDiT, TagProcessor, sample_flow
-    ModelClass, TagProcessor, sample_fn = TokenformerDiT, TagProcessor, sample_flow
+    from model_dit import FCDM, TagProcessor, sample_flow
+    ModelClass, TagProcessor, sample_fn = FCDM, TagProcessor, sample_flow
 
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
@@ -425,9 +417,8 @@ def train(config_path: str):
     # Model
     model = ModelClass(
         in_channels=in_channels if use_vae else config['model'].get('in_channels', 3),
-        dim=config['model'].get('dim', 768),
-        depth=config['model'].get('depth', 12),
-        num_heads=config['model'].get('num_heads', 12),
+        dim=config['model'].get('dim', 128),
+        depth=config['model'].get('depth', 2),
         num_classes=num_classes,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
         fcdm_blocks=config['model'].get('fcdm_blocks', 2),
@@ -442,7 +433,7 @@ def train(config_path: str):
     global_step = 0
     fixed_prompts = None
     fixed_noise = None
-    resume_dir = config.get('resume_from', "outputs_dit/")
+    resume_dir = config.get('resume_from', "outputs_fcdm/")
 
     # EMA (before DDP)
     use_ema = config['training'].get('use_ema', True)
@@ -494,7 +485,7 @@ def train(config_path: str):
 
     # WandB
     if rank == 0:
-        wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
+        wandb.init(project=config.get('wandb_project', 'fcdm-training'), config=config)
         pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
@@ -562,7 +553,7 @@ def train(config_path: str):
                 else:
                     inputs = images.to(device, memory_format=torch.channels_last).to(dtype=torch.bfloat16)
 
-            # Fixed validation data (deterministic sizing)
+            # Fixed validation data
             if rank == 0 and fixed_prompts is None:
                 n_fixed = min(16, len(prompts))
                 fixed_prompts = prompts[:n_fixed]
