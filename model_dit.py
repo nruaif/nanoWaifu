@@ -275,11 +275,13 @@ class FCDM(nn.Module):
 
         # Decoder with additive skips
         x = self.up2(x)
+        x = x[:, :, :skip2.shape[2], :skip2.shape[3]]
         x = x + skip2
         for block in self.dec2:
             x = self._block_forward(block, x, c)
 
         x = self.up1(x)
+        x = x[:, :, :skip1.shape[2], :skip1.shape[3]]
         x = x + skip1
         for block in self.dec1:
             x = self._block_forward(block, x, c)
