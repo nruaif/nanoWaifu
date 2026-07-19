@@ -5,7 +5,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import yaml
 import os
 import argparse
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
 import wandb
 import glob
@@ -14,9 +14,16 @@ from dataset import WDSLoader
 import torch.nn.functional as F
 from huggingface_hub import upload_file
 import threading
+import time
+from contextlib import nullcontext
+from typing import Optional, Dict, Any
+import math
 
 
-def _async_upload(ckpt_path, repo_id, step):
+# =============================================================================
+# HF Hub Async Upload
+# =============================================================================
+def _async_upload(ckpt_path: str, repo_id: str, step: int):
     try:
         upload_file(
             path_or_fileobj=ckpt_path,
@@ -29,15 +36,11 @@ def _async_upload(ckpt_path, repo_id, step):
         print(f"[HF] Upload failed for {ckpt_path}: {e}")
 
 
-torch.backends.cuda.enable_flash_sdp(True)
-
-# FIX: removed unused disp_loss function
-
-
-from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
-
-
-def setup_ddp():
+# =============================================================================
+# Distributed Setup
+# =============================================================================
+def setup_distributed():
+    """Initialize distributed training."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
@@ -50,15 +53,17 @@ def setup_ddp():
         return False, 0, 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def cleanup_ddp():
+def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-def cleanup_checkpoints(output_dir, max_checkpoints, rank):
-    if rank != 0:
+# =============================================================================
+# Checkpointing (with EMA support)
+# =============================================================================
+def cleanup_checkpoints(output_dir: str, max_checkpoints: int, rank: int):
+    if rank != 0 or max_checkpoints <= 0:
         return
-    max_checkpoints = 3
     checkpoints = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
     checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
     if len(checkpoints) > max_checkpoints:
@@ -71,38 +76,49 @@ def cleanup_checkpoints(output_dir, max_checkpoints, rank):
 
 
 def save_checkpoint(
-        model,
-        optimizer,
-        rank,
-        output_dir,
-        step,
-        config,
-        fixed_prompts=None,
-        fixed_noise=None,
-        push_to_hf=True,
-        repo_id="Shio-Koube/ConvNext-Diff"
+    model,
+    optimizer,
+    ema,
+    rank: int,
+    output_dir: str,
+    step: int,
+    config: Dict[str, Any],
+    fixed_prompts=None,
+    fixed_noise=None,
+    push_to_hf: bool = True,
+    repo_id: Optional[str] = None,
+    is_ddp: bool = False,
 ):
     if rank != 0:
         return
 
     print(f"\n[Step {step}] Saving Checkpoint...")
 
-    model_to_save = model.module if hasattr(model, 'module') else model
+    model_to_save = model.module if is_ddp else model
+
     ckpt_path = os.path.join(output_dir, f'ckpt_step_{step}.pth')
 
     checkpoint = {
         "model_state_dict": model_to_save.state_dict(),
-        # FIX: save optimizer state so resuming doesn't lose momentum/adaptive stats
         "optimizer_state_dict": optimizer.state_dict(),
         "global_step": step,
         "config": config,
         "rng_state": torch.get_rng_state(),
-        "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "fixed_prompts": fixed_prompts,
-        "fixed_noise": fixed_noise
+        "fixed_noise": fixed_noise,
+        "timestamp": time.time(),
     }
 
-    torch.save(checkpoint, ckpt_path)
+    # Save EMA state if available
+    if ema is not None:
+        checkpoint["ema_state_dict"] = ema.shadow
+
+    # Atomic write
+    temp_path = ckpt_path + ".tmp"
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, ckpt_path)
+
     cleanup_checkpoints(output_dir, config.get('max_checkpoints', 3), rank)
     print(f"Checkpoint saved: {ckpt_path}")
 
@@ -115,260 +131,399 @@ def save_checkpoint(
         thread.start()
 
 
-def train(config_path):
-    is_ddp, rank, local_rank, world_size, device = setup_ddp()
+def load_checkpoint(
+    model,
+    optimizer,
+    ema,
+    resume_path: str,
+    device,
+    is_ddp: bool = False,
+) -> tuple[int, Optional[Any], Optional[Any]]:
+    """Load checkpoint with EMA and shape mismatch handling."""
+    if not resume_path or not os.path.exists(resume_path):
+        return 0, None, None
+
+    print(f"Resuming from: {resume_path}")
+    checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+
+    model_to_load = model.module if is_ddp else model
+
+    state_dict = checkpoint["model_state_dict"]
+    model_state = model_to_load.state_dict()
+
+    # Filter by shape
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if k in model_state:
+            if v.shape == model_state[k].shape:
+                filtered_state[k] = v
+            else:
+                print(f">>> Shape Mismatch: Skipping {k}. "
+                      f"Checkpoint: {v.shape}, Model: {model_state[k].shape}")
+        else:
+            print(f">>> Key not in model: {k}")
+
+    missing_keys = [k for k in model_state if k not in filtered_state]
+    if missing_keys:
+        print(f">>> Missing keys (will init): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+
+    model_to_load.load_state_dict(filtered_state, strict=False)
+
+    # Restore optimizer
+    if "optimizer_state_dict" in checkpoint and optimizer is not None:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print(">>> Optimizer state restored.")
+        except Exception as e:
+            print(f">>> Could not restore optimizer state: {e}")
+
+    # Restore EMA
+    if ema is not None and "ema_state_dict" in checkpoint:
+        try:
+            ema.shadow = {k: v.to(device) for k, v in checkpoint["ema_state_dict"].items()}
+            print(">>> EMA state restored.")
+        except Exception as e:
+            print(f">>> Could not restore EMA state: {e}")
+
+    global_step = checkpoint.get("global_step", 0)
+    fixed_noise = checkpoint.get("fixed_noise")
+    fixed_prompts = checkpoint.get("fixed_prompts")
+    if fixed_noise is not None:
+        fixed_noise = fixed_noise.to(device)
+
+    return global_step, fixed_prompts, fixed_noise
+
+
+# =============================================================================
+# Optimizer
+# =============================================================================
+def create_optimizer(model, config: Dict[str, Any]):
+    lr = config['training']['learning_rate']
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+
+
+# =============================================================================
+# EMA
+# =============================================================================
+class EMA:
+    """Exponential Moving Average for model parameters."""
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.register()
+
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+# =============================================================================
+# VAE Setup
+# =============================================================================
+def setup_vae(config: Dict[str, Any], device):
+    use_vae = config['model'].get('use_vae', False)
+    use_tiny_vae = config['model'].get('use_tiny_vae', False)
+    if not (use_vae or use_tiny_vae):
+        return None, None, None, 3
+
+    stats_path = "vae_stats.pt"
+    standard_vae = None
+
+    if os.path.exists(stats_path):
+        print(f">>> Loading VAE normalization stats from {stats_path}...")
+        stats = torch.load(stats_path, map_location='cpu', weights_only=False)
+        latents_mean = stats["mean"].to(device=device, dtype=torch.bfloat16)
+        latents_std = stats["std"].to(device=device, dtype=torch.bfloat16)
+    else:
+        from diffusers import AutoencoderKLFlux2
+        print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
+        standard_vae = AutoencoderKLFlux2.from_pretrained(
+            "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+        ).to(device=device).eval()
+        latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
+        latents_std = torch.sqrt(
+            standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
+        ).to(device, dtype=torch.bfloat16)
+        torch.save({"mean": latents_mean.cpu(), "std": latents_std.cpu()}, stats_path)
+        print(f">>> Saved VAE normalization stats to {stats_path}")
+
+    if use_tiny_vae:
+        if standard_vae is not None:
+            del standard_vae
+            torch.cuda.empty_cache()
+        from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
+        print(">>> Loading Tiny FLUX.2 VAE...")
+        vae = Flux2TinyAutoEncoder.from_pretrained("fal/FLUX.2-Tiny-AutoEncoder")
+        vae = vae.to(device=device, dtype=torch.bfloat16).eval()
+        in_channels = 128
+        print(f">>> Tiny VAE Mode: in_channels = {in_channels}")
+    else:
+        if standard_vae is None:
+            from diffusers import AutoencoderKLFlux2
+            print(">>> Loading Standard FLUX.2 VAE...")
+            standard_vae = AutoencoderKLFlux2.from_pretrained(
+                "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+            ).to(device=device).eval()
+        vae = standard_vae
+        in_channels = 128
+        print(f">>> Standard VAE Mode: in_channels = {in_channels}")
+
+    return vae, latents_mean, latents_std, in_channels
+
+
+# =============================================================================
+# Timestep Samplers
+# =============================================================================
+def sample_logit_normal(m_loc: float, s_scale: float, bs: int, device, dtype):
+    eps = torch.randn(bs, device=device, dtype=dtype)
+    return torch.sigmoid(m_loc + s_scale * eps)
+
+
+def sample_uniform(bs: int, device, dtype):
+    return torch.rand(bs, device=device, dtype=dtype)
+
+
+def sample_cosine(bs: int, device, dtype):
+    u = torch.rand(bs, device=device, dtype=dtype)
+    return torch.arccos(torch.cos(torch.tensor(0.0)) * (1 - u) + torch.cos(torch.tensor(math.pi / 2)) * u) / (math.pi / 2)
+
+
+# =============================================================================
+# Loss Functions
+# =============================================================================
+def compute_fm_loss(x0_pred, x0_target, t, loss_type="mse"):
+    B = x0_pred.shape[0]
+    t_reshaped = t.view(B, 1, 1, 1)
+    if loss_type == "mse":
+        loss = F.mse_loss(x0_pred.float(), x0_target.float(), reduction='none')
+    elif loss_type == "l1":
+        loss = F.l1_loss(x0_pred.float(), x0_target.float(), reduction='none')
+    elif loss_type == "huber":
+        loss = F.smooth_l1_loss(x0_pred.float(), x0_target.float(), reduction='none', beta=0.1)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+    snr = (1 - t_reshaped)**2 / (t_reshaped**2 + 1e-5)
+    return (loss * snr).mean()
+
+
+def compute_deltafm_loss(x0_pred, x0_target, t, deltafm_lambda: float):
+    B = x0_pred.shape[0]
+    if B <= 1 or deltafm_lambda <= 0:
+        fm_loss = compute_fm_loss(x0_pred, x0_target, t)
+        return fm_loss, torch.zeros((), device=x0_pred.device), fm_loss
+    perm = torch.arange(B, device=x0_pred.device).roll(1)
+    inputs_neg = x0_target[perm]
+    fm_loss = compute_fm_loss(x0_pred, x0_target, t)
+    neg_loss = compute_fm_loss(x0_pred, inputs_neg, t)
+    deltafm_loss = fm_loss - deltafm_lambda * neg_loss
+    return fm_loss, neg_loss, deltafm_loss
+
+
+# =============================================================================
+# Augmentations
+# =============================================================================
+def apply_noise_injection(xt, noise_inject_ratio: float):
+    if noise_inject_ratio <= 0:
+        return xt
+    noise_mask = (torch.rand(xt.shape[0], 1, 1, 1, device=xt.device) < 0.5).to(xt.dtype)
+    noise_injection = torch.randn_like(xt)
+    return xt + noise_mask * noise_inject_ratio * noise_injection
+
+
+def apply_cross_sample_mixing(xt, inputs, t, cross_ratio: float):
+    if cross_ratio <= 0:
+        return xt
+    B = xt.shape[0]
+    cross_mask = (torch.rand(B, 1, 1, 1, device=xt.device) < 0.5).to(xt.dtype)
+    inputs_neg = inputs.roll(shifts=1, dims=0)
+    noise_neg = torch.randn_like(inputs)
+    t_reshaped = t.view(B, 1, 1, 1)
+    xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
+    return xt + cross_mask * cross_ratio * (xt_neg - xt)
+
+
+# =============================================================================
+# LR Scheduler
+# =============================================================================
+def get_lr_scheduler(optimizer, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.1):
+    """Cosine decay with linear warmup."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    # Apply to optimizer
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)]
+    return schedulers
+
+
+# =============================================================================
+# Main Training
+# =============================================================================
+def train(config_path: str):
+    is_ddp, rank, local_rank, world_size, device = setup_distributed()
 
     torch.autograd.set_detect_anomaly(False)
-    torch.autograd.profiler.profile(enabled=False)
-    torch.autograd.profiler.emit_nvtx(enabled=False)
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.enable_flash_sdp(True)
 
     if rank != 0:
-        def print_pass(*args, **kwargs): pass
-
-        builtins.print = print_pass
+        builtins.print = lambda *args, **kwargs: None
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
     from model_dit import TokenformerDiT, TagProcessor, sample_flow
     ModelClass, TagProcessor, sample_fn = TokenformerDiT, TagProcessor, sample_flow
 
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
 
+    # DataLoader
     use_cached_latents = config['data'].get('use_cached_latents', False)
-    if use_cached_latents:
-        print(f">>> Using Cached Latents mode (loading pre-computed latents from {config['data']['cache_dir']})...")
-        url = config['data']['cache_dir']
-        wds_loader = WDSLoader(
-            url=url,
-            csv_path=config['data'].get('csv_path'),
-            image_size=config['training']['image_size'],
-            batch_size=config['training']['batch_size'],
-            num_workers=config['training']['num_workers'],
-            use_advanced_captions=config['data'].get('use_advanced_captions', True)
-        )
-        dataloader = wds_loader.make_loader()
-    else:
-        wds_loader = WDSLoader(
-            url=config['data']['webdataset_url'],
-            csv_path=config['data'].get('csv_path'),
-            image_size=config['training']['image_size'],
-            batch_size=config['training']['batch_size'],
-            num_workers=config['training']['num_workers'],
-            use_advanced_captions=config['data'].get('use_advanced_captions', True)
-        )
-        dataloader = wds_loader.make_loader()
+    wds_loader = WDSLoader(
+        url=config['data'].get('cache_dir' if use_cached_latents else 'webdataset_url'),
+        csv_path=config['data'].get('csv_path'),
+        image_size=config['training']['image_size'],
+        batch_size=config['training']['batch_size'],
+        num_workers=config['training']['num_workers'],
+        use_advanced_captions=config['data'].get('use_advanced_captions', True)
+    )
+    dataloader = wds_loader.make_loader()
+    data_iter = iter(dataloader)
 
     image_size = config['training']['image_size']
 
-    use_vae = config['model'].get('use_vae', False)
-    use_tiny_vae = config['model'].get('use_tiny_vae', False)
-    in_channels = config['model'].get('in_channels', 3)
+    # VAE
+    vae, latents_mean, latents_std, in_channels = setup_vae(config, device)
+    use_vae = vae is not None
+    latent_size = (image_size // 8) if use_vae else image_size // config['model'].get('patch_size', 16)
 
-    if use_vae or use_tiny_vae:
-        stats_path = "vae_stats.pt"
-        if os.path.exists(stats_path):
-            print(f">>> Loading VAE normalization stats from {stats_path}...")
-            stats = torch.load(stats_path, map_location='cpu')
-            latents_mean = stats["mean"].to(device=device, dtype=torch.bfloat16)
-            latents_std = stats["std"].to(device=device, dtype=torch.bfloat16)
-            standard_vae = None
-        else:
-            from diffusers import AutoencoderKLFlux2
-            print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
-            standard_vae = AutoencoderKLFlux2.from_pretrained(
-                "black-forest-labs/FLUX.2-dev",
-                subfolder="vae",
-                torch_dtype=torch.bfloat16
-            ).to(device=device).eval()
-
-            latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
-            latents_std = torch.sqrt(
-                standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
-            ).to(device, dtype=torch.bfloat16)
-
-            torch.save({"mean": latents_mean.cpu(), "std": latents_std.cpu()}, stats_path)
-            print(f">>> Saved VAE normalization stats to {stats_path}")
-
-        if use_tiny_vae:
-            if standard_vae is not None:
-                del standard_vae
-                torch.cuda.empty_cache()
-
-            from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
-            print(">>> Loading Tiny FLUX.2 VAE...")
-            vae = Flux2TinyAutoEncoder.from_pretrained(
-                "fal/FLUX.2-Tiny-AutoEncoder",
-            ).to(device=device, dtype=torch.bfloat16).eval()
-
-            in_channels = 128
-            print(f">>> Tiny VAE Mode Enabled: Model in_channels = {in_channels}")
-        else:
-            if standard_vae is None:
-                from diffusers import AutoencoderKLFlux2
-                print(">>> Loading Standard FLUX.2 VAE for encoding/decoding...")
-                standard_vae = AutoencoderKLFlux2.from_pretrained(
-                    "black-forest-labs/FLUX.2-dev",
-                    subfolder="vae",
-                    torch_dtype=torch.bfloat16
-                ).to(device=device).eval()
-            vae = standard_vae
-            in_channels = 128
-            print(f">>> VAE Mode Enabled: Model in_channels = {in_channels}")
-
-    latent_size = (image_size // 8) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size',
-                                                                                                        16)
-
+    # Model
     model = ModelClass(
-        in_channels=128,
+        in_channels=in_channels if use_vae else config['model'].get('in_channels', 3),
         dim=config['model'].get('dim', 768),
         depth=config['model'].get('depth', 12),
         num_heads=config['model'].get('num_heads', 12),
         num_classes=num_classes,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
-    ).to(device=device, dtype=torch.bfloat16)
+        fcdm_blocks=config['model'].get('fcdm_blocks', 2),
+    ).to(device)
 
-    # Resume Logic
-    global_step = 0
-    resume_path = config.get('resume_from', "outputs_dit/")
-    fixed_prompts = None
-    fixed_noise = None
-
-    if resume_path:
-        if os.path.isdir(resume_path):
-            ckpt_files = glob.glob(os.path.join(resume_path, "ckpt_step_*.pth"))
-            if ckpt_files:
-                resume_path = sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
-            else:
-                resume_path = None
-
-        if resume_path and os.path.exists(resume_path):
-            print(f"Resuming from: {resume_path}")
-            checkpoint = torch.load(resume_path, map_location=device)
-            model_to_load = model.module if hasattr(model, 'module') else model
-
-            state_dict = checkpoint["model_state_dict"]
-            model_state = model_to_load.state_dict()
-            keys_to_delete = [
-                k for k in state_dict
-                if k in model_state and state_dict[k].shape != model_state[k].shape
-            ]
-            for k in keys_to_delete:
-                print(f">>> Shape Mismatch: Removing {k}. "
-                      f"Checkpoint: {state_dict[k].shape}, Model: {model_state[k].shape}")
-                del state_dict[k]
-
-            model_to_load.load_state_dict(state_dict, strict=False)
-            # FIX: removed the arbitrary - 10 offset
-            global_step = checkpoint["global_step"] - 10
-
-            if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
-                fixed_noise = checkpoint["fixed_noise"].to(device)
-            if "fixed_prompts" in checkpoint:
-                fixed_prompts = checkpoint["fixed_prompts"]
-
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-
+    # torch.compile BEFORE DDP
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
         model = torch.compile(model, mode="max-autotune")
-    # model.compile()
-    # Reference to the unwrapped model for accessing k-diff parameters
+
+    # Resume
+    global_step = 0
+    fixed_prompts = None
+    fixed_noise = None
+    resume_dir = config.get('resume_from', "outputs_dit/")
+
+    # EMA (before DDP)
+    use_ema = config['training'].get('use_ema', True)
+    ema = EMA(model, decay=config['training'].get('ema_decay', 0.9999)) if use_ema else None
+
+    if resume_dir and os.path.isdir(resume_dir):
+        ckpt_files = glob.glob(os.path.join(resume_dir, "ckpt_step_*.pth"))
+        if ckpt_files:
+            resume_path = sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
+            global_step, fixed_prompts, fixed_noise = load_checkpoint(
+                model, None, ema, resume_path, device, is_ddp=False
+            )
+
+    # DDP wrap AFTER compile
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+
     model_raw = model.module if hasattr(model, 'module') else model
 
-    # Mock Optimizers for safety if file is missing locally
-    try:
-        from adv_optm import Muon_adv as NorMuon
-        from adv_optm import AdamW_adv as DionAdamW
-    except ImportError:
-        print("Warning: Advanced optimizers missing, falling back to torch.optim.AdamW")
-        NorMuon, DionAdamW = torch.optim.AdamW, torch.optim.AdamW
+    # Optimizer
+    optimizer = create_optimizer(model, config)
 
-    adamw_params, normuon_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        is_1d = p.ndim <= 1
-        is_dwconv = 'dwconv' in name or 'dw_conv' in name or (p.ndim == 4 and p.shape[1] == 1)
-        is_embedding = ('embed' in name or isinstance(p, torch.nn.Embedding)
-                        or isinstance(p, torch.nn.EmbeddingBag) or 'token_embed' in name)
-        if is_1d or is_dwconv or is_embedding:
-            adamw_params.append(p)
-        else:
-            normuon_params.append(p)
+    # Restore optimizer after construction
+    if resume_dir and os.path.isdir(resume_dir):
+        ckpt_files = glob.glob(os.path.join(resume_dir, "ckpt_step_*.pth"))
+        if ckpt_files:
+            resume_path = sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            if "optimizer_state_dict" in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                except Exception as e:
+                    print(f">>> Could not restore optimizer state: {e}")
 
-    try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95),
-                              cautious_wd=True)
-        opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0,
-                              cautious_wd=True, normuon_variant=True)
-    except Exception:
-        opt_adamw = torch.optim.AdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0.1)
-        opt_normuon = torch.optim.AdamW(normuon_params, lr=config['training']['learning_rate'], weight_decay=0.1)
+    # LR Scheduler
+    schedulers = None
+    if config['training'].get('use_lr_scheduler', False):
+        schedulers = get_lr_scheduler(
+            optimizer,
+            warmup_steps=config['training'].get('warmup_steps', 10000),
+            max_steps=config['training'].get('max_train_steps', 1000000),
+            min_lr_ratio=config['training'].get('min_lr_ratio', 0.1)
+        )
 
-    class DualOptimizer:
-        def __init__(self, opt1, opt2):
-            self.opt1 = opt1
-            self.opt2 = opt2
+    # Compile VAE
+    if use_vae and config['training'].get('compile_vae', False):
+        print(">>> Compiling VAE...")
+        vae = torch.compile(vae)
 
-        def step(self):
-            self.opt1.step()
-            self.opt2.step()
-
-        def zero_grad(self, set_to_none=True):
-            self.opt1.zero_grad(set_to_none)
-            self.opt2.zero_grad(set_to_none)
-
-        def state_dict(self):
-            return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
-
-        def load_state_dict(self, state):
-            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
-            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
-
-    optimizer = DualOptimizer(opt_adamw, opt_normuon)
-
-    # FIX: restore optimizer state after it's constructed
-    if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
-        saved_checkpoint = torch.load(resume_path, map_location=device)
-        if "optimizer_state_dict" in saved_checkpoint:
-            try:
-                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
-                print(">>> Optimizer state restored.")
-            except Exception as e:
-                print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
-
+    # WandB
     if rank == 0:
         wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
         pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
-    if (use_vae or use_tiny_vae) and not use_cached_latents:
-        vae = torch.compile(vae)
-    data_iter = iter(dataloader)
-    running_loss = 0.0
-    running_fm_loss = 0.0
-    running_neg_loss = 0.0
-    running_deltafm_loss = 0.0
-    running_total_loss = 0.0
-    running_infonce_loss = 0.0
-    accum_steps = config['training'].get('grad_accum_steps', 1)
-    is_mar = config['model'].get('type', 'v2') == 'mar'
+
+    # Training state
+    accum_steps = max(1, config['training'].get('grad_accum_steps', 1))
+    max_grad_norm = config['training'].get('max_grad_norm', 1.0)
+    log_every = config['training']['log_every_steps']
+    save_every = config['training']['save_image_every_steps']
+
+    deltafm_lambda = config['training'].get('deltafm_lambda', 0.05)
+    infonce_weight = config['training'].get('infonce_weight', 0.2)
+    noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
+    cross_ratio = config['training'].get('cross_ratio', 0.1)
+    loss_type = config['training'].get('loss_type', 'mse')
+    timestep_sampler = config['training'].get('timestep_sampler', 'uniform')
+
+    running_metrics = {
+        'fm_loss': 0.0, 'neg_loss': 0.0, 'deltafm_loss': 0.0,
+        'total_loss': 0.0, 'infonce_loss': 0.0,
+    }
+
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        fm_loss_accum = 0.0
-        neg_loss_accum = 0.0
-        deltafm_loss_accum = 0.0
-        total_loss_accum = 0.0
-        infonce_loss_accum = 0.0
+        step_metrics = {k: 0.0 for k in running_metrics}
 
-        for _ in range(accum_steps):
+        for accum_idx in range(accum_steps):
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -380,163 +535,143 @@ def train(config_path):
                 prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
             )
 
-            # VAE Encoding
-            if use_cached_latents:
-                latents = images.to(device=device, dtype=torch.bfloat16)
-                # latents = (latents - latents_mean) / latents_std
-                # Note: latents are already normalized by cache_latents.py
-                inputs = latents
-            elif use_tiny_vae:
-                images = images.to(device, memory_format=torch.channels_last)
-                with torch.no_grad():
+            # Encode
+            with torch.no_grad():
+                if use_cached_latents:
+                    latents = images.to(device=device, dtype=torch.bfloat16)
+                    vae_channels = latents.shape[1]
+                    if latents.shape[1] != in_channels:
+                        latents = F.pixel_unshuffle(latents, 2)
+                    inputs = latents
+                elif use_vae:
+                    images = images.to(device, memory_format=torch.channels_last)
                     v_images = images.to(dtype=torch.bfloat16)
-                    out = vae.encode(v_images, return_dict=False)
-                    latents = out[0] if isinstance(out, tuple) else out
-                    # Normalize at native 128ch
+                    if hasattr(vae, 'encode'):
+                        out = vae.encode(v_images)
+                        if hasattr(out, 'latent_dist'):
+                            latents = out.latent_dist.mode()
+                        else:
+                            latents = out[0] if isinstance(out, tuple) else out
+                    else:
+                        latents = vae(v_images)
+                    vae_channels = latents.shape[1]
+                    if latents.shape[1] != in_channels:
+                        latents = F.pixel_unshuffle(latents, 2)
                     latents = (latents - latents_mean) / latents_std
                     inputs = latents.to(dtype=torch.bfloat16)
+                else:
+                    inputs = images.to(device, memory_format=torch.channels_last).to(dtype=torch.bfloat16)
 
-            elif use_vae:
-                images = images.to(device, memory_format=torch.channels_last)
-                with torch.no_grad():
-                    v_images = images.to(dtype=torch.bfloat16)
-                    latents = vae.encode(v_images).latent_dist.mode()
-                    # Reshape to 128ch for normalization (stats are in 2x2 patch format)
-                    latents = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
-                    latents = (latents - latents_mean) / latents_std
-                    # Keep in 128ch — model expects in_channels=128
-                    inputs = latents
-            else:
-                images = images.to(device, memory_format=torch.channels_last)
-                inputs = images.to(dtype=torch.bfloat16)
-
+            # Fixed validation data (deterministic sizing)
             if rank == 0 and fixed_prompts is None:
-                fixed_prompts = prompts[:16]
-                fixed_noise = torch.randn_like(inputs[:16])
+                n_fixed = min(16, len(prompts))
+                fixed_prompts = prompts[:n_fixed]
+                latent_size = inputs.shape[-1]
+                fixed_noise = torch.randn(n_fixed, in_channels, latent_size, latent_size,
+                                          device=device, dtype=torch.bfloat16)
 
             B, C, H, W = inputs.shape
 
-            def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
-                eps = torch.randn(bs, device=device, dtype=dtype)
-                return torch.sigmoid(m_loc + s_scale * eps)
-
-            def sample_uniform(bs, device, dtype):
-                return torch.rand(bs, device=device, dtype=dtype)
-
-            # Global Logit-Normal Timestep Sampler
-            # t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
-            t = sample_uniform(bs=B, device=device, dtype=torch.bfloat16)
+            # Sample timesteps
+            if timestep_sampler == 'logit_normal':
+                t = sample_logit_normal(0.8, 1.0, B, device, torch.bfloat16)
+            elif timestep_sampler == 'cosine':
+                t = sample_cosine(B, device, torch.bfloat16)
+            else:
+                t = sample_uniform(B, device, torch.bfloat16)
 
             t_reshaped = t.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
-            # --- Training Augmentations (each applied independently w/ 50% chance) ---
-            # 1. Gaussian noise injection to xt to simulate drift during inference
-            noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
-            if noise_inject_ratio > 0:
-                noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                noise_injection = torch.randn_like(xt)
-                xt = xt + noise_mask * noise_inject_ratio * noise_injection
+            # Augmentations
+            xt = apply_noise_injection(xt, noise_inject_ratio)
+            xt = apply_cross_sample_mixing(xt, inputs, t, cross_ratio)
 
-            # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
-            #    from a different clean sample to simulate mean-seeking drift
-            cross_ratio = config['training'].get('cross_ratio', 0.1)
-            if cross_ratio > 0:
-                cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                inputs_neg = inputs.roll(shifts=1, dims=0)
-                noise_neg = torch.randn_like(inputs)
+            # Forward with autocast
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext():
+                x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets, return_layer_match=True)
 
-                xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
-                xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
-
-            # Model outputs direct x0 prediction and layer match loss
-            x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets,
-                                       return_layer_match=True)
-
-            # Compute x0-space loss with SNR weighting
-            x0_target = inputs
-            snr = (1 - t_reshaped)**2 / (t_reshaped**2 + 1e-5)
-            
-            deltafm_lambda = config['training'].get('deltafm_lambda', 0.05)
-            if deltafm_lambda > 0 and B > 1:
-                perm = torch.arange(B, device=device).roll(1)
-            
-                inputs_neg = inputs[perm]
-            
-                fm_loss = (F.mse_loss(x0_pred.float(), x0_target.float(), reduction='none') * snr).mean()
-                neg_loss = (F.mse_loss(x0_pred.float(), inputs_neg.float(), reduction='none') * snr).mean()
-            
-                # ∆FM flow objective
-                deltafm_loss = fm_loss - deltafm_lambda * neg_loss
-            else:
-                fm_loss = (F.mse_loss(x0_pred.float(), x0_target.float(), reduction='none') * snr).mean()
-                neg_loss = torch.zeros((), device=device)
-                deltafm_loss = fm_loss
-            
-            # Full training loss
-            total_loss = deltafm_loss + 0.2 * infonce_loss
+            # Loss
+            fm_loss, neg_loss, deltafm_loss = compute_deltafm_loss(
+                x0_pred, inputs, t, deltafm_lambda
+            )
+            total_loss = deltafm_loss + infonce_weight * infonce_loss
 
             loss = total_loss / accum_steps
             loss.backward()
-            fm_loss_accum += fm_loss.detach().item() / accum_steps
-            neg_loss_accum += neg_loss.detach().item() / accum_steps
-            deltafm_loss_accum += deltafm_loss.detach().item() / accum_steps
-            total_loss_accum += total_loss.detach().item() / accum_steps
-            infonce_loss_accum += infonce_loss.detach().item() / accum_steps
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            step_metrics['fm_loss'] += fm_loss.detach().item() / accum_steps
+            step_metrics['neg_loss'] += neg_loss.detach().item() / accum_steps
+            step_metrics['deltafm_loss'] += deltafm_loss.detach().item() / accum_steps
+            step_metrics['total_loss'] += total_loss.detach().item() / accum_steps
+            step_metrics['infonce_loss'] += infonce_loss.detach().item() / accum_steps
+
+        # Step
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
+        if ema is not None:
+            ema.update()
+
+        if schedulers is not None:
+            for s in schedulers:
+                s.step()
+
         global_step += 1
-        running_fm_loss += fm_loss_accum
-        running_neg_loss += neg_loss_accum
-        running_deltafm_loss += deltafm_loss_accum
-        running_total_loss += total_loss_accum
-        running_infonce_loss += infonce_loss_accum
+
+        for k in running_metrics:
+            running_metrics[k] += step_metrics[k]
+
+        # Logging
         if rank == 0:
             pbar.update(1)
 
-            if global_step % config['training']['log_every_steps'] == 0:
-                log_interval = config['training']['log_every_steps']
-            
-                avg_fm_loss = running_fm_loss / log_interval
-                avg_neg_loss = running_neg_loss / log_interval
-                avg_deltafm_loss = running_deltafm_loss / log_interval
-                avg_total_loss = running_total_loss / log_interval
-                avg_infonce_loss = running_infonce_loss / log_interval
-            
-                wandb.log({
-                    "train/fm_loss": avg_fm_loss,
-                    "train/neg_loss": avg_neg_loss,
-                    "train/deltafm_loss": avg_deltafm_loss,
-                    "train/total_loss": avg_total_loss,
-                    "train/infonce_loss": avg_infonce_loss,
-                    "train/deltafm_lambda": config['training'].get('deltafm_lambda', 0.05),
-                }, step=global_step)
-            
-                pbar.set_postfix({
-                    "fm": f"{avg_fm_loss:.4f}",
-                    "dfm": f"{avg_deltafm_loss:.4f}",
-                    "total": f"{avg_total_loss:.4f}",
-                    "infonce": f"{avg_infonce_loss:.4f}",
-                })
-            
-                running_fm_loss = 0.0
-                running_neg_loss = 0.0
-                running_deltafm_loss = 0.0
-                running_total_loss = 0.0
-                running_infonce_loss = 0.0
+            if global_step % log_every == 0:
+                log_interval = log_every
+                avg_metrics = {k: v / log_interval for k, v in running_metrics.items()}
 
-            if global_step % config['training']['save_image_every_steps'] == 0:
-                save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
-                                global_step, config, fixed_prompts, fixed_noise)
+                log_dict = {
+                    "train/fm_loss": avg_metrics['fm_loss'],
+                    "train/neg_loss": avg_metrics['neg_loss'],
+                    "train/deltafm_loss": avg_metrics['deltafm_loss'],
+                    "train/total_loss": avg_metrics['total_loss'],
+                    "train/infonce_loss": avg_metrics['infonce_loss'],
+                    "train/deltafm_lambda": deltafm_lambda,
+                    "train/lr": optimizer.param_groups[0]['lr'],
+                }
+                wandb.log(log_dict, step=global_step)
+
+                pbar.set_postfix({
+                    "fm": f"{avg_metrics['fm_loss']:.4f}",
+                    "dfm": f"{avg_metrics['deltafm_loss']:.4f}",
+                    "total": f"{avg_metrics['total_loss']:.4f}",
+                    "infonce": f"{avg_metrics['infonce_loss']:.4f}",
+                })
+
+                for k in running_metrics:
+                    running_metrics[k] = 0.0
+
+            # Validation & checkpoint
+            if global_step % save_every == 0:
+                save_checkpoint(
+                    model, optimizer, ema, rank, config['training']['output_dir'],
+                    global_step, config, fixed_prompts, fixed_noise,
+                    push_to_hf=config.get('push_to_hf', True),
+                    repo_id=config.get('hf_repo_id', None),
+                    is_ddp=is_ddp,
+                )
 
                 print(f"\n[Step {global_step}] Generating validation samples...")
                 model.eval()
+
+                if ema is not None:
+                    ema.apply_shadow()
+
                 with torch.no_grad():
                     samples = sample_fn(
-                        model.module if hasattr(model, 'module') else model,
+                        model_raw,
                         tag_processor,
                         latent_size,
                         len(fixed_prompts),
@@ -544,38 +679,39 @@ def train(config_path):
                         device,
                         guidance_scale=config['training'].get('cfg_scale', 1.4),
                         noise=fixed_noise,
-                        sampler_type="euler"
                     )
 
-                    if use_tiny_vae:
+                    if use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        # Un-normalize 128ch latents → decode with tiny VAE
-                        # latents = samples * latents_std + latents_mean
-                        out = vae.decode(samples, return_dict=False)
-                        recon = out[0] if isinstance(out, tuple) else out
-                        samples = recon.clamp(-1, 1) / 2.0 + 0.5
-                        samples = samples.to(dtype=torch.float32)
-
-                    elif use_vae:
-                        samples = samples.to(dtype=torch.bfloat16)
-                        # Un-normalize 128ch → pixel_shuffle to 32ch → decode with standard VAE
-                        # latents = samples * latents_std + latents_mean
-                        latents = F.pixel_shuffle(samples, 2)
-                        recon = vae.decode(latents).sample
+                        if 'vae_channels' in locals() and samples.shape[1] != vae_channels:
+                            samples = F.pixel_shuffle(samples, 2)
+                        recon = vae.decode(samples).sample if hasattr(vae, 'decode') else vae(samples)
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
+                    save_path = os.path.join(config['training']['output_dir'], f"val_ema_step_{global_step}.png")
+                    save_image(samples, save_path, nrow=4)
                     wandb.log({
                         "val/samples": wandb.Image(grid, caption=f"Step {global_step}")
                     }, step=global_step)
+
+                if ema is not None:
+                    ema.restore()
                 model.train()
 
+    # Final save
     if rank == 0:
-        save_checkpoint(model, optimizer, rank, config['training']['output_dir'],
-                        global_step, config, fixed_prompts, fixed_noise)
+        save_checkpoint(
+            model, optimizer, ema, rank, config['training']['output_dir'],
+            global_step, config, fixed_prompts, fixed_noise,
+            push_to_hf=config.get('push_to_hf', True),
+            repo_id=config.get('hf_repo_id', None),
+            is_ddp=is_ddp,
+        )
         wandb.finish()
-    cleanup_ddp()
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
@@ -583,4 +719,3 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
     train(args.config)
-    cleanup_ddp()
