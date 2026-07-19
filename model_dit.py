@@ -12,88 +12,59 @@ torch._dynamo.config.recompile_limit = 128
 # =============================================================================
 # Utilities
 # =============================================================================
-def get_timestep_embedding(t, dim):
-    """Sinusoidal timestep embedding."""
-    half_dim = dim // 2
-    emb = math.log(10000) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
-    emb = t.float()[:, None] * emb[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    if dim % 2 == 1:
-        emb = F.pad(emb, (0, 1))
-    return emb
+class LayerNorm2d(nn.LayerNorm):
+    """Channels-last LayerNorm applied in NCHW layout."""
+    def __init__(self, num_channels, eps=1e-6, affine=True):
+        super().__init__(num_channels, eps=eps, elementwise_affine=affine)
 
-
-# =============================================================================
-# FCDM Components (ConvNeXt-based)
-# =============================================================================
-class GlobalResponseNorm(nn.Module):
-    """Global Response Normalization (GRN) from ConvNeXt V2."""
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
-        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
-
-    def forward(self, x):
-        # x: [B, H, W, C]
-        gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
-        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
-        x = self.gamma * (x * nx) + self.beta + x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        x = x.permute(0, 3, 1, 2)
         return x
 
 
-class AdaLN(nn.Module):
-    """Adaptive Layer Normalization for FCDM."""
-    def __init__(self, dim, cond_dim):
+def modulate(x, shift, scale):
+    """Apply adaptive modulation: x * (1 + scale) + shift with spatial broadcast."""
+    return x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
+
+
+# =============================================================================
+# Embedding Layers for Timesteps and Tags
+# =============================================================================
+class TimestepEmbedder(nn.Module):
+    """Embeds scalar timesteps into vector representations via sinusoidal embedding + MLP."""
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
-            nn.Linear(cond_dim, 3 * dim, bias=True)
+            nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        nn.init.zeros_(self.mlp[1].weight)
-        nn.init.zeros_(self.mlp[1].bias)
+        self.frequency_embedding_size = frequency_embedding_size
 
-    def forward(self, x, c):
-        # x: [B, H, W, C], c: [B, cond_dim]
-        x_norm = self.norm(x)
-        modulation = self.mlp(c)
-        gamma, beta, alpha = modulation.chunk(3, dim=-1)
-        gamma = gamma.unsqueeze(1).unsqueeze(1)
-        beta = beta.unsqueeze(1).unsqueeze(1)
-        alpha = alpha.unsqueeze(1).unsqueeze(1)
-        x_out = x_norm * (1 + gamma) + beta
-        return x_out, alpha
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
 
-
-class FCDMBlock(nn.Module):
-    """FCDM Block: ConvNeXt with AdaLN conditioning."""
-    def __init__(self, dim, cond_dim, expansion_ratio=3, kernel_size=7):
-        super().__init__()
-        padding = kernel_size // 2
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim)
-        self.adaln = AdaLN(dim, cond_dim)
-        self.pwconv_expand = nn.Linear(dim, dim * expansion_ratio)
-        self.grn = GlobalResponseNorm(dim * expansion_ratio)
-        self.act = nn.GELU()
-        self.pwconv_reduce = nn.Linear(dim * expansion_ratio, dim)
-        nn.init.zeros_(self.pwconv_reduce.weight)
-        nn.init.zeros_(self.pwconv_reduce.bias)
-
-    def forward(self, x, c):
-        identity = x
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)          # [B, H, W, C]
-        x, alpha = self.adaln(x, c)
-        x = self.pwconv_expand(x)
-        x = self.grn(x)
-        x = self.act(x)
-        x = self.pwconv_reduce(x)
-        identity = identity.permute(0, 2, 3, 1)
-        x = identity + alpha * x
-        x = x.permute(0, 3, 1, 2)          # [B, C, H, W]
-        return x
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
 
 
 class FCDMConditioning(nn.Module):
@@ -149,89 +120,230 @@ class FCDMConditioning(nn.Module):
 
 
 # =============================================================================
+# Core FCDM Components
+# =============================================================================
+class GRN(nn.Module):
+    """GRN (Global Response Normalization) layer in NCHW format."""
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, dim, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x):
+        Gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        Nx = Gx / (Gx.mean(dim=1, keepdim=True) + 1e-6)
+        return self.gamma * (x * Nx) + self.beta + x
+
+
+class ConvNeXtBlock(nn.Module):
+    """
+    ConvNeXt-style block with adaLN-Zero conditioning (all NCHW).
+    DWConv → Norm+Modulate → Expand(1x1) → GELU → GRN → Reduce(1x1) → gate → residual.
+    """
+    def __init__(self, dim, mlp_ratio=4.0):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = LayerNorm2d(dim, affine=False, eps=1e-6)
+        self.pwconv1 = nn.Conv2d(dim, int(dim * mlp_ratio), 1)
+        self.act = nn.GELU()
+        self.grn = GRN(int(dim * mlp_ratio))
+        self.pwconv2 = nn.Conv2d(int(dim * mlp_ratio), dim, 1)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 3 * dim, bias=True)
+        )
+
+    def forward(self, x, c):
+        """
+        x: (B, C, H, W) feature map
+        c: (B, C) conditioning vector
+        """
+        h = self.dwconv(x)
+        # adaLN-Zero: compute shift, scale, gate from conditioning
+        shift, scale, gate = self.adaLN_modulation(c).unsqueeze(2).unsqueeze(3).chunk(3, dim=1)
+        h = self.norm(h)
+        h = torch.addcmul(shift, h, scale + 1)
+        # Pointwise MLP
+        h = self.pwconv1(h)
+        h = self.act(h)
+        h = self.grn(h)
+        h = self.pwconv2(h)
+        # Gate and residual
+        h = h * gate
+        return x + h
+
+
+class ConvFinalLayer(nn.Module):
+    """Conv-style final layer with adaLN modulation (shift + scale only, no gate)."""
+    def __init__(self, hidden_size, out_channels):
+        super().__init__()
+        self.norm = LayerNorm2d(hidden_size, affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+        self.conv = nn.Conv2d(hidden_size, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        x = self.conv(x)
+        return x
+
+
+class Downsample(nn.Module):
+    """Spatial downsample via Conv2d + PixelUnshuffle (2x)."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch // 4, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelUnshuffle(2),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    """Spatial upsample via Conv2d + PixelShuffle (2x)."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelShuffle(2),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+# =============================================================================
 # FCDM U-Net Backbone
 # =============================================================================
 class FCDM(nn.Module):
     """
     Fully Convolutional Diffusion Model (FCDM).
-    ConvNeXt-based U-Net with AdaLN conditioning and additive skip connections.
-    Scales via two hyperparameters: depth=L (blocks per stage-1) and dim=C (base channels).
+    ConvNeXt-based U-Net with adaLN-Zero conditioning, PixelShuffle up/down,
+    concat skip connections, and per-resolution conditioning.
     """
 
     def __init__(
         self,
         in_channels: int = 4,
         dim: int = 128,
-        depth: int = 2,
+        depth=[2, 4, 8, 4, 2],
         num_classes: int = 1000,
         use_checkpoint: bool = False,
         max_tags: int = 64,
-        fcdm_blocks: int = 2,
-        expansion_ratio: int = 3,
-        kernel_size: int = 7,
-        cond_dim: int = None,
-        **kwargs,  # absorb num_heads, num_cls_tokens etc. from old DiT configs
+        mlp_ratio: float = 3.0,
+        learn_sigma: bool = False,
+        **kwargs,  # absorb old params: expansion_ratio, kernel_size, cond_dim, fcdm_blocks
     ):
         super().__init__()
         self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.dim = dim
+        self.learn_sigma = learn_sigma
         self.use_checkpoint = use_checkpoint
-        cond_dim = cond_dim or dim
+
+        # Normalize depth: int → [d, 2d, 4d, 2d, d], list of 5 used directly
+        if isinstance(depth, int):
+            depth = [depth, depth * 2, depth * 4, depth * 2, depth]
+        assert len(depth) == 5, f"depth must be int or list of 5, got {depth}"
 
         # ---- Input projection ------------------------------------------------
-        self.input_conv = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
+        self.x_embedder = nn.Conv2d(in_channels, dim, kernel_size=3, stride=1, padding=1)
 
-        # ---- Conditioning ----------------------------------------------------
+        # ---- Per-resolution timestep embedders --------------------------------
+        self.t_embedder_1 = TimestepEmbedder(dim)
+        self.t_embedder_2 = TimestepEmbedder(dim * 2)
+        self.t_embedder_3 = TimestepEmbedder(dim * 4)
+
+        # ---- Tag conditioning: shared EmbeddingBag + per-resolution projections -
         self.y_embedder = FCDMConditioning(
-            num_classes=num_classes,
-            dim=cond_dim,
-            max_tags=max_tags,
+            num_classes=num_classes, dim=dim, max_tags=max_tags,
         )
+        self.y_proj_2 = nn.Linear(dim, dim * 2)
+        self.y_proj_3 = nn.Linear(dim, dim * 4)
 
-        # ---- Encoder ---------------------------------------------------------
-        self.enc1 = nn.ModuleList([
-            FCDMBlock(dim, cond_dim, expansion_ratio, kernel_size) for _ in range(depth)
+        # ---- Encoder level 1 -------------------------------------------------
+        self.encoder_level_1 = nn.ModuleList([
+            ConvNeXtBlock(dim, mlp_ratio=mlp_ratio) for _ in range(depth[0])
         ])
-        self.down1 = nn.Sequential(
-            nn.GroupNorm(1, dim),
-            nn.Conv2d(dim, dim * 2, kernel_size=3, stride=2, padding=1),
-        )
+        self.down1_2 = Downsample(dim, dim * 2)
 
-        self.enc2 = nn.ModuleList([
-            FCDMBlock(dim * 2, cond_dim, expansion_ratio, kernel_size) for _ in range(depth * 2)
+        # ---- Encoder level 2 -------------------------------------------------
+        self.encoder_level_2 = nn.ModuleList([
+            ConvNeXtBlock(dim * 2, mlp_ratio=mlp_ratio) for _ in range(depth[1])
         ])
-        self.down2 = nn.Sequential(
-            nn.GroupNorm(1, dim * 2),
-            nn.Conv2d(dim * 2, dim * 4, kernel_size=3, stride=2, padding=1),
-        )
+        self.down2_3 = Downsample(dim * 2, dim * 4)
 
-        # ---- Bottleneck ------------------------------------------------------
-        self.bottleneck = nn.ModuleList([
-            FCDMBlock(dim * 4, cond_dim, expansion_ratio, kernel_size) for _ in range(depth * 4)
+        # ---- Bottleneck (latent) ---------------------------------------------
+        self.latent = nn.ModuleList([
+            ConvNeXtBlock(dim * 4, mlp_ratio=mlp_ratio) for _ in range(depth[2])
         ])
 
-        # ---- Decoder ---------------------------------------------------------
-        self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(dim * 4, dim * 2, kernel_size=3, padding=1),
-        )
-        self.dec2 = nn.ModuleList([
-            FCDMBlock(dim * 2, cond_dim, expansion_ratio, kernel_size) for _ in range(depth * 2)
+        # ---- Decoder level 2 -------------------------------------------------
+        self.up3_2 = Upsample(dim * 4, dim * 2)
+        self.reduce_chans_2 = nn.Conv2d(dim * 4, dim * 2, kernel_size=1)
+        self.decoder_level_2 = nn.ModuleList([
+            ConvNeXtBlock(dim * 2, mlp_ratio=mlp_ratio) for _ in range(depth[3])
         ])
 
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1),
-        )
-        self.dec1 = nn.ModuleList([
-            FCDMBlock(dim, cond_dim, expansion_ratio, kernel_size) for _ in range(depth)
+        # ---- Decoder level 1 -------------------------------------------------
+        self.up2_1 = Upsample(dim * 2, dim)
+        self.reduce_chans_1 = nn.Conv2d(dim * 2, dim, kernel_size=1)
+        self.decoder_level_1 = nn.ModuleList([
+            ConvNeXtBlock(dim, mlp_ratio=mlp_ratio) for _ in range(depth[4])
         ])
 
-        # ---- Output ----------------------------------------------------------
-        self.final_norm = nn.GroupNorm(1, dim)
-        self.final_conv = nn.Conv2d(dim, in_channels, kernel_size=3, padding=1)
-        nn.init.zeros_(self.final_conv.weight)
-        nn.init.zeros_(self.final_conv.bias)
+        # ---- Output -----------------------------------------------------------
+        self.output_layer = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1)
+        self.final_layer = ConvFinalLayer(dim, self.out_channels)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Xavier init for all Linear and Conv2d
+        def _basic_init(module):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Input projection (re-init as flat matrix)
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        nn.init.constant_(self.x_embedder.bias, 0)
+
+        # Tag embedding (re-init after _basic_init overwrote it)
+        nn.init.normal_(self.y_embedder.embedding_bag.weight, std=0.02)
+        with torch.no_grad():
+            self.y_embedder.embedding_bag.weight[self.y_embedder.padding_idx].zero_()
+
+        # Timestep embedding MLPs
+        for t_emb in [self.t_embedder_1, self.t_embedder_2, self.t_embedder_3]:
+            nn.init.normal_(t_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(t_emb.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in all blocks
+        all_blocks = (
+            list(self.encoder_level_1) + list(self.encoder_level_2) +
+            list(self.latent) +
+            list(self.decoder_level_2) + list(self.decoder_level_1)
+        )
+        for block in all_blocks:
+            if hasattr(block, 'adaLN_modulation'):
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out final layer
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.conv.weight, 0)
+        nn.init.constant_(self.final_layer.conv.bias, 0)
 
     def _block_forward(self, block, x, c):
         if self.use_checkpoint and self.training:
@@ -248,49 +360,62 @@ class FCDM(nn.Module):
         return_layer_match=False,
         **kwargs,
     ):
-        B, C, H, W = x_in.shape
-
+        """
+        Forward pass of FCDM.
+        x_in: (B, C, H, W) input (images or latent representations)
+        t: (B,) diffusion timesteps in [0, 1]
+        y_indices: flat 1-D tag indices
+        y_offsets: per-sample offsets into y_indices
+        """
         # Project input
-        x = self.input_conv(x_in)
+        x = self.x_embedder(x_in)
 
-        # Conditioning: time + tags
-        t_emb = get_timestep_embedding(t * 1000.0, self.y_embedder.dim).to(x_in.dtype)
-        y_emb = self.y_embedder(y_indices, y_offsets)
-        c = t_emb + y_emb  # [B, cond_dim]
+        # Per-resolution conditioning: time + tags
+        t_scaled = t * 1000.0
+        y_base = self.y_embedder(y_indices, y_offsets)  # [B, dim]
 
-        # Encoder
-        for block in self.enc1:
-            x = self._block_forward(block, x, c)
-        skip1 = x
-        x = self.down1(x)
+        c1 = self.t_embedder_1(t_scaled) + y_base
+        c2 = self.t_embedder_2(t_scaled) + self.y_proj_2(y_base)
+        c3 = self.t_embedder_3(t_scaled) + self.y_proj_3(y_base)
 
-        for block in self.enc2:
-            x = self._block_forward(block, x, c)
-        skip2 = x
-        x = self.down2(x)
+        # Encoder level 1
+        out_enc_level1 = x
+        for block in self.encoder_level_1:
+            out_enc_level1 = self._block_forward(block, out_enc_level1, c1)
+        inp_enc_level2 = self.down1_2(out_enc_level1)
+
+        # Encoder level 2
+        out_enc_level2 = inp_enc_level2
+        for block in self.encoder_level_2:
+            out_enc_level2 = self._block_forward(block, out_enc_level2, c2)
+        inp_enc_level3 = self.down2_3(out_enc_level2)
 
         # Bottleneck
-        for block in self.bottleneck:
-            x = self._block_forward(block, x, c)
+        latent = inp_enc_level3
+        for block in self.latent:
+            latent = self._block_forward(block, latent, c3)
 
-        # Decoder with additive skips
-        x = self.up2(x)
-        x = x[:, :, :skip2.shape[2], :skip2.shape[3]]
-        x = x + skip2
-        for block in self.dec2:
-            x = self._block_forward(block, x, c)
+        # Decoder level 2 (concat skip)
+        inp_dec_level2 = self.up3_2(latent)
+        inp_dec_level2 = inp_dec_level2[:, :, :out_enc_level2.shape[2], :out_enc_level2.shape[3]]
+        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
+        out_dec_level2 = self.reduce_chans_2(inp_dec_level2)
+        for block in self.decoder_level_2:
+            out_dec_level2 = self._block_forward(block, out_dec_level2, c2)
 
-        x = self.up1(x)
-        x = x[:, :, :skip1.shape[2], :skip1.shape[3]]
-        x = x + skip1
-        for block in self.dec1:
-            x = self._block_forward(block, x, c)
+        # Decoder level 1 (concat skip)
+        inp_dec_level1 = self.up2_1(out_dec_level2)
+        inp_dec_level1 = inp_dec_level1[:, :, :out_enc_level1.shape[2], :out_enc_level1.shape[3]]
+        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
+        out_dec_level1 = self.reduce_chans_1(inp_dec_level1)
+        for block in self.decoder_level_1:
+            out_dec_level1 = self._block_forward(block, out_dec_level1, c1)
 
         # Output
-        x = self.final_norm(x)
-        x0_pred = self.final_conv(x)
+        x = self.output_layer(out_dec_level1)
+        x0_pred = self.final_layer(x, c1)
 
-        # Layer-match placeholder (kept for training-script compatibility)
+        # Compatibility returns
         infonce_loss = torch.tensor(0.0, device=x0_pred.device, dtype=x0_pred.dtype)
 
         if return_features:
@@ -302,6 +427,29 @@ class FCDM(nn.Module):
 
 # Backward-compat alias so old imports don't break
 TokenformerDiT = FCDM
+
+
+# =============================================================================
+# FCDM Model Configs
+# =============================================================================
+def FCDM_S(**kwargs):
+    return FCDM(dim=128, depth=[2, 4, 8, 4, 2], **kwargs)
+
+def FCDM_B(**kwargs):
+    return FCDM(dim=256, depth=[2, 4, 8, 4, 2], **kwargs)
+
+def FCDM_L(**kwargs):
+    return FCDM(dim=512, depth=[2, 4, 8, 4, 2], **kwargs)
+
+def FCDM_XL(**kwargs):
+    return FCDM(dim=512, depth=[3, 6, 12, 6, 3], **kwargs)
+
+FCDM_models = {
+    'FCDM-S': FCDM_S,
+    'FCDM-B': FCDM_B,
+    'FCDM-L': FCDM_L,
+    'FCDM-XL': FCDM_XL,
+}
 
 
 # =============================================================================
@@ -393,10 +541,10 @@ if __name__ == "__main__":
     model = FCDM(
         in_channels=4,
         dim=128,
-        depth=2,
+        depth=[2, 4, 8, 4, 2],
         num_classes=1000,
         max_tags=64,
-        fcdm_blocks=2,
+        mlp_ratio=3.0,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -427,6 +575,18 @@ if __name__ == "__main__":
     loss = F.mse_loss(x0_pred, torch.randn_like(x0_pred)) + 0.2 * infonce
     loss.backward()
     print(f"  [OK] Backward: loss={loss.item():.4f}")
+
+    # Test 4: learn_sigma
+    model_sigma = FCDM(in_channels=4, dim=64, depth=[1, 2, 4, 2, 1], num_classes=100, learn_sigma=True).to(device)
+    out = model_sigma(x_in, t, y_indices, y_offsets)
+    assert out.shape == (batch_size, 8, H, W), f"Expected 8 channels with learn_sigma, got {out.shape}"
+    print(f"  [OK] learn_sigma: {out.shape}")
+
+    # Test 5: depth as int (backward compat)
+    model_int = FCDM(in_channels=4, dim=64, depth=2, num_classes=100).to(device)
+    out = model_int(x_in, t, y_indices, y_offsets)
+    assert out.shape == x_in.shape
+    print(f"  [OK] depth=int: {out.shape}")
 
     print("\n" + "=" * 60)
     print("All tests passed!")
