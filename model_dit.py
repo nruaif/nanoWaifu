@@ -8,6 +8,10 @@ import random
 
 torch._dynamo.config.recompile_limit = 128
 
+_ = torch._dynamo
+# Now the config should be available
+torch._functorch.config.activation_memory_budget = 0.5
+
 
 # =============================================================================
 # Utilities
@@ -623,6 +627,7 @@ class FCDM(nn.Module):
             return checkpoint(self.topk_memory, x, use_reentrant=False)
         return self.topk_memory(x)
 
+    @torch.compile
     def forward(
         self,
         x_in,
