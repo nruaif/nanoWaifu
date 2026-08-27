@@ -1,5 +1,5 @@
 training:
-  batch_size: 64
+  batch_size: 32
   grad_accum_steps: 1
   learning_rate: 1.0e-4
   max_train_steps: 2000000
@@ -8,18 +8,18 @@ training:
   # Training objective:
   #   flow_matching - multi-step FM (default)
   #   emf           - Euler Mean Flows, one-step / few-step generation (emf.py)
-  objective: flow_matching
+  objective: emf
 
   # EMF settings (used when objective: emf)
-  # emf:
-  #   delta_t: 0.05          # local linearization step size
-  #   interval_ratio: 0.25   # fraction of samples with r != t
-  #   time_sampler: uniform  # or logit_normal
-  #   cfg_scale: 2.5         # effective guidance baked into the model (0 = off)
-  #   cfg_k: 0.4             # CFG mixing coefficient
-  #   adaptive_c: 0.001      # adaptive loss constants (MeanFlow / ECM style)
-  #   adaptive_p: 1.0
-  #   val_steps: 1           # sampling steps for validation images
+  emf:
+    delta_t: 0.05          # local linearization step size
+    interval_ratio: 0.25   # fraction of samples with r != t
+    time_sampler: uniform  # or logit_normal
+    cfg_scale: 2.5         # effective guidance baked into the model (0 = off)
+    cfg_k: 0.4             # CFG mixing coefficient
+    adaptive_c: 0.001      # adaptive loss constants (MeanFlow / ECM style)
+    adaptive_p: 1.0
+    val_steps: 8           # sampling steps for validation images
 
   compile: false
   compile_vae: false
@@ -41,7 +41,7 @@ training:
 
   # Loss
   loss_type: "mse"
-  deltafm_lambda: 0.05
+  deltafm_lambda: 0
   infonce_weight: 0
 
   # Timestep sampling
@@ -74,7 +74,7 @@ model:
   #   FCDM-L : dim=512, depth=2  (~505M params, 48.3 GFLOPs)
   #   FCDM-XL: dim=512, depth=3  (~699M params, 64.6 GFLOPs)
   dim: 256
-  depth: 2
+  depth: 3
 
   # Attention after every N blocks in the decoder stages (0 = off)
   attn_every: 3
@@ -92,7 +92,7 @@ model:
   # Placed after 2nd ConvNeXt in decoder_level_1 (full-resolution, c_in=dim)
   use_topk_memory: true
   topk_c_mem: 512
-  topk_num_entries: 4096
+  topk_num_entries: 262144
   topk_top_k: 8
   topk_query_dim: 64
 
@@ -105,6 +105,6 @@ model:
   in_channels: 3
 
 data:
-  cache_dir: '/workspace/nanoWaifu/cached_latents/latents-000{00..66}.tar'
-  use_cached_latents: true
+  use_cached_latents: false
+  webdataset_url: "/workspace/data/train/000{00..99}.tar"
   use_advanced_captions: true
