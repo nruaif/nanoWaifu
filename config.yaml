@@ -79,16 +79,17 @@ model:
   # Attention after every N blocks in the decoder stages (0 = off)
   attn_every: 3
 
-  # LFQ Memory Block at end of Block 2 (encoder_level_2) — legacy (Linear K->c_mem)
+  # LFQ Memory Block at final stage (decoder_level_1) after 2nd block — legacy (Linear K->c_mem)
   # Disabled by default. Enable with use_lfq_memory: true
   use_lfq_memory: false
   lfq_c_mem: 512
   lfq_num_latents: 8
   lfq_k_bits: 12
 
-  # Top-K Memory Block at end of Block 2 (encoder_level_2) — current (sparse)
+  # Top-K Memory Block at final stage (decoder_level_1) after 2nd block — current (sparse)
   # Replaces LFQ's 2^K tables with learned keys/values + top-k routing.
   # Uses nn.Linear for q_proj + nn.Parameter keys/values, fully differentiable via softmax(top-k).
+  # Placed after 2nd ConvNeXt in decoder_level_1 (full-resolution, c_in=dim)
   use_topk_memory: true
   topk_c_mem: 512
   topk_num_entries: 4096

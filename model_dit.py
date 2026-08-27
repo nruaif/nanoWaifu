@@ -465,12 +465,12 @@ class FCDM(nn.Module):
         mlp_ratio: float = 3.0,
         learn_sigma: bool = False,
         attn_every: int = 3,
-        # LFQ Memory at end of Block 2 (encoder_level_2) - legacy
+        # LFQ Memory at final stage (decoder_level_1) after 2nd block - legacy
         use_lfq_memory: bool = False,
         lfq_c_mem: int = 512,
         lfq_num_latents: int = 8,
         lfq_k_bits: int = 18,
-        # Top-K Memory at end of Block 2 (encoder_level_2) - current
+        # Top-K Memory at final stage (decoder_level_1) after 2nd block - current
         use_topk_memory: bool = False,
         topk_c_mem: int = 512,
         topk_num_entries: int = 4096,
@@ -515,21 +515,6 @@ class FCDM(nn.Module):
         self.encoder_level_2 = nn.ModuleList([
             ConvNeXtBlock(dim * 2, mlp_ratio=mlp_ratio) for _ in range(depth[1])
         ])
-        # Memory Block at end of encoder_level_2 (Block 2)
-        # Supports LFQ (legacy, Linear) and Top-K (current, sparse).
-        # Only one is active; TopK takes precedence if both enabled.
-        self.lfq_memory = None
-        self.topk_memory = None
-        if use_topk_memory:
-            self.topk_memory = TopKMemoryBlock2D(
-                c_in=dim * 2, c_mem=topk_c_mem,
-                num_entries=topk_num_entries, top_k=topk_top_k, query_dim=topk_query_dim
-            )
-        elif use_lfq_memory:
-            self.lfq_memory = LFQMemoryBlock2D(
-                c_in=dim * 2, c_mem=lfq_c_mem,
-                num_latents=lfq_num_latents, k_bits=lfq_k_bits
-            )
         self.down2_3 = Downsample(dim * 2, dim * 4)
 
         # ---- Bottleneck (latent) ---------------------------------------------
@@ -546,6 +531,22 @@ class FCDM(nn.Module):
         self.up2_1 = Upsample(dim * 2, dim)
         self.reduce_chans_1 = nn.Conv2d(dim * 2, dim, kernel_size=1)
         self.decoder_level_1 = _stage_blocks(dim, depth[4], mlp_ratio, attn_every)
+        # Memory Block at final stage (decoder_level_1) after 2nd block
+        # Supports LFQ (legacy, Linear) and Top-K (current, sparse).
+        # Only one is active; TopK takes precedence if both enabled.
+        # Placed after 2nd block in decoder_level_1 (full-resolution stage); c_in=dim
+        self.lfq_memory = None
+        self.topk_memory = None
+        if use_topk_memory:
+            self.topk_memory = TopKMemoryBlock2D(
+                c_in=dim, c_mem=topk_c_mem,
+                num_entries=topk_num_entries, top_k=topk_top_k, query_dim=topk_query_dim
+            )
+        elif use_lfq_memory:
+            self.lfq_memory = LFQMemoryBlock2D(
+                c_in=dim, c_mem=lfq_c_mem,
+                num_latents=lfq_num_latents, k_bits=lfq_k_bits
+            )
 
         # ---- Output -----------------------------------------------------------
         self.output_layer = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1)
@@ -670,12 +671,6 @@ class FCDM(nn.Module):
         out_enc_level2 = inp_enc_level2
         for block in self.encoder_level_2:
             out_enc_level2 = self._block_forward(block, out_enc_level2, c2)
-        # Memory Block at end of Block 2 (non-causal, NCHW-friendly)
-        # TopK takes precedence over LFQ
-        if self.topk_memory is not None:
-            out_enc_level2 = self._topk_forward(out_enc_level2)
-        elif self.lfq_memory is not None:
-            out_enc_level2 = self._lfq_forward(out_enc_level2)
         inp_enc_level3 = self.down2_3(out_enc_level2)
 
         # Bottleneck
@@ -691,13 +686,25 @@ class FCDM(nn.Module):
         for block in self.decoder_level_2:
             out_dec_level2 = self._block_forward(block, out_dec_level2, c2)
 
-        # Decoder level 1 (concat skip)
+        # Decoder level 1 (concat skip) - memory after 2nd block in final stage
         inp_dec_level1 = self.up2_1(out_dec_level2)
         inp_dec_level1 = inp_dec_level1[:, :, :out_enc_level1.shape[2], :out_enc_level1.shape[3]]
         inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
         out_dec_level1 = self.reduce_chans_1(inp_dec_level1)
-        for block in self.decoder_level_1:
+        for idx, block in enumerate(self.decoder_level_1):
             out_dec_level1 = self._block_forward(block, out_dec_level1, c1)
+            # Inject memory after 2nd block (idx==1) in final stage (c_in=dim)
+            if idx == 1:
+                if self.topk_memory is not None:
+                    out_dec_level1 = self._topk_forward(out_dec_level1)
+                elif self.lfq_memory is not None:
+                    out_dec_level1 = self._lfq_forward(out_dec_level1)
+        # If depth[4] <2, still apply at end (covers depth 1 case)
+        if len(self.decoder_level_1) < 2:
+            if self.topk_memory is not None:
+                out_dec_level1 = self._topk_forward(out_dec_level1)
+            elif self.lfq_memory is not None:
+                out_dec_level1 = self._lfq_forward(out_dec_level1)
 
         # Output
         x = self.output_layer(out_dec_level1)
