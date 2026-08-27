@@ -806,20 +806,22 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
     null_prompts = [""] * batch_size
     y_null_indices, y_null_offsets = tag_processor.process_prompts(null_prompts, device)
 
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    # Consistent with training: t=0 noise, t=1 data, model predicts x (data)
+    # x_t = (1-t) noise + t x1, v = (x1 - x_t)/(1-t)
+    ts = torch.linspace(0.0, 1.0, steps + 1, device=device)
     for i in tqdm(range(steps), desc="Sampling", disable=device.type == "cpu"):
         t_curr = ts[i]
         t_next = ts[i + 1]
-        dt = t_next - t_curr
+        dt = float(t_next - t_curr)
 
-        t_vec = torch.full((batch_size,), t_curr.item(), device=device, dtype=x.dtype)
+        t_vec = torch.full((batch_size,), float(t_curr), device=device, dtype=x.dtype)
 
-        x0_cond = model(x, t_vec, y_indices, y_offsets)
-        x0_uncond = model(x, t_vec, y_null_indices, y_null_offsets)
+        x1_cond = model(x, t_vec, y_indices, y_offsets)
+        x1_uncond = model(x, t_vec, y_null_indices, y_null_offsets)
 
-        x0 = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
-        t_reshaped = t_vec.view(-1, 1, 1, 1).clamp(min=1e-5)
-        v = (x - x0) / t_reshaped
+        x1 = x1_uncond + guidance_scale * (x1_cond - x1_uncond)
+        denom = (1 - t_vec.view(-1, 1, 1, 1)).clamp(min=0.02)
+        v = (x1 - x) / denom
         x = x + dt * v
 
     return x
