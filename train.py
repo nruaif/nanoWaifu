@@ -11,7 +11,9 @@ import wandb
 import glob
 import builtins
 from dataset import WDSLoader
+from emf import emf_loss, sample_emf, sample_emf_times
 import torch.nn.functional as F
+from flux2_tiny_autoencoder import normalize_latent_f8
 from huggingface_hub import upload_file
 import threading
 import time
@@ -61,6 +63,13 @@ def cleanup_distributed():
 # =============================================================================
 # Checkpointing (with EMA support)
 # =============================================================================
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    ckpt_files = glob.glob(os.path.join(output_dir, "ckpt_step_*.pth"))
+    if not ckpt_files:
+        return None
+    return sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
+
+
 def cleanup_checkpoints(output_dir: str, max_checkpoints: int, rank: int):
     if rank != 0 or max_checkpoints <= 0:
         return
@@ -234,55 +243,77 @@ class EMA:
 # =============================================================================
 # VAE Setup
 # =============================================================================
-def setup_vae(config: Dict[str, Any], device):
-    use_vae = config['model'].get('use_vae', False)
-    use_tiny_vae = config['model'].get('use_tiny_vae', False)
-    if not (use_vae or use_tiny_vae):
-        return None, None, None, 3
+def load_vae_stats(device):
+    """Load (or extract once and cache) FLUX.2 latent normalization stats.
 
+    Stats are stored in the VAE's internal 2x2-patchified layout [1, 4C, 1, 1]
+    (e.g. 128 channels for the 32-channel f/8 latent).
+    """
     stats_path = "vae_stats.pt"
-    standard_vae = None
-
     if os.path.exists(stats_path):
         print(f">>> Loading VAE normalization stats from {stats_path}...")
         stats = torch.load(stats_path, map_location='cpu', weights_only=False)
-        latents_mean = stats["mean"].to(device=device, dtype=torch.bfloat16)
-        latents_std = stats["std"].to(device=device, dtype=torch.bfloat16)
-    else:
-        from diffusers import AutoencoderKLFlux2
-        print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
-        standard_vae = AutoencoderKLFlux2.from_pretrained(
-            "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
-        ).to(device=device).eval()
-        latents_mean = standard_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
-        latents_std = torch.sqrt(
-            standard_vae.bn.running_var.view(1, -1, 1, 1) + standard_vae.config.batch_norm_eps
-        ).to(device, dtype=torch.bfloat16)
-        torch.save({"mean": latents_mean.cpu(), "std": latents_std.cpu()}, stats_path)
-        print(f">>> Saved VAE normalization stats to {stats_path}")
+        return (stats["mean"].to(device=device, dtype=torch.bfloat16),
+                stats["std"].to(device=device, dtype=torch.bfloat16))
 
-    if use_tiny_vae:
-        if standard_vae is not None:
-            del standard_vae
-            torch.cuda.empty_cache()
+    from diffusers import AutoencoderKLFlux2
+    print(">>> Loading Standard FLUX.2 VAE to extract normalization stats...")
+    std_vae = AutoencoderKLFlux2.from_pretrained(
+        "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+    ).to(device=device).eval()
+    mean = std_vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype=torch.bfloat16)
+    std = torch.sqrt(
+        std_vae.bn.running_var.view(1, -1, 1, 1) + std_vae.config.batch_norm_eps
+    ).to(device, dtype=torch.bfloat16)
+    torch.save({"mean": mean.cpu(), "std": std.cpu()}, stats_path)
+    print(f">>> Saved VAE normalization stats to {stats_path}")
+    del std_vae
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return mean, std
+
+
+def load_decode_vae(config: Dict[str, Any], device):
+    """Load the VAE used for decoding validation samples.
+
+    Returns (vae, decode_channels): the Tiny VAE decodes the patchified
+    128-channel f/16 layout, the standard VAE decodes 32-channel f/8 directly.
+    """
+    if config['model'].get('use_tiny_vae', False):
         from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
-        print(">>> Loading Tiny FLUX.2 VAE...")
         vae = Flux2TinyAutoEncoder.from_pretrained("fal/FLUX.2-Tiny-AutoEncoder")
         vae = vae.to(device=device, dtype=torch.bfloat16).eval()
-        in_channels = 128
-        print(f">>> Tiny VAE Mode: in_channels = {in_channels}")
-    else:
-        if standard_vae is None:
-            from diffusers import AutoencoderKLFlux2
-            print(">>> Loading Standard FLUX.2 VAE...")
-            standard_vae = AutoencoderKLFlux2.from_pretrained(
-                "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
-            ).to(device=device).eval()
-        vae = standard_vae
-        in_channels = 128
-        print(f">>> Standard VAE Mode: in_channels = {in_channels}")
+        return vae, vae.tiny_vae.latent_channels * 4
+    from diffusers import AutoencoderKLFlux2
+    vae = AutoencoderKLFlux2.from_pretrained(
+        "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
+    ).to(device=device).eval()
+    return vae, vae.config.latent_channels
 
-    return vae, latents_mean, latents_std, in_channels
+
+def setup_vae(config: Dict[str, Any], device, decode_only: bool = False):
+    """Returns (vae, latents_mean, latents_std, in_channels, decode_channels).
+
+    The model always consumes the native f/8 latent (in_channels = 32 for
+    FLUX.2). With decode_only (cached-latent training) no VAE is kept in
+    memory during training; load_decode_vae() provides one at validation.
+    """
+    use_vae = config['model'].get('use_vae', False)
+    use_tiny_vae = config['model'].get('use_tiny_vae', False)
+    if not (use_vae or use_tiny_vae):
+        return None, None, None, 3, None
+
+    latents_mean, latents_std = load_vae_stats(device)
+    in_channels = latents_mean.shape[1] // 4  # f/8 native channels
+    print(f">>> VAE Mode ({'tiny' if use_tiny_vae else 'standard'}): "
+          f"model consumes f/8 latents with {in_channels} channels")
+
+    if decode_only:
+        print(">>> Cached-latent training: VAE loads lazily at validation")
+        return None, latents_mean, latents_std, in_channels, None
+
+    vae, decode_channels = load_decode_vae(config, device)
+    return vae, latents_mean, latents_std, in_channels, decode_channels
 
 
 # =============================================================================
@@ -299,7 +330,7 @@ def sample_uniform(bs: int, device, dtype):
 
 def sample_cosine(bs: int, device, dtype):
     u = torch.rand(bs, device=device, dtype=dtype)
-    return torch.arccos(torch.cos(torch.tensor(0.0)) * (1 - u) + torch.cos(torch.tensor(math.pi / 2)) * u) / (math.pi / 2)
+    return 2.0 * torch.arccos(1 - u) / math.pi
 
 
 # =============================================================================
@@ -389,7 +420,6 @@ def train(config_path: str):
         config = yaml.safe_load(f)
 
     from model_dit import FCDM, TagProcessor, sample_flow
-    ModelClass, TagProcessor, sample_fn = FCDM, TagProcessor, sample_flow
 
     tag_processor = TagProcessor("tags.txt")
     num_classes = tag_processor.num_classes
@@ -398,7 +428,6 @@ def train(config_path: str):
     use_cached_latents = config['data'].get('use_cached_latents', False)
     wds_loader = WDSLoader(
         url=config['data'].get('cache_dir' if use_cached_latents else 'webdataset_url'),
-        csv_path=config['data'].get('csv_path'),
         image_size=config['training']['image_size'],
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
@@ -410,18 +439,29 @@ def train(config_path: str):
     image_size = config['training']['image_size']
 
     # VAE
-    vae, latents_mean, latents_std, in_channels = setup_vae(config, device)
-    use_vae = vae is not None
+    vae, latents_mean, latents_std, in_channels, vae_channels = setup_vae(
+        config, device, decode_only=use_cached_latents
+    )
+    use_vae = vae is not None or latents_mean is not None
     latent_size = (image_size // 8) if use_vae else image_size // config['model'].get('patch_size', 16)
 
     # Model
-    model = ModelClass(
+    model = FCDM(
         in_channels=in_channels if use_vae else config['model'].get('in_channels', 3),
         dim=config['model'].get('dim', 128),
         depth=config['model'].get('depth', 2),
         num_classes=num_classes,
         use_checkpoint=config['training'].get('gradient_checkpointing', False),
-        fcdm_blocks=config['model'].get('fcdm_blocks', 2),
+        attn_every=config['model'].get('attn_every', 3),
+        use_lfq_memory=config['model'].get('use_lfq_memory', False),
+        lfq_c_mem=config['model'].get('lfq_c_mem', 512),
+        lfq_num_latents=config['model'].get('lfq_num_latents', 8),
+        lfq_k_bits=config['model'].get('lfq_k_bits', 12),
+        use_topk_memory=config['model'].get('use_topk_memory', False),
+        topk_c_mem=config['model'].get('topk_c_mem', 512),
+        topk_num_entries=config['model'].get('topk_num_entries', 4096),
+        topk_top_k=config['model'].get('topk_top_k', 8),
+        topk_query_dim=config['model'].get('topk_query_dim', 64),
     ).to(device)
 
     # torch.compile BEFORE DDP
@@ -430,22 +470,11 @@ def train(config_path: str):
         model = torch.compile(model, mode="max-autotune")
 
     # Resume
-    global_step = 0
-    fixed_prompts = None
-    fixed_noise = None
     resume_dir = config.get('resume_from', "outputs_fcdm/")
 
     # EMA (before DDP)
     use_ema = config['training'].get('use_ema', True)
     ema = EMA(model, decay=config['training'].get('ema_decay', 0.9999)) if use_ema else None
-
-    if resume_dir and os.path.isdir(resume_dir):
-        ckpt_files = glob.glob(os.path.join(resume_dir, "ckpt_step_*.pth"))
-        if ckpt_files:
-            resume_path = sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
-            global_step, fixed_prompts, fixed_noise = load_checkpoint(
-                model, None, ema, resume_path, device, is_ddp=False
-            )
 
     # DDP wrap AFTER compile
     if is_ddp:
@@ -456,17 +485,15 @@ def train(config_path: str):
     # Optimizer
     optimizer = create_optimizer(model, config)
 
-    # Restore optimizer after construction
-    if resume_dir and os.path.isdir(resume_dir):
-        ckpt_files = glob.glob(os.path.join(resume_dir, "ckpt_step_*.pth"))
-        if ckpt_files:
-            resume_path = sorted(ckpt_files, key=lambda x: int(x.split('_')[-1].split('.')[0]))[-1]
-            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-            if "optimizer_state_dict" in checkpoint:
-                try:
-                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                except Exception as e:
-                    print(f">>> Could not restore optimizer state: {e}")
+    # Restore model, EMA, and optimizer state from the newest checkpoint
+    global_step = 0
+    fixed_prompts = None
+    fixed_noise = None
+    resume_path = find_latest_checkpoint(resume_dir) if resume_dir else None
+    if resume_path:
+        global_step, fixed_prompts, fixed_noise = load_checkpoint(
+            model, optimizer, ema, resume_path, device, is_ddp=is_ddp
+        )
 
     # LR Scheduler
     schedulers = None
@@ -479,7 +506,7 @@ def train(config_path: str):
         )
 
     # Compile VAE
-    if use_vae and config['training'].get('compile_vae', False):
+    if vae is not None and config['training'].get('compile_vae', False):
         print(">>> Compiling VAE...")
         vae = torch.compile(vae)
 
@@ -503,10 +530,26 @@ def train(config_path: str):
     loss_type = config['training'].get('loss_type', 'mse')
     timestep_sampler = config['training'].get('timestep_sampler', 'uniform')
 
-    running_metrics = {
-        'fm_loss': 0.0, 'neg_loss': 0.0, 'deltafm_loss': 0.0,
-        'total_loss': 0.0, 'infonce_loss': 0.0,
-    }
+    # Objective: "flow_matching" (multi-step) or "emf" (Euler Mean Flows,
+    # one-step / few-step generation; see emf.py)
+    objective = config['training'].get('objective', 'flow_matching')
+    emf_opts = config['training'].get('emf', {}) or {}
+    emf_delta_t = emf_opts.get('delta_t', 0.05)
+    emf_interval_ratio = emf_opts.get('interval_ratio', 0.25)
+    emf_time_sampler = emf_opts.get('time_sampler', 'uniform')
+    emf_cfg_scale = emf_opts.get('cfg_scale', 2.5)
+    emf_cfg_k = emf_opts.get('cfg_k', 0.4)
+    emf_adaptive_c = emf_opts.get('adaptive_c', 1e-3)
+    emf_adaptive_p = emf_opts.get('adaptive_p', 1.0)
+    emf_val_steps = emf_opts.get('val_steps', 1)
+
+    if objective == 'emf':
+        running_metrics = {'emf_loss': 0.0}
+    else:
+        running_metrics = {
+            'fm_loss': 0.0, 'neg_loss': 0.0, 'deltafm_loss': 0.0,
+            'total_loss': 0.0, 'infonce_loss': 0.0,
+        }
 
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
@@ -525,14 +568,19 @@ def train(config_path: str):
             y_indices, y_offsets = tag_processor.process_prompts(
                 prompts, device, dropout_prob=config['training'].get('class_dropout_prob', 0.1)
             )
+            if objective == 'emf':
+                y_null = tag_processor.process_prompts([""] * len(prompts), device)
 
             # Encode
             with torch.no_grad():
                 if use_cached_latents:
                     latents = images.to(device=device, dtype=torch.bfloat16)
-                    vae_channels = latents.shape[1]
                     if latents.shape[1] != in_channels:
-                        latents = F.pixel_unshuffle(latents, 2)
+                        raise ValueError(
+                            f"Cached latents have {latents.shape[1]} channels but this config "
+                            f"expects f/8 latents with {in_channels} channels. Old caches use "
+                            f"the f/16 patchified format - re-run cache_latents.py."
+                        )
                     inputs = latents
                 elif use_vae:
                     images = images.to(device, memory_format=torch.channels_last)
@@ -545,10 +593,14 @@ def train(config_path: str):
                             latents = out[0] if isinstance(out, tuple) else out
                     else:
                         latents = vae(v_images)
-                    vae_channels = latents.shape[1]
-                    if latents.shape[1] != in_channels:
-                        latents = F.pixel_unshuffle(latents, 2)
-                    latents = (latents - latents_mean) / latents_std
+                    if latents.shape[1] == latents_mean.shape[1]:
+                        # Patchified f/16 output (Tiny VAE): normalize in the
+                        # stats layout, then convert to the f/8 native layout
+                        latents = (latents - latents_mean) / latents_std
+                        latents = F.pixel_shuffle(latents, 2)
+                    else:
+                        # Native f/8 output (standard VAE)
+                        latents = normalize_latent_f8(latents, latents_mean, latents_std)
                     inputs = latents.to(dtype=torch.bfloat16)
                 else:
                     inputs = images.to(device, memory_format=torch.channels_last).to(dtype=torch.bfloat16)
@@ -557,46 +609,65 @@ def train(config_path: str):
             if rank == 0 and fixed_prompts is None:
                 n_fixed = min(16, len(prompts))
                 fixed_prompts = prompts[:n_fixed]
-                latent_size = inputs.shape[-1]
-                fixed_noise = torch.randn(n_fixed, in_channels, latent_size, latent_size,
+                latent_size = (inputs.shape[-2], inputs.shape[-1])
+                fixed_noise = torch.randn(n_fixed, in_channels, latent_size[0], latent_size[1],
                                           device=device, dtype=torch.bfloat16)
 
             B, C, H, W = inputs.shape
 
-            # Sample timesteps
-            if timestep_sampler == 'logit_normal':
-                t = sample_logit_normal(0.8, 1.0, B, device, torch.bfloat16)
-            elif timestep_sampler == 'cosine':
-                t = sample_cosine(B, device, torch.bfloat16)
+            if objective == 'emf':
+                # Euler Mean Flow (paper convention: t=0 noise, t=1 data)
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext():
+                    t, r = sample_emf_times(
+                        B, device, dist=emf_time_sampler, interval_ratio=emf_interval_ratio
+                    )
+                    noise = torch.randn_like(inputs)
+                    xt = (1 - t.view(B, 1, 1, 1)) * noise + t.view(B, 1, 1, 1) * inputs
+                    total_loss, emf_metrics = emf_loss(
+                        model, xt, inputs, t, r,
+                        (y_indices, y_offsets), y_null,
+                        delta_t=emf_delta_t, cfg_scale=emf_cfg_scale, cfg_k=emf_cfg_k,
+                        adaptive_c=emf_adaptive_c, adaptive_p=emf_adaptive_p,
+                    )
+
+                loss = total_loss / accum_steps
+                loss.backward()
+                step_metrics['emf_loss'] += emf_metrics['loss'] / accum_steps
             else:
-                t = sample_uniform(B, device, torch.bfloat16)
+                # Sample timesteps (t=1 noise, t=0 data)
+                if timestep_sampler == 'logit_normal':
+                    t = sample_logit_normal(0.8, 1.0, B, device, torch.bfloat16)
+                elif timestep_sampler == 'cosine':
+                    t = sample_cosine(B, device, torch.bfloat16)
+                else:
+                    t = sample_uniform(B, device, torch.bfloat16)
 
-            t_reshaped = t.view(B, 1, 1, 1)
-            noise = torch.randn_like(inputs)
-            xt = (1 - t_reshaped) * inputs + t_reshaped * noise
+                t_reshaped = t.view(B, 1, 1, 1)
+                noise = torch.randn_like(inputs)
+                xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
-            # Augmentations
-            xt = apply_noise_injection(xt, noise_inject_ratio)
-            xt = apply_cross_sample_mixing(xt, inputs, t, cross_ratio)
+                # Augmentations
+                xt = apply_noise_injection(xt, noise_inject_ratio)
+                xt = apply_cross_sample_mixing(xt, inputs, t, cross_ratio)
 
-            # Forward with autocast
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext():
-                x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets, return_layer_match=True)
+                # Forward with autocast
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext():
+                    x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets, return_layer_match=True)
 
-            # Loss
-            fm_loss, neg_loss, deltafm_loss = compute_deltafm_loss(
-                x0_pred, inputs, t, deltafm_lambda
-            )
-            total_loss = deltafm_loss + infonce_weight * infonce_loss
+                # Loss
+                fm_loss, neg_loss, deltafm_loss = compute_deltafm_loss(
+                    x0_pred, inputs, t, deltafm_lambda
+                )
+                total_loss = deltafm_loss + infonce_weight * infonce_loss
 
-            loss = total_loss / accum_steps
-            loss.backward()
+                loss = total_loss / accum_steps
+                loss.backward()
 
-            step_metrics['fm_loss'] += fm_loss.detach().item() / accum_steps
-            step_metrics['neg_loss'] += neg_loss.detach().item() / accum_steps
-            step_metrics['deltafm_loss'] += deltafm_loss.detach().item() / accum_steps
-            step_metrics['total_loss'] += total_loss.detach().item() / accum_steps
-            step_metrics['infonce_loss'] += infonce_loss.detach().item() / accum_steps
+                step_metrics['fm_loss'] += fm_loss.detach().item() / accum_steps
+                step_metrics['neg_loss'] += neg_loss.detach().item() / accum_steps
+                step_metrics['deltafm_loss'] += deltafm_loss.detach().item() / accum_steps
+                step_metrics['total_loss'] += total_loss.detach().item() / accum_steps
+                step_metrics['infonce_loss'] += infonce_loss.detach().item() / accum_steps
 
         # Step
         if max_grad_norm > 0:
@@ -623,23 +694,29 @@ def train(config_path: str):
                 log_interval = log_every
                 avg_metrics = {k: v / log_interval for k, v in running_metrics.items()}
 
-                log_dict = {
-                    "train/fm_loss": avg_metrics['fm_loss'],
-                    "train/neg_loss": avg_metrics['neg_loss'],
-                    "train/deltafm_loss": avg_metrics['deltafm_loss'],
-                    "train/total_loss": avg_metrics['total_loss'],
-                    "train/infonce_loss": avg_metrics['infonce_loss'],
-                    "train/deltafm_lambda": deltafm_lambda,
-                    "train/lr": optimizer.param_groups[0]['lr'],
-                }
+                if objective == 'emf':
+                    log_dict = {
+                        "train/emf_loss": avg_metrics['emf_loss'],
+                        "train/lr": optimizer.param_groups[0]['lr'],
+                    }
+                    pbar.set_postfix({"emf": f"{avg_metrics['emf_loss']:.4f}"})
+                else:
+                    log_dict = {
+                        "train/fm_loss": avg_metrics['fm_loss'],
+                        "train/neg_loss": avg_metrics['neg_loss'],
+                        "train/deltafm_loss": avg_metrics['deltafm_loss'],
+                        "train/total_loss": avg_metrics['total_loss'],
+                        "train/infonce_loss": avg_metrics['infonce_loss'],
+                        "train/deltafm_lambda": deltafm_lambda,
+                        "train/lr": optimizer.param_groups[0]['lr'],
+                    }
+                    pbar.set_postfix({
+                        "fm": f"{avg_metrics['fm_loss']:.4f}",
+                        "dfm": f"{avg_metrics['deltafm_loss']:.4f}",
+                        "total": f"{avg_metrics['total_loss']:.4f}",
+                        "infonce": f"{avg_metrics['infonce_loss']:.4f}",
+                    })
                 wandb.log(log_dict, step=global_step)
-
-                pbar.set_postfix({
-                    "fm": f"{avg_metrics['fm_loss']:.4f}",
-                    "dfm": f"{avg_metrics['deltafm_loss']:.4f}",
-                    "total": f"{avg_metrics['total_loss']:.4f}",
-                    "infonce": f"{avg_metrics['infonce_loss']:.4f}",
-                })
 
                 for k in running_metrics:
                     running_metrics[k] = 0.0
@@ -661,24 +738,36 @@ def train(config_path: str):
                     ema.apply_shadow()
 
                 with torch.no_grad():
-                    samples = sample_fn(
-                        model_raw,
-                        tag_processor,
-                        latent_size,
-                        len(fixed_prompts),
-                        fixed_prompts,
-                        device,
-                        guidance_scale=config['training'].get('cfg_scale', 1.4),
-                        noise=fixed_noise,
-                    )
+                    if objective == 'emf':
+                        samples = sample_emf(
+                            model_raw, tag_processor, latent_size, len(fixed_prompts),
+                            fixed_prompts, device, steps=emf_val_steps, noise=fixed_noise,
+                        )
+                    else:
+                        samples = sample_flow(
+                            model_raw, tag_processor, latent_size, len(fixed_prompts),
+                            fixed_prompts, device,
+                            guidance_scale=config['training'].get('cfg_scale', 1.4),
+                            noise=fixed_noise,
+                        )
 
                     if use_vae:
+                        lazy_vae = vae is None
+                        decode_vae = vae
+                        if decode_vae is None:
+                            # Cached-latent training: VAE is only needed here
+                            decode_vae, vae_channels = load_decode_vae(config, device)
                         samples = samples.to(dtype=torch.bfloat16)
-                        if 'vae_channels' in locals() and samples.shape[1] != vae_channels:
-                            samples = F.pixel_shuffle(samples, 2)
-                        recon = vae.decode(samples).sample if hasattr(vae, 'decode') else vae(samples)
+                        if samples.shape[1] != vae_channels:
+                            # f/8 (32ch) -> patchified f/16 (128ch) for Tiny VAE
+                            samples = F.pixel_unshuffle(samples, 2)
+                        recon = decode_vae.decode(samples).sample if hasattr(decode_vae, 'decode') else decode_vae(samples)
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
+                        if lazy_vae:
+                            del decode_vae
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
 
                     grid = make_grid(samples, nrow=4)
                     save_path = os.path.join(config['training']['output_dir'], f"val_ema_step_{global_step}.png")

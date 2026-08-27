@@ -174,6 +174,221 @@ class ConvNeXtBlock(nn.Module):
         return x + h
 
 
+class AttentionBlock(nn.Module):
+    """
+    Global spatial self-attention with adaLN-Zero conditioning (NCHW).
+
+    Resolution-agnostic (fully convolutional philosophy): attention runs over
+    the H*W spatial tokens of the feature map. Uses SDPA so FlashAttention /
+    memory-efficient kernels are used on GPU. The residual gate is
+    zero-initialized, so the block starts as an identity mapping.
+    """
+    def __init__(self, dim, num_heads=None):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads or max(1, dim // 64)
+        assert dim % self.num_heads == 0, (
+            f"dim {dim} not divisible by num_heads {self.num_heads}")
+        self.head_dim = dim // self.num_heads
+
+        self.norm = LayerNorm2d(dim, affine=False, eps=1e-6)
+        self.qkv = nn.Conv2d(dim, 3 * dim, 1)
+        self.proj = nn.Conv2d(dim, dim, 1)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 3 * dim, bias=True)
+        )
+
+    def forward(self, x, c):
+        B, C, H, W = x.shape
+        shift, scale, gate = self.adaLN_modulation(c).unsqueeze(2).unsqueeze(3).chunk(3, dim=1)
+        h = torch.addcmul(shift, self.norm(x), scale + 1)
+
+        q, k, v = self.qkv(h).chunk(3, dim=1)
+
+        def to_heads(t):  # (B, C, H, W) -> (B, heads, H*W, head_dim)
+            return t.reshape(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+
+        h = F.scaled_dot_product_attention(to_heads(q), to_heads(k), to_heads(v))
+        h = h.transpose(2, 3).reshape(B, C, H, W)
+
+        return x + gate * self.proj(h)
+
+
+# =============================================================================
+# LFQ Memory Block (Non-Causal) — 1D Sequence (B, D, C) + 2D Wrapper (B, C, H, W)
+# =============================================================================
+class LFQMemoryBlockNonCausal(nn.Module):
+    def __init__(self, c_in=1024, c_mem=512, num_latents=8, k_bits=18):
+        """
+        Args:
+            c_in: Input feature dimension (C)
+            c_mem: Memory embedding dimension
+            num_latents: Number of parallel codebooks (8)
+            k_bits: Bits per code (codebook size = 2^k_bits, e.g., 2^18)
+        """
+        super().__init__()
+        self.num_latents = num_latents
+        self.k_bits = k_bits
+        self.c_mem = c_mem
+        self.vocab_size = 2 ** k_bits
+
+        # 1. Projection to 8 latents of K bits
+        self.in_proj = nn.Linear(c_in, num_latents * k_bits, bias=False)
+
+        # 2. Memory projections (replaces 2^K embedding tables)
+        # Old: 8 x [2^K, c_mem] tables (~1B params for K=18). Gradient to
+        # in_proj was blocked by F.embedding (discrete idx).
+        # New: 8 x Linear(K -> c_mem) (~74K params for K=18, c_mem=512).
+        # Fully differentiable via STE bits.
+        self.mem_projs = nn.ModuleList([
+            nn.Linear(k_bits, c_mem, bias=False) for _ in range(num_latents)
+        ])
+
+        # 3. Gating projections (Key and Value)
+        self.k_proj = nn.Linear(c_mem, c_in, bias=False)
+        self.v_proj = nn.Linear(c_mem, c_in, bias=False)
+
+        # 4. Normalizations
+        self.q_norm = nn.RMSNorm(c_in)
+        self.k_norm = nn.RMSNorm(c_in)
+        self.v_norm = nn.RMSNorm(c_in)
+
+        # 5. Point-wise Linear Output Projection
+        self.out_proj = nn.Linear(c_in, c_in, bias=False)
+
+        # Kept for compatibility/debug (not used in linear mode)
+        self.vocab_size = 2 ** k_bits
+        self.register_buffer("basis", 2 ** torch.arange(k_bits, dtype=torch.long))
+
+    def _quantize_bits(self, z):
+        # STE for LFQ bits: forward hard 0/1, backward sigmoid-STE
+        # z: [..., K]  continuous logits
+        # 1) sign STE: z_ste = z + (sign(z)-z).detach() -> gradient identity, forward sign(z)
+        # 2) bits = (z_ste+1)/2 in [0,1] (0 for -1, 0.5 for 0, 1 for 1)
+        # This makes bits differentiable w.r.t z (dbits/dz = 0.5)
+        z_sign = torch.sign(z)
+        z_ste = z + (z_sign - z).detach()
+        bits = (z_ste + 1) * 0.5
+        bits = bits.clamp(0, 1)
+        return bits
+
+    def _quantize(self, z):
+        # Legacy API kept for compatibility: returns indices (not used in linear path)
+        z_sign = torch.sign(z)
+        z_quantized = z + (z_sign - z).detach()
+        bits = (z_quantized > 0).long()
+        indices = (bits * self.basis).sum(dim=-1)
+        return indices
+
+    def forward(self, x):
+        """
+        Input x: [B, D, C]
+        """
+        B, D, C = x.shape
+
+        # Step 1: Project & split into 8 latents
+        z_raw = self.in_proj(x)  # [B, D, 8*K]
+        z = z_raw.view(B, D, self.num_latents, self.k_bits).permute(2, 0, 1, 3)  # [8, B, D, K]
+
+        # Step 2: Quantize to bits (STE) and project to memory dim via Linear
+        retrieved_mem = []
+        for i in range(self.num_latents):
+            bits = self._quantize_bits(z[i])          # [B, D, K]  differentiable
+            emb_i = self.mem_projs[i](bits)            # [B, D, c_mem]  Linear(K -> c_mem)
+            retrieved_mem.append(emb_i)
+
+        # Step 3: Sum the 8 memory projections
+        e = torch.stack(retrieved_mem, dim=0).sum(dim=0)  # [B, D, c_mem]
+
+        # Step 4: Context-aware Gating
+        q = self.q_norm(x)
+        k = self.k_norm(self.k_proj(e))
+        v = self.v_proj(e)
+
+        alpha = torch.sigmoid((q * k).sum(dim=-1, keepdim=True) / (C ** 0.5))
+        v_gated = alpha * v  # [B, D, C]
+
+        # Step 5: Point-wise Non-linearity & Output Projection
+        y = self.out_proj(F.silu(self.v_norm(v_gated)))
+
+        # Step 6: Residual Addition
+        return x + y
+
+
+class LFQMemoryBlock2D(nn.Module):
+    """
+    NCHW wrapper around LFQMemoryBlockNonCausal.
+    Converts (B, C, H, W) -> (B, H*W, C) -> LFQ -> (B, C, H, W).
+    Use this for FCDM which is fully convolutional / NCHW.
+    """
+    def __init__(self, c_in, c_mem=512, num_latents=8, k_bits=18):
+        super().__init__()
+        self.block = LFQMemoryBlockNonCausal(
+            c_in=c_in, c_mem=c_mem, num_latents=num_latents, k_bits=k_bits
+        )
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B, D, C]
+        y_seq = self.block(x_seq)  # [B, D, C]
+        y = y_seq.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        return y
+
+
+class TopKMemoryBlock(nn.Module):
+    def __init__(self, c_in=1024, c_mem=512, num_entries=4096, top_k=8, query_dim=64):
+        super().__init__()
+        self.num_entries = num_entries
+        self.top_k = top_k
+        self.c_mem = c_mem
+        self.query_dim = query_dim
+        self.q_proj = nn.Linear(c_in, query_dim, bias=False)
+        self.memory_keys = nn.Parameter(torch.randn(num_entries, query_dim) * (query_dim ** -0.5))
+        self.memory_values = nn.Parameter(torch.randn(num_entries, c_mem) * 0.02)
+        self.k_proj = nn.Linear(c_mem, c_in, bias=False)
+        self.v_proj = nn.Linear(c_mem, c_in, bias=False)
+        self.out_proj = nn.Linear(c_in, c_in, bias=False)
+        self.q_norm = nn.RMSNorm(c_in)
+        self.k_norm = nn.RMSNorm(c_in)
+        self.v_norm = nn.RMSNorm(c_in)
+
+    def forward(self, x):
+        B, D, C = x.shape
+        q = self.q_proj(x)  # [B,D,query_dim]
+        scores = torch.matmul(q, self.memory_keys.t()) / (self.query_dim ** 0.5)  # [B,D,num_entries]
+        topk_scores, topk_indices = torch.topk(scores, k=self.top_k, dim=-1)  # [B,D,top_k]
+        topk_weights = F.softmax(topk_scores, dim=-1)
+        retrieved_values = F.embedding(topk_indices, self.memory_values)  # [B,D,top_k,c_mem]
+        e = (retrieved_values * topk_weights.unsqueeze(-1)).sum(dim=-2)  # [B,D,c_mem]
+        ctx_q = self.q_norm(x)
+        ctx_k = self.k_norm(self.k_proj(e))
+        ctx_v = self.v_proj(e)
+        alpha = torch.sigmoid((ctx_q * ctx_k).sum(dim=-1, keepdim=True) / (C ** 0.5))
+        v_gated = alpha * ctx_v
+        y = self.out_proj(F.silu(self.v_norm(v_gated)))
+        return x + y, topk_indices
+
+
+class TopKMemoryBlock2D(nn.Module):
+    """
+    NCHW wrapper around TopKMemoryBlock.
+    Converts (B, C, H, W) -> (B, H*W, C) -> TopK -> (B, C, H, W).
+    Returns only the residual output (indices are internal for debugging).
+    """
+    def __init__(self, c_in, c_mem=512, num_entries=4096, top_k=8, query_dim=64):
+        super().__init__()
+        self.block = TopKMemoryBlock(c_in=c_in, c_mem=c_mem, num_entries=num_entries, top_k=top_k, query_dim=query_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B,D,C]
+        y_seq, _ = self.block(x_seq)  # [B,D,C]
+        y = y_seq.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        return y
+
+
 class ConvFinalLayer(nn.Module):
     """Conv-style final layer with adaLN modulation (shift + scale only, no gate)."""
     def __init__(self, hidden_size, out_channels):
@@ -221,11 +436,22 @@ class Upsample(nn.Module):
 # =============================================================================
 # FCDM U-Net Backbone
 # =============================================================================
+def _stage_blocks(dim, num_blocks, mlp_ratio, attn_every=0):
+    """ConvNeXt blocks with an AttentionBlock after every `attn_every` blocks."""
+    blocks = []
+    for i in range(num_blocks):
+        blocks.append(ConvNeXtBlock(dim, mlp_ratio=mlp_ratio))
+        if attn_every and (i + 1) % attn_every == 0:
+            blocks.append(AttentionBlock(dim))
+    return nn.ModuleList(blocks)
+
+
 class FCDM(nn.Module):
     """
     Fully Convolutional Diffusion Model (FCDM).
     ConvNeXt-based U-Net with adaLN-Zero conditioning, PixelShuffle up/down,
-    concat skip connections, and per-resolution conditioning.
+    concat skip connections, per-resolution conditioning, and optional
+    attention in the final (decoder) stages.
     """
 
     def __init__(
@@ -238,6 +464,18 @@ class FCDM(nn.Module):
         max_tags: int = 64,
         mlp_ratio: float = 3.0,
         learn_sigma: bool = False,
+        attn_every: int = 3,
+        # LFQ Memory at end of Block 2 (encoder_level_2) - legacy
+        use_lfq_memory: bool = False,
+        lfq_c_mem: int = 512,
+        lfq_num_latents: int = 8,
+        lfq_k_bits: int = 18,
+        # Top-K Memory at end of Block 2 (encoder_level_2) - current
+        use_topk_memory: bool = False,
+        topk_c_mem: int = 512,
+        topk_num_entries: int = 4096,
+        topk_top_k: int = 8,
+        topk_query_dim: int = 64,
         **kwargs,  # absorb old params: expansion_ratio, kernel_size, cond_dim, fcdm_blocks
     ):
         super().__init__()
@@ -277,6 +515,21 @@ class FCDM(nn.Module):
         self.encoder_level_2 = nn.ModuleList([
             ConvNeXtBlock(dim * 2, mlp_ratio=mlp_ratio) for _ in range(depth[1])
         ])
+        # Memory Block at end of encoder_level_2 (Block 2)
+        # Supports LFQ (legacy, Linear) and Top-K (current, sparse).
+        # Only one is active; TopK takes precedence if both enabled.
+        self.lfq_memory = None
+        self.topk_memory = None
+        if use_topk_memory:
+            self.topk_memory = TopKMemoryBlock2D(
+                c_in=dim * 2, c_mem=topk_c_mem,
+                num_entries=topk_num_entries, top_k=topk_top_k, query_dim=topk_query_dim
+            )
+        elif use_lfq_memory:
+            self.lfq_memory = LFQMemoryBlock2D(
+                c_in=dim * 2, c_mem=lfq_c_mem,
+                num_latents=lfq_num_latents, k_bits=lfq_k_bits
+            )
         self.down2_3 = Downsample(dim * 2, dim * 4)
 
         # ---- Bottleneck (latent) ---------------------------------------------
@@ -287,16 +540,12 @@ class FCDM(nn.Module):
         # ---- Decoder level 2 -------------------------------------------------
         self.up3_2 = Upsample(dim * 4, dim * 2)
         self.reduce_chans_2 = nn.Conv2d(dim * 4, dim * 2, kernel_size=1)
-        self.decoder_level_2 = nn.ModuleList([
-            ConvNeXtBlock(dim * 2, mlp_ratio=mlp_ratio) for _ in range(depth[3])
-        ])
+        self.decoder_level_2 = _stage_blocks(dim * 2, depth[3], mlp_ratio, attn_every)
 
         # ---- Decoder level 1 -------------------------------------------------
         self.up2_1 = Upsample(dim * 2, dim)
         self.reduce_chans_1 = nn.Conv2d(dim * 2, dim, kernel_size=1)
-        self.decoder_level_1 = nn.ModuleList([
-            ConvNeXtBlock(dim, mlp_ratio=mlp_ratio) for _ in range(depth[4])
-        ])
+        self.decoder_level_1 = _stage_blocks(dim, depth[4], mlp_ratio, attn_every)
 
         # ---- Output -----------------------------------------------------------
         self.output_layer = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1)
@@ -345,10 +594,33 @@ class FCDM(nn.Module):
         nn.init.constant_(self.final_layer.conv.weight, 0)
         nn.init.constant_(self.final_layer.conv.bias, 0)
 
+        # Memory blocks: zero out_proj so block starts as identity residual
+        if getattr(self, 'lfq_memory', None) is not None:
+            nn.init.constant_(self.lfq_memory.block.out_proj.weight, 0)
+        if getattr(self, 'topk_memory', None) is not None:
+            nn.init.constant_(self.topk_memory.block.out_proj.weight, 0)
+            # Re-init keys/values with small std after _basic_init overwrote them
+            nn.init.normal_(self.topk_memory.block.memory_keys, std=self.topk_memory.block.query_dim ** -0.5)
+            nn.init.normal_(self.topk_memory.block.memory_values, std=0.02)
+
     def _block_forward(self, block, x, c):
         if self.use_checkpoint and self.training:
             return checkpoint(block, x, c, use_reentrant=False)
         return block(x, c)
+
+    def _lfq_forward(self, x):
+        if self.lfq_memory is None:
+            return x
+        if self.use_checkpoint and self.training:
+            return checkpoint(self.lfq_memory, x, use_reentrant=False)
+        return self.lfq_memory(x)
+
+    def _topk_forward(self, x):
+        if self.topk_memory is None:
+            return x
+        if self.use_checkpoint and self.training:
+            return checkpoint(self.topk_memory, x, use_reentrant=False)
+        return self.topk_memory(x)
 
     def forward(
         self,
@@ -356,6 +628,7 @@ class FCDM(nn.Module):
         t,
         y_indices,
         y_offsets=None,
+        r=None,
         return_features=False,
         return_layer_match=False,
         **kwargs,
@@ -366,6 +639,9 @@ class FCDM(nn.Module):
         t: (B,) diffusion timesteps in [0, 1]
         y_indices: flat 1-D tag indices
         y_offsets: per-sample offsets into y_indices
+        r: (B,) optional interval end time for EMF-style mean-flow models.
+           When given, the model predicts the flow over [t, r] and is
+           conditioned on (r - t) through the same timestep embedders.
         """
         # Project input
         x = self.x_embedder(x_in)
@@ -374,9 +650,15 @@ class FCDM(nn.Module):
         t_scaled = t * 1000.0
         y_base = self.y_embedder(y_indices, y_offsets)  # [B, dim]
 
-        c1 = self.t_embedder_1(t_scaled) + y_base
-        c2 = self.t_embedder_2(t_scaled) + self.y_proj_2(y_base)
-        c3 = self.t_embedder_3(t_scaled) + self.y_proj_3(y_base)
+        if r is not None:
+            dr_scaled = (r - t) * 1000.0
+            c1 = self.t_embedder_1(t_scaled) + self.t_embedder_1(dr_scaled) + y_base
+            c2 = self.t_embedder_2(t_scaled) + self.t_embedder_2(dr_scaled) + self.y_proj_2(y_base)
+            c3 = self.t_embedder_3(t_scaled) + self.t_embedder_3(dr_scaled) + self.y_proj_3(y_base)
+        else:
+            c1 = self.t_embedder_1(t_scaled) + y_base
+            c2 = self.t_embedder_2(t_scaled) + self.y_proj_2(y_base)
+            c3 = self.t_embedder_3(t_scaled) + self.y_proj_3(y_base)
 
         # Encoder level 1
         out_enc_level1 = x
@@ -388,6 +670,12 @@ class FCDM(nn.Module):
         out_enc_level2 = inp_enc_level2
         for block in self.encoder_level_2:
             out_enc_level2 = self._block_forward(block, out_enc_level2, c2)
+        # Memory Block at end of Block 2 (non-causal, NCHW-friendly)
+        # TopK takes precedence over LFQ
+        if self.topk_memory is not None:
+            out_enc_level2 = self._topk_forward(out_enc_level2)
+        elif self.lfq_memory is not None:
+            out_enc_level2 = self._lfq_forward(out_enc_level2)
         inp_enc_level3 = self.down2_3(out_enc_level2)
 
         # Bottleneck
@@ -423,10 +711,6 @@ class FCDM(nn.Module):
         if return_layer_match:
             return x0_pred, infonce_loss
         return x0_pred
-
-
-# Backward-compat alias so old imports don't break
-TokenformerDiT = FCDM
 
 
 # =============================================================================
@@ -587,6 +871,29 @@ if __name__ == "__main__":
     out = model_int(x_in, t, y_indices, y_offsets)
     assert out.shape == x_in.shape
     print(f"  [OK] depth=int: {out.shape}")
+
+    # Test 6: interval conditioning (EMF-style r argument)
+    r = (t + torch.rand(batch_size, device=device) * (1.0 - t)).clamp(max=1.0)
+    out_r = model(x_in, t, y_indices, y_offsets, r=r)
+    assert out_r.shape == x_in.shape
+    loss = F.mse_loss(out_r, torch.randn_like(out_r))
+    loss.backward()
+    print(f"  [OK] interval r: {out_r.shape}")
+
+    # Test 7: decoder attention + rectangular input (fully convolutional)
+    n_attn = sum(isinstance(b, AttentionBlock) for b in
+                 list(model.decoder_level_1) + list(model.decoder_level_2))
+    assert n_attn > 0, "expected AttentionBlocks in decoder stages"
+    x_rect = torch.randn(2, 4, 32, 48, device=device)
+    out_rect = model(x_rect, t, y_indices, y_offsets)
+    assert out_rect.shape == x_rect.shape
+    print(f"  [OK] decoder attention ({n_attn} blocks), rect input: {tuple(out_rect.shape)}")
+
+    # Test 8: attention disabled (attn_every=0)
+    model_noattn = FCDM(in_channels=4, dim=64, depth=2, num_classes=100, attn_every=0).to(device)
+    out_na = model_noattn(x_in, t, y_indices, y_offsets)
+    assert out_na.shape == x_in.shape
+    print(f"  [OK] attn_every=0: {out_na.shape}")
 
     print("\n" + "=" * 60)
     print("All tests passed!")

@@ -2,9 +2,25 @@ training:
   batch_size: 64
   grad_accum_steps: 1
   learning_rate: 1.0e-4
-  num_epochs: 100              # Not used; max_train_steps takes precedence
   max_train_steps: 2000000
   gradient_checkpointing: false
+
+  # Training objective:
+  #   flow_matching - multi-step FM (default)
+  #   emf           - Euler Mean Flows, one-step / few-step generation (emf.py)
+  objective: flow_matching
+
+  # EMF settings (used when objective: emf)
+  # emf:
+  #   delta_t: 0.05          # local linearization step size
+  #   interval_ratio: 0.25   # fraction of samples with r != t
+  #   time_sampler: uniform  # or logit_normal
+  #   cfg_scale: 2.5         # effective guidance baked into the model (0 = off)
+  #   cfg_k: 0.4             # CFG mixing coefficient
+  #   adaptive_c: 0.001      # adaptive loss constants (MeanFlow / ECM style)
+  #   adaptive_p: 1.0
+  #   val_steps: 1           # sampling steps for validation images
+
   compile: false
   compile_vae: false
   log_every_steps: 10
@@ -60,15 +76,30 @@ model:
   dim: 256
   depth: 2
 
-  # VAE settings
+  # Attention after every N blocks in the decoder stages (0 = off)
+  attn_every: 3
+
+  # LFQ Memory Block at end of Block 2 (encoder_level_2) — legacy (Linear K->c_mem)
+  # Disabled by default. Enable with use_lfq_memory: true
+  use_lfq_memory: false
+  lfq_c_mem: 512
+  lfq_num_latents: 8
+  lfq_k_bits: 12
+
+  # Top-K Memory Block at end of Block 2 (encoder_level_2) — current (sparse)
+  # Replaces LFQ's 2^K tables with learned keys/values + top-k routing.
+  # Uses nn.Linear for q_proj + nn.Parameter keys/values, fully differentiable via softmax(top-k).
+  use_topk_memory: true
+  topk_c_mem: 512
+  topk_num_entries: 4096
+  topk_top_k: 8
+  topk_query_dim: 64
+
+  # VAE settings (model consumes the native f/8 latent, 32 channels)
   use_vae: true
   use_tiny_vae: false
 
-  # Conditioning (small FCDM blocks run over the tag grid)
-  fcdm_blocks: 2
-
-  # Legacy DiT keys — harmless, but ignored by FCDM
-  num_heads: 16
+  # Legacy DiT keys — harmless, but ignored by FCDM (only used on the no-VAE path)
   patch_size: 1
   in_channels: 3
 
