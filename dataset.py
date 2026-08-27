@@ -1,7 +1,6 @@
 import webdataset as wds
 import torch
 from torch.utils.data import DataLoader
-import pandas as pd
 import torchvision.transforms.functional as F
 import torchvision.transforms as transforms
 import random
@@ -229,13 +228,12 @@ def bucket_batch(data, batch_size):
 
 
 class WDSLoader:
-    def __init__(self, url, csv_path=None, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
+    def __init__(self, url, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
         """
         WebDataset Loader for nanoWaifu.
 
         Args:
             url: WebDataset URL or path
-            csv_path: Path to CSV for class mapping (optional, for backward compatibility)
             image_size: Target image size
             batch_size: Batch size
             num_workers: Number of workers for DataLoader
@@ -246,13 +244,6 @@ class WDSLoader:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.use_advanced_captions = use_advanced_captions
-
-        # Optional class map for backward compatibility
-        self.class_map = None
-        self.num_classes = 0
-        if csv_path:
-            self.class_map = self.load_class_map(csv_path)
-            self.num_classes = len(self.class_map)
 
         # Precalculate buckets
         base_size = self.image_size
@@ -266,22 +257,13 @@ class WDSLoader:
             # w * h = area, w / h = ar  =>  h^2 * ar = area => h = sqrt(area / ar)
             h = int(math.sqrt(target_area / ar))
             w = int(h * ar)
-            # Round to nearest multiple of 16 for FCDM/MAR/Patching compatibility
+            # Round to nearest multiple of 32 for FCDM/MAR/Patching compatibility
             h = (h // 32) * 32
             w = (w // 32) * 32
             if h > 0 and w > 0:
                 self.buckets.append((h, w))
 
         self.bucket_ars = [bw / bh for bh, bw in self.buckets]
-
-    def load_class_map(self, csv_path):
-        if csv_path.endswith('.txt'):
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                tags = [line.strip() for line in f if line.strip()]
-            return {tag: i for i, tag in enumerate(tags)}
-        # Using latin-1 encoding to avoid UnicodeDecodeError on special characters
-        df = pd.read_csv(csv_path, encoding='latin-1')
-        return dict(zip(df['character'], df['id']))
 
     def preprocess(self, sample):
         """
@@ -424,7 +406,3 @@ class WDSLoader:
         )
 
         return loader
-
-
-
-

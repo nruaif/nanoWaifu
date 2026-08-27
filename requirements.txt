@@ -10,4 +10,5 @@ Pillow
 diffusers
 transformers
 accelerate
+huggingface_hub
 nvitop

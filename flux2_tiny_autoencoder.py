@@ -1,10 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusers.models import AutoencoderTiny
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.autoencoders.vae import EncoderOutput, DecoderOutput
 from diffusers.configuration_utils import ConfigMixin, register_to_config
+
+
+def normalize_latent_f8(z, mean, std):
+    """
+    Normalize an f/8 latent ([B, C, H, W], C = stats_channels // 4) against
+    FLUX.2 VAE stats, which are stored in the VAE's internal 2x2-patchified
+    layout ([1, 4C, 1, 1]).
+
+    The latent is temporarily pixel-unshuffled into the stats' layout, so the
+    channel/position alignment matches exactly, then shuffled back.
+    """
+    zp = F.pixel_unshuffle(z, 2)
+    zp = (zp - mean.to(z)) / std.to(z)
+    return F.pixel_shuffle(zp, 2)
 
 
 class Flux2TinyAutoEncoder(ModelMixin, ConfigMixin):

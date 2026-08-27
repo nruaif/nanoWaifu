@@ -1,6 +1,7 @@
 .idea/
 __pycache__/
 test_outputs/
+overfit_logs/
 *.pyc
 *.pyo
 .pytest_cache/

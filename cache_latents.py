@@ -2,7 +2,8 @@
 Encode images from WebDataset tars into cached latents, grouped into 1GB WebDataset .tar shards.
 
 Each output file is a .tar shard containing samples with:
-  - "latent.npy": float16 array of shape [128, H', W']
+  - "latent.npy": float16 array of shape [32, H', W'] (f/8 native layout,
+    NOT the VAE's 2x2-patchified format)
   - "prompt.txt": The prompt string
 
 Files are named: latents-00000.tar, latents-00001.tar, etc.
@@ -28,6 +29,8 @@ import webdataset as wds
 from PIL import Image
 from tqdm import tqdm
 import torchvision.transforms.functional as TF
+
+from flux2_tiny_autoencoder import Flux2TinyAutoEncoder, normalize_latent_f8
 
 
 # ── Bucket calculation (matches WDSLoader) ──────────────────────────────────
@@ -158,10 +161,8 @@ def main():
             "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.bfloat16
         )
     else:
-        from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
         print(f"Loading Tiny VAE from {args.vae_model}...")
         vae = Flux2TinyAutoEncoder.from_pretrained(args.vae_model)
-        
     vae = vae.to(device=device, dtype=torch.bfloat16).eval()
 
     # ── Load normalization stats ────────────────────────────────────────────
@@ -242,20 +243,18 @@ def main():
 
             with torch.no_grad():
                 if args.use_standard_vae:
-                    import torch.nn.functional as F
-                    latents = vae.encode(batch).latent_dist.mode()
-                    # Reshape to 128ch for normalization since stats are in 2x2 patch format
-                    latents = F.pixel_unshuffle(latents, 2)
+                    latents = vae.encode(batch).latent_dist.mode()  # [B, 32, H/8, W/8]
+                    latents = normalize_latent_f8(latents, latents_mean, latents_std)
                 else:
                     out = vae.encode(batch, return_dict=False)
-                    latents = out[0] if isinstance(out, tuple) else out
-
-                if latents_mean is not None and latents_std is not None:
+                    latents = out[0] if isinstance(out, tuple) else out  # [B, 128, H/16, W/16]
+                    # Normalize in the stats' patchified layout, then move to f/8
                     latents = (latents - latents_mean) / latents_std
+                    latents = torch.nn.functional.pixel_shuffle(latents, 2)  # [B, 32, H/8, W/8]
 
                 all_latents.append(latents.to(torch.float16).cpu())
 
-        stacked = torch.cat(all_latents, dim=0).numpy()  # [N, 128, H', W']
+        stacked = torch.cat(all_latents, dim=0).numpy()  # [N, 32, H', W'] f/8
 
         # Save to ShardWriter
         for idx in range(n):

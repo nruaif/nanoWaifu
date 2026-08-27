@@ -1,183 +1,152 @@
+"""
+Overfit test for the ConvNeXt FCDM backbone + EMF objective.
+
+Trains a small (~2M parameter) FCDM with decoder attention to memorize a
+single image (resized so its shortest side is 512, encoded to f/8 latents
+with the FLUX.2 Tiny VAE) using the Euler Mean Flow loss (x1-prediction).
+The model then reproduces the image in a single forward pass.
+
+Every --log-every steps a 1-step EMF sample (left) and the VAE
+reconstruction of the target latent (right) are saved to overfit_logs/.
+
+Usage:
+    python test_overfit.py --steps 5000
+    python test_overfit.py --image path/to/img.jpg --size 512 --dim 32
+"""
+import argparse
+import os
+
 import torch
 import torch.nn.functional as F
-from PIL import Image
-import torchvision.transforms.functional as TF
 import torchvision
-import os
-from flux2_tiny_autoencoder import Flux2TinyAutoEncoder
-from model_dit import TokenformerDiT, TagProcessor, sample_flow
-from tqdm import tqdm
+from PIL import Image
+from torchvision.transforms import functional as TF
+from tqdm import trange
+
+from emf import emf_loss, sample_emf_times
+from flux2_tiny_autoencoder import Flux2TinyAutoEncoder, normalize_latent_f8
+from model_dit import FCDM, TagProcessor
+
+DEFAULT_IMAGE = (
+    r"C:\Users\nRuaif\Downloads"
+    r"\__hatsune_miku_artoria_pendragon_cirno_akemi_homura_kaname_madoka_and_97_more"
+    r"_original_and_98_more_drawn_by_shinanashina__"
+    r"cf7381d1616cbec451c495c37f0e7805(1).jpg"
+)
 
 
-class DummyTagProcessor:
-    """Minimal tag processor for overfitting tests with direct class index control."""
-    def __init__(self, num_classes):
-        self.num_classes = num_classes
-
-    def process_prompts(self, prompts, device):
-        """Map prompts to class indices. Empty prompts map to the null class."""
-        indices = []
-        offsets = [0]
-        for p in prompts:
-            if p.strip():
-                # Interpret prompt as an integer class index
-                try:
-                    indices.append(int(p))
-                except ValueError:
-                    indices.append(self.num_classes)  # null class
-            else:
-                indices.append(self.num_classes)  # null class for empty prompts
-            offsets.append(len(indices))
-        indices = torch.tensor(indices, dtype=torch.long, device=device)
-        offsets = torch.tensor(offsets[:-1], dtype=torch.long, device=device)
-        return indices, offsets
-
-def prepare_image(image_path, size=256):
-    img = Image.open(image_path).convert("RGB")
-    # Simple center crop to maintain aspect ratio then resize
+def prepare_image(path, size):
+    """Resize so the shortest side is `size`, then crop to a 16-multiple."""
+    img = Image.open(path).convert("RGB")
     w, h = img.size
-    min_side = min(w, h)
-    left = (w - min_side) // 2
-    top = (h - min_side) // 2
-    right = (w + min_side) // 2
-    bottom = (h + min_side) // 2
-    img = img.crop((left, top, right, bottom))
-    img = img.resize((size, size), Image.Resampling.LANCZOS)
-    return img
+    scale = size / min(w, h)
+    img = img.resize((round(w * scale), round(h * scale)), Image.Resampling.LANCZOS)
+    w, h = img.size
+    return img.crop((0, 0, (w // 16) * 16, (h // 16) * 16))
+
+
+def encode_image(vae, img, device):
+    """Encode a PIL image to a (normalized, if stats exist) f/8 latent."""
+    x = TF.to_tensor(img).unsqueeze(0).to(device)
+    x = x * 2.0 - 1.0  # [0,1] -> [-1,1]
+    with torch.no_grad():
+        out = vae.encode(x)
+        z = out.latent if hasattr(out, "latent") else (out[0] if isinstance(out, tuple) else out)
+        z = F.pixel_shuffle(z.float(), 2)  # [1, 32, H/8, W/8]
+        if os.path.exists("vae_stats.pt"):
+            stats = torch.load("vae_stats.pt", map_location="cpu")
+            z = normalize_latent_f8(z, stats["mean"], stats["std"])
+        else:
+            print("Note: vae_stats.pt not found - training WITHOUT latent normalization.")
+    return z[0]  # [32, H/8, W/8]
+
+
+def decode_latent(vae, z):
+    """Decode f/8 latents [N, 32, H, W] back to images in [0, 1]."""
+    zp = F.pixel_unshuffle(z, 2)  # [N, 128, H/2, W/2] patchified for the Tiny VAE
+    with torch.no_grad():
+        out = vae.decode(zp)
+        img = out.sample if hasattr(out, "sample") else (out[0] if isinstance(out, tuple) else out)
+    return (img.clamp(-1, 1) + 1.0) / 2.0
+
 
 def main():
-    torch._dynamo.config.disable = True
+    parser = argparse.ArgumentParser(description="FCDM + EMF single-image overfit test")
+    parser.add_argument("--image", type=str, default=DEFAULT_IMAGE)
+    parser.add_argument("--size", type=int, default=512, help="target shortest side")
+    parser.add_argument("--dim", type=int, default=32, help="FCDM base channels")
+    parser.add_argument("--depth", type=int, default=2, help="FCDM depth (L)")
+    parser.add_argument("--attn_every", type=int, default=3, help="decoder attention period (0=off)")
+    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch", type=int, default=4, help="copies of the image per step")
+    parser.add_argument("--interval_ratio", type=float, default=0.5)
+    parser.add_argument("--delta_t", type=float, default=0.05)
+    parser.add_argument("--log_every", type=int, default=100)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # --- Configuration ---
-    NUM_IMAGES = 8  # Number of images to load and overfit on
-
-    # 1. Load images from D:\out2\goodness
-    img_dir = r"D:\out2\goodness"
-    if not os.path.exists(img_dir):
-        print(f"Error: {img_dir} not found. Using local images if any.")
-        # Fallback to current dir if D: is not available
-        img_files = [f for f in os.listdir(".") if f.endswith((".jpg", ".png", ".webp"))][:NUM_IMAGES]
-        if not img_files:
-             print("No images found for overfitting.")
-             return
-    else:
-        all_files = [f for f in os.listdir(img_dir) if f.endswith((".webp", ".jpg", ".png"))]
-        img_files = [os.path.join(img_dir, f) for f in all_files[:NUM_IMAGES]]
-
-    print(f"Loading {len(img_files)} images...")
-    img_tensors = []
-    for img_path in img_files:
-        img = prepare_image(img_path)
-        img_tensor = TF.to_tensor(img).unsqueeze(0).to(device)
-        img_tensor = (img_tensor - 0.5) * 2.0
-        img_tensors.append(img_tensor)
-    
-    batch_imgs = torch.cat(img_tensors, dim=0)  # [N, 3, 256, 256]
-
-    # 2. VAE and Latent Caching
-    print("Loading Tiny VAE...")
-    try:
-        vae = Flux2TinyAutoEncoder.from_pretrained("fal/FLUX.2-Tiny-AutoEncoder").to(device).eval()
-    except Exception as e:
-        print(f"Could not load fal/FLUX.2-Tiny-AutoEncoder: {e}")
-        vae = Flux2TinyAutoEncoder().to(device).eval()
-
-    # Load normalization stats
-    stats_path = "vae_stats.pt"
-    if os.path.exists(stats_path):
-        print(f"Loading VAE normalization stats from {stats_path}...")
-        stats = torch.load(stats_path, map_location='cpu')
-        latents_mean = stats["mean"].to(device, dtype=torch.float32)
-        latents_std = stats["std"].to(device, dtype=torch.float32)
-    else:
-        print("Warning: vae_stats.pt not found. Running WITHOUT latent normalization.")
-        latents_mean = None
-        latents_std = None
-
-    print("Encoding images to latents...")
-    with torch.no_grad():
-        out = vae.encode(batch_imgs.to(torch.float32))
-        latents = out.latent # [8, 128, 16, 16]
-        if latents_mean is not None and latents_std is not None:
-            latents = (latents - latents_mean) / latents_std
-            print("Normalized encoded latents using VAE running stats.")
-        latents = F.pixel_shuffle(latents, 2)
-    print(f"Latents shape: {latents.shape}")
-
-    # 3. Model Setup
-    # FCDM-L Model
-    # in_channels=32 (f8 representation), dim=512 (FCDM-L specification)
-    NUM_CLASSES = 8
-    model_dit = TokenformerDiT(
-        in_channels=32,
-        dim=64,
-        num_heads=8,
-        num_classes=NUM_CLASSES,
-    ).to(device)
-
-    print(f"DiT Params: {sum(p.numel() for p in model_dit.parameters() if p.requires_grad) / 1e6:.2f} M")
-
-    # 4. Overfitting Loop
-    opt_dit = torch.optim.AdamW(model_dit.parameters(), lr=5e-4)
-    
-    y_indices = torch.arange(NUM_IMAGES, device=device)
-    y_offsets_dit = torch.arange(NUM_IMAGES + 1, device=device)
-
+    print(f"Device: {device}")
     os.makedirs("overfit_logs", exist_ok=True)
 
-    print("Starting overfit training (1000 steps)...")
-    for i in tqdm(range(100001)):
-        # --- DiT Training ---
-        model_dit.train()
-        B, C, H, W = latents.shape
-        t = torch.rand((B, ), device=device)
-        t_reshaped = t.view(B, 1, 1, 1)
-        noise = torch.randn_like(latents)
-        
-        # DiT uses (1-t)*x + t*noise
-        xt_dit = (1 - t_reshaped) * latents + t_reshaped * noise
-        v_target = noise - latents
-        
-        v_pred, infonce_loss = model_dit(xt_dit, t, y_indices, y_offsets_dit[:-1], return_layer_match=True)
-        loss_dit = F.mse_loss(v_pred, v_target)
-        
-        total_loss = loss_dit + 0.2 * infonce_loss
-        
-        opt_dit.zero_grad()
-        total_loss.backward()
-        opt_dit.step()
+    # -- Data: single image -> f/8 latent -------------------------------------
+    img = prepare_image(args.image, args.size)
+    print(f"Image: {img.size[0]}x{img.size[1]} (shortest side {args.size})")
 
-        if i % 50 == 0:
-            print(f"Step {i:4d} | DiT Loss: {loss_dit.item():.6f} | InfoNCE Loss: {infonce_loss.item():.6f}")
-            
-            # --- Sampling and Logging ---
-            model_dit.eval()
+    vae = Flux2TinyAutoEncoder.from_pretrained("fal/FLUX.2-Tiny-AutoEncoder").to(device).eval()
+    z = encode_image(vae, img, device)
+    print(f"Latent: {tuple(z.shape)} (f/8)")
+    z_batch = z.unsqueeze(0).repeat(args.batch, 1, 1, 1)
+
+    # -- Model -----------------------------------------------------------------
+    model = FCDM(
+        in_channels=z.shape[0],
+        dim=args.dim,
+        depth=args.depth,
+        num_classes=1,
+        attn_every=args.attn_every,
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"FCDM params: {n_params / 1e6:.2f}M (dim={args.dim}, depth={args.depth}, "
+          f"attn_every={args.attn_every})")
+
+    # -- Conditioning: a single tag, no CFG ------------------------------------
+    with open("_overfit_tags.txt", "w", encoding="utf-8") as f:
+        f.write("subject\n")
+    tp = TagProcessor("_overfit_tags.txt")
+    cond = tp.process_prompts(["subject"] * args.batch, device)
+    cond_null = tp.process_prompts([""] * args.batch, device)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    fixed_noise = torch.randn(args.batch, *z.shape, device=device)
+
+    print(f"Training EMF (x1-prediction) for {args.steps} steps...")
+    for step in trange(args.steps, desc="Overfit", dynamic_ncols=True):
+        t, r = sample_emf_times(args.batch, device, interval_ratio=args.interval_ratio)
+        noise = torch.randn_like(z_batch)
+        xt = (1 - t.view(-1, 1, 1, 1)) * noise + t.view(-1, 1, 1, 1) * z_batch
+        loss, _ = emf_loss(model, xt, z_batch, t, r, cond, cond_null,
+                           delta_t=args.delta_t, cfg_scale=0.0)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+        if step % args.log_every == 0 or step == args.steps - 1:
             with torch.no_grad():
-                # Sample DiT
-                tp = DummyTagProcessor(NUM_CLASSES)
-                # Use the actual training class labels as prompts
-                sample_prompts = [str(c) for c in range(NUM_IMAGES)]
-                samples_dit = sample_flow(
-                    model_dit, tp, (H, W), NUM_IMAGES, sample_prompts, device, steps=50, sampler_type="euler"
-                )
-                
-                samples_dit = F.pixel_unshuffle(samples_dit, 2)
-                # De-normalize samples if stats are available
-                if latents_mean is not None and latents_std is not None:
-                    samples_dit = (samples_dit * latents_std) + latents_mean
-                
-                # Decode
-                out_dit = vae.decode(samples_dit.to(torch.float32)).sample
-                
-                out_dit = (out_dit / 2.0 + 0.5).clamp(0, 1)
-                
-                # Create a grid: Top row DiT
-                grid_img = torchvision.utils.make_grid(out_dit, nrow=2)
-                torchvision.utils.save_image(grid_img, f"overfit_logs/step_{i:04d}.png")
+                ones = torch.ones(args.batch, device=device)
+                endpoint = model(fixed_noise, torch.zeros(args.batch, device=device),
+                                 cond[0], cond[1], r=ones)
+                mse = F.mse_loss(endpoint, z_batch).item()
+            sample = decode_latent(vae, endpoint[:1].float())
+            target = decode_latent(vae, z_batch[:1].float())
+            grid = torchvision.utils.make_grid(torch.cat([sample, target]), nrow=2)
+            torchvision.utils.save_image(grid, f"overfit_logs/step_{step:05d}.png")
+            print(f"  step {step:5d} | 1-step latent mse {mse:.4f}")
 
-    print("\nOverfitting complete. Check overfit_logs/ directory.")
+    os.remove("_overfit_tags.txt")
+    print(f"\nDone. Check overfit_logs/ for sample (left) vs target (right) grids.")
+
 
 if __name__ == "__main__":
     main()
