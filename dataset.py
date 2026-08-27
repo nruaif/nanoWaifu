@@ -228,7 +228,8 @@ def bucket_batch(data, batch_size):
 
 
 class WDSLoader:
-    def __init__(self, url, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True):
+    def __init__(self, url, image_size=64, batch_size=16, num_workers=4, use_advanced_captions=True,
+                 fast_loading=False):
         """
         WebDataset Loader for nanoWaifu.
 
@@ -238,12 +239,15 @@ class WDSLoader:
             batch_size: Batch size
             num_workers: Number of workers for DataLoader
             use_advanced_captions: Use advanced caption processing with tag dropping
+            fast_loading: Resize shortest side to 320 then random crop to image_size
+                (skips aspect-ratio bucketing; all images end up image_size x image_size)
         """
         self.url = url
         self.image_size = image_size
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.use_advanced_captions = use_advanced_captions
+        self.fast_loading = fast_loading
 
         # Precalculate buckets
         base_size = self.image_size
@@ -335,30 +339,41 @@ class WDSLoader:
             elif not isinstance(image, Image.Image):
                 return None
 
-            w, h = image.size
-            img_ar = w / h
-
-            # Find closest bucket by aspect ratio
-            best_bucket_idx = min(range(len(self.bucket_ars)), key=lambda i: abs(self.bucket_ars[i] - img_ar))
-            target_h, target_w = self.buckets[best_bucket_idx]
-            target_ar = self.bucket_ars[best_bucket_idx]
-
-            # Resize to cover
-            if img_ar > target_ar:
-                # Image is wider than bucket, match height
-                new_h = target_h
-                new_w = int(target_h * img_ar)
+            if self.fast_loading:
+                # Fast path: resize shortest side to 320, then random crop to image_size
+                w, h = image.size
+                scale = 320 / min(w, h)
+                image = image.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                                      Image.Resampling.BILINEAR)
+                w, h = image.size
+                left = random.randint(0, max(0, w - self.image_size))
+                top = random.randint(0, max(0, h - self.image_size))
+                image = image.crop((left, top, left + self.image_size, top + self.image_size))
             else:
-                # Image is taller than bucket, match width
-                new_w = target_w
-                new_h = int(target_w / img_ar)
+                w, h = image.size
+                img_ar = w / h
 
-            image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                # Find closest bucket by aspect ratio
+                best_bucket_idx = min(range(len(self.bucket_ars)), key=lambda i: abs(self.bucket_ars[i] - img_ar))
+                target_h, target_w = self.buckets[best_bucket_idx]
+                target_ar = self.bucket_ars[best_bucket_idx]
 
-            # Random crop to bucket size
-            left = random.randint(0, max(0, new_w - target_w))
-            top = random.randint(0, max(0, new_h - target_h))
-            image = image.crop((left, top, left + target_w, top + target_h))
+                # Resize to cover
+                if img_ar > target_ar:
+                    # Image is wider than bucket, match height
+                    new_h = target_h
+                    new_w = int(target_h * img_ar)
+                else:
+                    # Image is taller than bucket, match width
+                    new_w = target_w
+                    new_h = int(target_w / img_ar)
+
+                image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+                # Random crop to bucket size
+                left = random.randint(0, max(0, new_w - target_w))
+                top = random.randint(0, max(0, new_h - target_h))
+                image = image.crop((left, top, left + target_w, top + target_h))
 
             # Random Horizontal Flip
             if random.random() < 0.5:

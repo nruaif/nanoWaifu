@@ -108,3 +108,6 @@ data:
   use_cached_latents: false
   webdataset_url: "/workspace/data/train/000{00..99}.tar"
   use_advanced_captions: true
+  # Fast loading: resize shortest side to 320 then random crop to image_size
+  # (skips aspect-ratio bucketing; all images are image_size x image_size)
+  fast_loading: true

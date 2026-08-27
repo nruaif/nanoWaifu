@@ -431,7 +431,8 @@ def train(config_path: str):
         image_size=config['training']['image_size'],
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
-        use_advanced_captions=config['data'].get('use_advanced_captions', True)
+        use_advanced_captions=config['data'].get('use_advanced_captions', True),
+        fast_loading=config['data'].get('fast_loading', False)
     )
     dataloader = wds_loader.make_loader()
     data_iter = iter(dataloader)
