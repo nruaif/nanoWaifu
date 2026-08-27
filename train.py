@@ -545,7 +545,7 @@ def train(config_path: str):
     emf_val_steps = emf_opts.get('val_steps', 1)
 
     if objective == 'emf':
-        running_metrics = {'emf_loss': 0.0}
+        running_metrics = {'emf_loss': 0.0, 'emf_raw_mse': 0.0}
     else:
         running_metrics = {
             'fm_loss': 0.0, 'neg_loss': 0.0, 'deltafm_loss': 0.0,
@@ -634,6 +634,7 @@ def train(config_path: str):
                 loss = total_loss / accum_steps
                 loss.backward()
                 step_metrics['emf_loss'] += emf_metrics['loss'] / accum_steps
+                step_metrics['emf_raw_mse'] += emf_metrics.get('raw_mse', emf_metrics['loss']) / accum_steps
             else:
                 # Sample timesteps (t=1 noise, t=0 data)
                 if timestep_sampler == 'logit_normal':
@@ -698,9 +699,10 @@ def train(config_path: str):
                 if objective == 'emf':
                     log_dict = {
                         "train/emf_loss": avg_metrics['emf_loss'],
+                        "train/emf_raw_mse": avg_metrics['emf_raw_mse'],
                         "train/lr": optimizer.param_groups[0]['lr'],
                     }
-                    pbar.set_postfix({"emf": f"{avg_metrics['emf_loss']:.4f}"})
+                    pbar.set_postfix({"emf": f"{avg_metrics['emf_loss']:.4f}", "raw": f"{avg_metrics['emf_raw_mse']:.4f}"})
                 else:
                     log_dict = {
                         "train/fm_loss": avg_metrics['fm_loss'],

@@ -161,14 +161,19 @@ def emf_loss(model, xt, x1, t, r, cond, cond_null, delta_t=0.05,
             target = target + coef.view(B, 1, 1, 1) * corr
 
     # Adaptive loss with the x1 time weight 1/(1-t)^2 (paper Sec. 4.3)
-    residual = pred - target
+    # Use float32 + mean reduction so scale is invariant to C*H*W.
+    # raw_mse (without time weight) is logged for debugging — the adaptive
+    # weight saturates the weighted loss at ~1 while residuals are large.
+    residual = (pred.float() - target.float())
     dims = list(range(1, residual.dim()))
-    per_sample_sq = residual.pow(2).sum(dim=dims)
-    per_sample_sq = per_sample_sq / (1.0 - t).clamp(min=MIN_DENOM).pow(2)
-    weight = 1.0 / (per_sample_sq.detach() + adaptive_c).pow(adaptive_p)
-    loss = (weight * per_sample_sq).mean()
+    base_mse = residual.pow(2).mean(dim=dims)  # [B] without time weight
+    raw_mse = base_mse.detach().mean()
+    per_sample_mse = base_mse / (1.0 - t).clamp(min=MIN_DENOM).pow(2)
+    # Weight from time-weighted mse (paper) — saturates at 1 when per >> c
+    weight = 1.0 / (per_sample_mse.detach() + adaptive_c).pow(adaptive_p)
+    loss = (weight * per_sample_mse).mean()
 
-    return loss, {"loss": loss.item(), "active_frac": active.float().mean().item()}
+    return loss, {"loss": loss.item(), "raw_mse": raw_mse.item(), "raw_time_weighted": per_sample_mse.detach().mean().item(), "active_frac": active.float().mean().item()}
 
 
 # =============================================================================
