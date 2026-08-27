@@ -383,7 +383,7 @@ def apply_cross_sample_mixing(xt, inputs, t, cross_ratio: float):
     inputs_neg = inputs.roll(shifts=1, dims=0)
     noise_neg = torch.randn_like(inputs)
     t_reshaped = t.view(B, 1, 1, 1)
-    xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
+    xt_neg = (1 - t_reshaped) * noise_neg + t_reshaped * inputs_neg  # t=0 noise, t=1 data (EMF)
     return xt + cross_mask * cross_ratio * (xt_neg - xt)
 
 
@@ -636,29 +636,34 @@ def train(config_path: str):
                 step_metrics['emf_loss'] += emf_metrics['loss'] / accum_steps
                 step_metrics['emf_raw_mse'] += emf_metrics.get('raw_mse', emf_metrics['loss']) / accum_steps
             else:
-                # Sample timesteps (t=1 noise, t=0 data)
+                # Sample timesteps (t=0 noise, t=1 data) — consistent with EMF (emf.py:10)
+                # Model predicts x (clean data, x1) in both paths; only time convention differed before.
                 if timestep_sampler == 'logit_normal':
                     t = sample_logit_normal(0.8, 1.0, B, device, torch.bfloat16)
+                    t = 1 - t
                 elif timestep_sampler == 'cosine':
                     t = sample_cosine(B, device, torch.bfloat16)
+                    t = 1 - t
                 else:
                     t = sample_uniform(B, device, torch.bfloat16)
+                    t = 1 - t  # uniform stays uniform, flip for 0=noise convention
 
                 t_reshaped = t.view(B, 1, 1, 1)
                 noise = torch.randn_like(inputs)
-                xt = (1 - t_reshaped) * inputs + t_reshaped * noise
+                xt = (1 - t_reshaped) * noise + t_reshaped * inputs  # t=0 noise, t=1 data
 
-                # Augmentations
+                # Augmentations (cross-mixing expects t with 0=noise)
                 xt = apply_noise_injection(xt, noise_inject_ratio)
                 xt = apply_cross_sample_mixing(xt, inputs, t, cross_ratio)
 
-                # Forward with autocast
+                # Forward with autocast — predict x (data)
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext():
                     x0_pred, infonce_loss = model(xt, t, y_indices, y_offsets, return_layer_match=True)
 
-                # Loss
+                # Loss — compute_fm_loss expects t with 0=noise now, but its SNR was (1-t)^2/t^2 for 1=noise;
+                # flip back for weighting to keep same curriculum: pass 1-t
                 fm_loss, neg_loss, deltafm_loss = compute_deltafm_loss(
-                    x0_pred, inputs, t, deltafm_lambda
+                    x0_pred, inputs, 1 - t, deltafm_lambda
                 )
                 total_loss = deltafm_loss + infonce_weight * infonce_loss
 
