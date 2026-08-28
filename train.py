@@ -6,6 +6,8 @@ import yaml
 import os
 import argparse
 from torchvision.utils import make_grid
+import torchvision.transforms.functional as TF
+from PIL import Image
 from tqdm.auto import tqdm
 import wandb
 import glob
@@ -35,7 +37,56 @@ torch.backends.cuda.enable_flash_sdp(True)
 
 
 from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
+def minibatch_ot_pair_noise(inputs, noise):
+    """
+    Hard minibatch OT pairing using squared Euclidean cost.
 
+    inputs: [B, C, H, W] data/latent batch
+    noise:  [B, C, H, W] Gaussian batch
+
+    Returns:
+        noise_reordered: noise matched to inputs by OT assignment
+    """
+    B = inputs.shape[0]
+
+    with torch.no_grad():
+        x = inputs.detach().float().flatten(1)
+        z = noise.detach().float().flatten(1)
+
+        # Optional normalization makes the cost less dominated by latent scale.
+        # Usually helpful for high-dimensional VAE latents.
+        x = F.normalize(x, dim=1)
+        z = F.normalize(z, dim=1)
+
+        # Cost matrix: [B, B]
+        cost = torch.cdist(x, z, p=2).pow(2)
+
+        try:
+            from scipy.optimize import linear_sum_assignment
+
+            row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
+            col_ind = torch.as_tensor(col_ind, device=inputs.device, dtype=torch.long)
+
+            # row_ind should be [0, 1, ..., B-1], but sort defensively
+            row_ind = torch.as_tensor(row_ind, device=inputs.device, dtype=torch.long)
+            order = torch.argsort(row_ind)
+            col_ind = col_ind[order]
+
+        except Exception:
+            # Greedy fallback if scipy is not installed.
+            # Not exact OT, but often better than random pairing.
+            col_ind = torch.empty(B, device=inputs.device, dtype=torch.long)
+            used = torch.zeros(B, device=inputs.device, dtype=torch.bool)
+
+            for i in range(B):
+                c = cost[i].clone()
+                c[used] = float("inf")
+                j = torch.argmin(c)
+                col_ind[i] = j
+                used[j] = True
+
+    return noise[col_ind]
+    
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -265,10 +316,6 @@ def train(config_path):
             # FIX: removed the arbitrary - 10 offset
             global_step = checkpoint["global_step"] - 10
 
-            if "fixed_noise" in checkpoint and checkpoint["fixed_noise"] is not None:
-                fixed_noise = checkpoint["fixed_noise"].to(device)
-            if "fixed_prompts" in checkpoint:
-                fixed_prompts = checkpoint["fixed_prompts"]
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
@@ -302,7 +349,7 @@ def train(config_path):
             normuon_params.append(p)
 
     try:
-        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.95),
+        opt_adamw = DionAdamW(adamw_params, lr=config['training']['learning_rate'], weight_decay=0, betas=(0.9, 0.999),
                               cautious_wd=True)
         opt_normuon = NorMuon(normuon_params, lr=config['training']['learning_rate'] * 10, weight_decay=0,
                               cautious_wd=True, normuon_variant=True)
@@ -343,7 +390,7 @@ def train(config_path):
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
 
     if rank == 0:
-        wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I'), config=config)
+        wandb.init(project=config.get('wandb_project', 'nanoWaifu-C2I3'), config=config)
         pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
@@ -383,6 +430,7 @@ def train(config_path):
             # VAE Encoding
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
+                latents = latents / 1.7
                 # latents = (latents - latents_mean) / latents_std
                 # Note: latents are already normalized by cache_latents.py
                 inputs = latents
@@ -429,6 +477,7 @@ def train(config_path):
 
             t_reshaped = t.view(B, 1, 1, 1)
             noise = torch.randn_like(inputs)
+            noise = minibatch_ot_pair_noise(inputs, noise)
             xt = (1 - t_reshaped) * inputs + t_reshaped * noise
 
             # --- Training Augmentations (each applied independently w/ 50% chance) ---
@@ -475,7 +524,7 @@ def train(config_path):
                 deltafm_loss = fm_loss
             
             # Full training loss
-            total_loss = deltafm_loss + 0.2 * infonce_loss
+            total_loss = deltafm_loss 
 
             loss = total_loss / accum_steps
             loss.backward()
@@ -549,9 +598,15 @@ def train(config_path):
 
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        # Un-normalize 128ch latents → decode with tiny VAE
-                        # latents = samples * latents_std + latents_mean
-                        out = vae.decode(samples, return_dict=False)
+                        # Un-normalize 128ch latents using VAE stats if available (inverse of cache_latents.py normalization)
+                        if 'latents_mean' in locals() and 'latents_std' in locals() and latents_mean is not None and latents_std is not None:
+                            # Cast stats to samples dtype/device for mixed precision
+                            mean = latents_mean.to(device=samples.device, dtype=samples.dtype)
+                            std = latents_std.to(device=samples.device, dtype=samples.dtype)
+                            latents = samples * std + mean
+                        else:
+                            latents = samples
+                        out = vae.decode(latents, return_dict=False)
                         recon = out[0] if isinstance(out, tuple) else out
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
@@ -559,15 +614,24 @@ def train(config_path):
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
                         # Un-normalize 128ch → pixel_shuffle to 32ch → decode with standard VAE
-                        # latents = samples * latents_std + latents_mean
-                        latents = F.pixel_shuffle(samples, 2)
+                        # Prefer VAE stats (cache_latents.py) over hardcoded 0.82 scale
+                        if 'latents_mean' in locals() and 'latents_std' in locals() and latents_mean is not None and latents_std is not None:
+                            mean = latents_mean.to(device=samples.device, dtype=samples.dtype)
+                            std = latents_std.to(device=samples.device, dtype=samples.dtype)
+                            latents = samples * std + mean
+                        else:
+                            latents = samples * 0.82
+                        latents = F.pixel_shuffle(latents, 2)
                         recon = vae.decode(latents).sample
                         samples = recon.clamp(-1, 1) / 2.0 + 0.5
                         samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
+                    # Convert tensor grid to PIL image before logging (tensor in [0,1] -> PIL)
+                    grid = grid.clamp(0, 1)
+                    grid_pil = TF.to_pil_image(grid.cpu())
                     wandb.log({
-                        "val/samples": wandb.Image(grid, caption=f"Step {global_step}")
+                        "val/samples": wandb.Image(grid_pil, caption=f"Step {global_step}")
                     }, step=global_step)
                 model.train()
 
