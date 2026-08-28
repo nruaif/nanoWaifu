@@ -351,10 +351,6 @@ class TokenformerDiT(nn.Module):
         self.cls_tokens = nn.Parameter(torch.zeros(1, num_cls_tokens, dim))
         nn.init.normal_(self.cls_tokens, std=0.02)
 
-        # Per-CLS-token weight for AdaLN conditioning (per layer, zero-init -> learns gradually)
-        # Shape [depth, num_cls_tokens] scalar weight per token per block, added as weighted sum to c
-        self.cls_token_weights = nn.Parameter(torch.zeros(depth, num_cls_tokens))
-
         self.t_embedder = TimestepEmbedder(dim)
         self.y_embedder = TagTransformer(num_classes, dim)
 
@@ -413,14 +409,6 @@ class TokenformerDiT(nn.Module):
         for idx, block in enumerate(self.blocks):
             # Condition first 4 blocks (idx 0, 1, 2, 3) with timestep only
             c = c_time_only if idx < 4 else c_full
-            # Add per-CLS-token weighted contribution to AdaLN conditioning
-            # Uses current x's CLS tokens (dynamic, per-sample) weighted by learned per-token scalar
-            # Zero-init ensures initial behavior matches baseline (c unchanged at start)
-            if self.num_cls_tokens > 0:
-                w = self.cls_token_weights[idx]  # [num_cls_tokens]
-                cls_tok = x[:, :self.num_cls_tokens]  # [B, num_cls_tokens, dim]
-                cls_pooled = (cls_tok * w.view(1, -1, 1)).sum(dim=1, keepdim=True)  # [B, 1, dim]
-                c = c + cls_pooled
             
             if self.use_checkpoint and self.training:
                 x, qkv_res = checkpoint(block, x, c, H, W, self.rope, self.num_cls_tokens, None, qkv_res,
