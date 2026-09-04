@@ -429,7 +429,11 @@ def train(config_path):
             # VAE Encoding
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
-                latents = (latents - data_mean) / data_std
+                if data_mean is not None and data_std is not None:
+                    # Dynamically detect unnormalized shards (std ~ 0.46) vs already normalized shards (std ~ 1.0)
+                    sample_std = latents.std(dim=(1, 2, 3), keepdim=True)
+                    needs_norm = sample_std < 0.75
+                    latents = torch.where(needs_norm, (latents - data_mean) / data_std, latents)
                 inputs = latents
             elif use_tiny_vae:
                 images = images.to(device, memory_format=torch.channels_last)
