@@ -505,11 +505,12 @@ class TokenformerDiT(nn.Module):
             if z3 is None or z9 is None:
                 infonce_loss = torch.tensor(0.0, device=x.device)
             else:
-                # Paired norm: for each channel, compute joint std across both latents
+                # Paired norm: for each channel, center and scale by joint stats across both latents
                 paired = torch.cat([z3, z9], dim=1)              # [B, 2N, dim]
+                paired_mean = paired.mean(dim=1, keepdim=True)            # [B, 1, dim]
                 paired_std = paired.std(dim=1, keepdim=True).clamp(min=1e-6)  # [B, 1, dim]
-                z3_pn = z3 / paired_std
-                z9_pn = z9 / paired_std
+                z3_pn = (z3 - paired_mean) / paired_std
+                z9_pn = (z9 - paired_mean) / paired_std
 
                 # Per-token cosine similarity, averaged over all tokens and batch
                 z3_norm = F.normalize(z3_pn, dim=-1)  # [B, N, dim]
