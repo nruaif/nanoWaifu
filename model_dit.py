@@ -582,6 +582,8 @@ def sample_flow(model, tag_processor, latent_size, batch_size, prompts, device,
             x = torch.stack([n.to(device) for n in noise[:batch_size]])
         else:
             x = noise.clone().to(device)
+        # Override H, W from actual noise shape (may differ from latent_size due to bucket batching)
+        H, W = x.shape[2], x.shape[3]
     else:
         x = torch.randn(batch_size, in_channels, H, W, device=device)
 
