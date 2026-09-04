@@ -33,60 +33,31 @@ def _async_upload(ckpt_path, repo_id, step):
 
 torch.backends.cuda.enable_flash_sdp(True)
 
-# FIX: removed unused disp_loss function
 
-
-from model_dit import TokenformerDiT as ModelClass, sample_flow as sample_fn, TagProcessor
-def minibatch_ot_pair_noise(inputs, noise):
+def sample_ltg_timesteps(batch_size, num_patches, loc=0.0, scale=1.0, std=0.2, device="cpu", dtype=torch.float32):
     """
-    Hard minibatch OT pairing using squared Euclidean cost.
-
-    inputs: [B, C, H, W] data/latent batch
-    noise:  [B, C, H, W] Gaussian batch
-
-    Returns:
-        noise_reordered: noise matched to inputs by OT assignment
+    Logit-Normal Truncated Gaussian (LTG) Timestep Sampler from Algorithm S2
+    (Patch Forcing: Schusterbauer et al., CompVis @ LMU Munich).
+    Samples per-patch timesteps where t_max ~ LogitNorm(loc, scale),
+    and t_i ~ truncate(N(t_max, std_eff^2)) with std_eff = min(t_max / 2, std).
     """
-    B = inputs.shape[0]
+    eps_max = torch.randn(batch_size, device=device)
+    t_max = torch.sigmoid(loc + scale * eps_max)  # Logit-Normal
+    std_eff = torch.min(t_max / 2.0, torch.full_like(t_max, std))
 
-    with torch.no_grad():
-        x = inputs.detach().float().flatten(1)
-        z = noise.detach().float().flatten(1)
+    t_max_2d = t_max.unsqueeze(1)
+    std_eff_2d = std_eff.unsqueeze(1)
 
-        # Optional normalization makes the cost less dominated by latent scale.
-        # Usually helpful for high-dimensional VAE latents.
-        x = F.normalize(x, dim=1)
-        z = F.normalize(z, dim=1)
+    eps = torch.randn(batch_size, num_patches, device=device)
+    t = t_max_2d - torch.abs(eps) * std_eff_2d
 
-        # Cost matrix: [B, B]
-        cost = torch.cdist(x, z, p=2).pow(2)
+    # Reset values < 0 to uniform in [0, t_max]
+    neg_mask = (t < 0.0)
+    if neg_mask.any():
+        t = torch.where(neg_mask, torch.rand_like(t) * t_max_2d, t)
 
-        try:
-            from scipy.optimize import linear_sum_assignment
+    return t.to(dtype)
 
-            row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
-            col_ind = torch.as_tensor(col_ind, device=inputs.device, dtype=torch.long)
-
-            # row_ind should be [0, 1, ..., B-1], but sort defensively
-            row_ind = torch.as_tensor(row_ind, device=inputs.device, dtype=torch.long)
-            order = torch.argsort(row_ind)
-            col_ind = col_ind[order]
-
-        except Exception:
-            # Greedy fallback if scipy is not installed.
-            # Not exact OT, but often better than random pairing.
-            col_ind = torch.empty(B, device=inputs.device, dtype=torch.long)
-            used = torch.zeros(B, device=inputs.device, dtype=torch.bool)
-
-            for i in range(B):
-                c = cost[i].clone()
-                c[used] = float("inf")
-                j = torch.argmin(c)
-                col_ind[i] = j
-                used[j] = True
-
-    return noise[col_ind]
-    
 
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -143,7 +114,6 @@ def save_checkpoint(
 
     checkpoint = {
         "model_state_dict": model_to_save.state_dict(),
-        # FIX: save optimizer state so resuming doesn't lose momentum/adaptive stats
         "optimizer_state_dict": optimizer.state_dict(),
         "global_step": step,
         "config": config,
@@ -178,11 +148,11 @@ def train(config_path):
 
     if rank != 0:
         def print_pass(*args, **kwargs): pass
-
         builtins.print = print_pass
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
     from model_dit import TokenformerDiT, TagProcessor, sample_flow
     ModelClass, TagProcessor, sample_fn = TokenformerDiT, TagProcessor, sample_flow
 
@@ -270,8 +240,30 @@ def train(config_path):
             in_channels = 128
             print(f">>> VAE Mode Enabled: Model in_channels = {in_channels}")
 
-    latent_size = (image_size // 8) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size',
-                                                                                                        16)
+    if use_cached_latents:
+        data_stats_path = config['data'].get('stats_path', "runtime_stats_online.pt")
+        alt_path = "runtime_stats_online.pt"
+        if not os.path.exists(data_stats_path) and os.path.exists(alt_path):
+            data_stats_path = alt_path
+        if os.path.exists(data_stats_path):
+            print(f">>> Loading cached latent data stats from {data_stats_path}...")
+            dstats = torch.load(data_stats_path, map_location='cpu')
+            dm = dstats["mean"]
+            ds = dstats["std"]
+            if dm.ndim == 1:
+                dm = dm.view(1, -1, 1, 1)
+            if ds.ndim == 1:
+                ds = ds.view(1, -1, 1, 1)
+            data_mean = dm.to(device=device, dtype=torch.bfloat16)
+            data_std = ds.to(device=device, dtype=torch.bfloat16)
+            print(f"    data stats: mean {dm.float().mean().item():.5f} std {ds.float().mean().item():.5f}")
+        else:
+            print(f">>> Warning: {data_stats_path} not found, falling back to VAE stats for cached latents")
+            data_mean, data_std = latents_mean, latents_std
+    else:
+        data_mean, data_std = None, None
+
+    latent_size = (image_size // 8) if (use_vae or use_tiny_vae) else image_size // config['model'].get('patch_size', 16)
 
     model = ModelClass(
         in_channels=128,
@@ -303,6 +295,20 @@ def train(config_path):
 
             state_dict = checkpoint["model_state_dict"]
             model_state = model_to_load.state_dict()
+
+            if "final_proj.weight" in state_dict and "final_proj.weight" in model_state:
+                if state_dict["final_proj.weight"].shape != model_state["final_proj.weight"].shape:
+                    old_w = state_dict["final_proj.weight"]
+                    old_b = state_dict.get("final_proj.bias", None)
+                    new_w = model_state["final_proj.weight"].clone()
+                    new_b = model_state["final_proj.bias"].clone()
+                    new_w[:old_w.shape[0]] = old_w
+                    if old_b is not None:
+                        new_b[:old_b.shape[0]] = old_b
+                    state_dict["final_proj.weight"] = new_w
+                    state_dict["final_proj.bias"] = new_b
+                    print(f">>> Adapted final_proj from {old_w.shape} to {new_w.shape} for difficulty head.")
+
             keys_to_delete = [
                 k for k in state_dict
                 if k in model_state and state_dict[k].shape != model_state[k].shape
@@ -313,9 +319,7 @@ def train(config_path):
                 del state_dict[k]
 
             model_to_load.load_state_dict(state_dict, strict=False)
-            # FIX: removed the arbitrary - 10 offset
-            global_step = checkpoint["global_step"] - 10
-
+            global_step = checkpoint["global_step"]
 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
@@ -323,11 +327,8 @@ def train(config_path):
     if config['training'].get('compile', False):
         print(">>> Compiling Model...")
         model = torch.compile(model, mode="max-autotune")
-    # model.compile()
-    # Reference to the unwrapped model for accessing k-diff parameters
-    model_raw = model.module if hasattr(model, 'module') else model
 
-    # Mock Optimizers for safety if file is missing locally
+    # Optimizer configuration
     try:
         from adv_optm import Muon_adv as NorMuon
         from adv_optm import AdamW_adv as DionAdamW
@@ -379,12 +380,11 @@ def train(config_path):
 
     optimizer = DualOptimizer(opt_adamw, opt_normuon)
 
-    # FIX: restore optimizer state after it's constructed
     if resume_path and os.path.exists(resume_path if isinstance(resume_path, str) else ""):
         saved_checkpoint = torch.load(resume_path, map_location=device)
         if "optimizer_state_dict" in saved_checkpoint:
             try:
-                # optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+                optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
                 print(">>> Optimizer state restored.")
             except Exception as e:
                 print(f">>> Could not restore optimizer state: {e}. Starting fresh.")
@@ -394,24 +394,23 @@ def train(config_path):
         pbar = tqdm(range(global_step, config['training'].get('max_train_steps', 1000000)),
                     desc="Training", dynamic_ncols=True)
         os.makedirs(config['training']['output_dir'], exist_ok=True)
+
     if (use_vae or use_tiny_vae) and not use_cached_latents:
         vae = torch.compile(vae)
+
     data_iter = iter(dataloader)
-    running_loss = 0.0
     running_fm_loss = 0.0
-    running_neg_loss = 0.0
-    running_deltafm_loss = 0.0
+    running_nll_loss = 0.0
     running_total_loss = 0.0
     running_infonce_loss = 0.0
     accum_steps = config['training'].get('grad_accum_steps', 1)
-    is_mar = config['model'].get('type', 'v2') == 'mar'
+
     while global_step < config['training'].get('max_train_steps', 1000000):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
         fm_loss_accum = 0.0
-        neg_loss_accum = 0.0
-        deltafm_loss_accum = 0.0
+        nll_loss_accum = 0.0
         total_loss_accum = 0.0
         infonce_loss_accum = 0.0
 
@@ -430,9 +429,7 @@ def train(config_path):
             # VAE Encoding
             if use_cached_latents:
                 latents = images.to(device=device, dtype=torch.bfloat16)
-                latents = latents / 1.7
-                # latents = (latents - latents_mean) / latents_std
-                # Note: latents are already normalized by cache_latents.py
+                latents = (latents - data_mean) / data_std
                 inputs = latents
             elif use_tiny_vae:
                 images = images.to(device, memory_format=torch.channels_last)
@@ -440,19 +437,15 @@ def train(config_path):
                     v_images = images.to(dtype=torch.bfloat16)
                     out = vae.encode(v_images, return_dict=False)
                     latents = out[0] if isinstance(out, tuple) else out
-                    # Normalize at native 128ch
                     latents = (latents - latents_mean) / latents_std
                     inputs = latents.to(dtype=torch.bfloat16)
-
             elif use_vae:
                 images = images.to(device, memory_format=torch.channels_last)
                 with torch.no_grad():
                     v_images = images.to(dtype=torch.bfloat16)
                     latents = vae.encode(v_images).latent_dist.mode()
-                    # Reshape to 128ch for normalization (stats are in 2x2 patch format)
                     latents = F.pixel_unshuffle(latents, 2).to(dtype=torch.bfloat16)
                     latents = (latents - latents_mean) / latents_std
-                    # Keep in 128ch — model expects in_channels=128
                     inputs = latents
             else:
                 images = images.to(device, memory_format=torch.channels_last)
@@ -464,116 +457,93 @@ def train(config_path):
 
             B, C, H, W = inputs.shape
 
-            def sample_logit_normal(m_loc, s_scale, bs, device, dtype):
-                eps = torch.randn(bs, device=device, dtype=dtype)
-                return torch.sigmoid(m_loc + s_scale * eps)
+            N = H * W
 
-            def sample_uniform(bs, device, dtype):
-                return torch.rand(bs, device=device, dtype=dtype)
-
-            # Global Logit-Normal Timestep Sampler
-            # t = sample_logit_normal(m_loc=0.8, s_scale=1.0, bs=B, device=device, dtype=torch.bfloat16)
-            t = sample_uniform(bs=B, device=device, dtype=torch.bfloat16)
-
-            t_reshaped = t.view(B, 1, 1, 1)
-            noise = torch.randn_like(inputs)
-            noise = minibatch_ot_pair_noise(inputs, noise)
-            xt = (1 - t_reshaped) * inputs + t_reshaped * noise
-
-            # --- Training Augmentations (each applied independently w/ 50% chance) ---
-            # 1. Gaussian noise injection to xt to simulate drift during inference
-            noise_inject_ratio = config['training'].get('noise_inject_ratio', 0.1)
-            if noise_inject_ratio > 0:
-                noise_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                noise_injection = torch.randn_like(xt)
-                xt = xt + noise_mask * noise_inject_ratio * noise_injection
-
-            # 2. Intra-sample crossing: build xt_neg at the SAME timestep t
-            #    from a different clean sample to simulate mean-seeking drift
-            cross_ratio = config['training'].get('cross_ratio', 0.1)
-            if cross_ratio > 0:
-                cross_mask = (torch.rand(B, 1, 1, 1, device=device) < 0.5).to(xt.dtype)
-                inputs_neg = inputs.roll(shifts=1, dims=0)
-                noise_neg = torch.randn_like(inputs)
-
-                xt_neg = (1 - t_reshaped) * inputs_neg + t_reshaped * noise_neg
-                xt = xt + cross_mask * cross_ratio * (xt_neg - xt)
-
-            # Model outputs direct v-prediction and layer match loss
-            v_pred, infonce_loss = model(xt, t, y_indices, y_offsets,
-                                       return_layer_match=True)
-
-            # Compute velocity-space loss (flow matching target: noise - inputs)
-            v_target = noise - inputs
-            deltafm_lambda = config['training'].get('deltafm_lambda', 0.05)
-            if deltafm_lambda > 0 and B > 1:
-                perm = torch.arange(B, device=device).roll(1)
-            
-                inputs_neg = inputs[perm]
-                noise_neg = noise[perm]
-                v_neg_target = noise_neg - inputs_neg
-            
-                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
-                neg_loss = F.mse_loss(v_pred.float(), v_neg_target.float())
-            
-                # ∆FM flow objective
-                deltafm_loss = fm_loss - deltafm_lambda * neg_loss
+            # --- Patch Forcing (PF): Logit-Normal Truncated Gaussian (LTG) Timestep Sampler ---
+            sampler_mode = config['training'].get('timestep_sampler', 'ltg')
+            if sampler_mode == 'ltg':
+                loc = float(config['training'].get('ltg_loc', 0.0))
+                scale = float(config['training'].get('ltg_scale', 1.0))
+                std = float(config['training'].get('ltg_std', 0.2))
+                t = sample_ltg_timesteps(B, N, loc=loc, scale=scale, std=std, device=device, dtype=inputs.dtype)
+            elif sampler_mode == 'uniform':
+                t = torch.rand(B, N, device=device, dtype=inputs.dtype)
             else:
-                fm_loss = F.mse_loss(v_pred.float(), v_target.float())
-                neg_loss = torch.zeros((), device=device)
-                deltafm_loss = fm_loss
-            
-            # Full training loss
-            total_loss = deltafm_loss 
+                t_scalar = torch.rand(B, device=device, dtype=inputs.dtype)
+                t = t_scalar.unsqueeze(1).expand(B, N)
+
+            t_4d = t.view(B, 1, H, W)
+            noise = torch.randn_like(inputs)
+            xt = (1.0 - t_4d) * inputs + t_4d * noise
+            v_target = noise - inputs
+
+            v_pred, logvar_theta, infonce_loss = model(
+                xt, t, y_indices, y_offsets,
+                return_logvar=True, return_layer_match=True
+            )
+
+            # Flow Matching velocity loss (Eq 2)
+            fm_loss = F.mse_loss(v_pred.float(), v_target.float())
+
+            # Difficulty-aware Heteroscedastic NLL Loss (Eq 4 in paper)
+            lambda_nll = float(config['model'].get('lambda_nll', 0.01))
+            if lambda_nll > 0:
+                # Stop-gradient on v_pred as required by Eq 4: sg(v_theta)
+                diff_sq = (v_target.float() - v_pred.detach().float()).pow(2)
+                mse_per_patch = diff_sq.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+                logvar_f = logvar_theta.float()
+                nll_loss = 0.5 * (torch.exp(-logvar_f) * mse_per_patch + logvar_f).mean()
+            else:
+                nll_loss = torch.tensor(0.0, device=device)
+
+            total_loss = fm_loss + lambda_nll * nll_loss
+            if infonce_loss is not None:
+                total_loss = total_loss + infonce_loss
 
             loss = total_loss / accum_steps
             loss.backward()
-            fm_loss_accum += fm_loss.detach().item() / accum_steps
-            neg_loss_accum += neg_loss.detach().item() / accum_steps
-            deltafm_loss_accum += deltafm_loss.detach().item() / accum_steps
-            total_loss_accum += total_loss.detach().item() / accum_steps
-            infonce_loss_accum += infonce_loss.detach().item() / accum_steps
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            fm_loss_accum += fm_loss.detach().item() / accum_steps
+            nll_loss_accum += nll_loss.detach().item() / accum_steps
+            total_loss_accum += total_loss.detach().item() / accum_steps
+            if infonce_loss is not None:
+                infonce_loss_accum += infonce_loss.detach().item() / accum_steps
+
         optimizer.step()
 
         global_step += 1
         running_fm_loss += fm_loss_accum
-        running_neg_loss += neg_loss_accum
-        running_deltafm_loss += deltafm_loss_accum
+        running_nll_loss += nll_loss_accum
         running_total_loss += total_loss_accum
         running_infonce_loss += infonce_loss_accum
+
         if rank == 0:
             pbar.update(1)
 
             if global_step % config['training']['log_every_steps'] == 0:
                 log_interval = config['training']['log_every_steps']
-            
                 avg_fm_loss = running_fm_loss / log_interval
-                avg_neg_loss = running_neg_loss / log_interval
-                avg_deltafm_loss = running_deltafm_loss / log_interval
+                avg_nll_loss = running_nll_loss / log_interval
                 avg_total_loss = running_total_loss / log_interval
                 avg_infonce_loss = running_infonce_loss / log_interval
-            
+
                 wandb.log({
                     "train/fm_loss": avg_fm_loss,
-                    "train/neg_loss": avg_neg_loss,
-                    "train/deltafm_loss": avg_deltafm_loss,
+                    "train/nll_loss": avg_nll_loss,
                     "train/total_loss": avg_total_loss,
                     "train/infonce_loss": avg_infonce_loss,
-                    "train/deltafm_lambda": config['training'].get('deltafm_lambda', 0.05),
+                    "train/logvar_mean": logvar_theta.detach().float().mean().item(),
                 }, step=global_step)
-            
+
                 pbar.set_postfix({
                     "fm": f"{avg_fm_loss:.4f}",
-                    "dfm": f"{avg_deltafm_loss:.4f}",
+                    "nll": f"{avg_nll_loss:.4f}",
                     "total": f"{avg_total_loss:.4f}",
                     "infonce": f"{avg_infonce_loss:.4f}",
                 })
-            
+
                 running_fm_loss = 0.0
-                running_neg_loss = 0.0
-                running_deltafm_loss = 0.0
+                running_nll_loss = 0.0
                 running_total_loss = 0.0
                 running_infonce_loss = 0.0
 
@@ -593,14 +563,15 @@ def train(config_path):
                         device,
                         guidance_scale=config['training'].get('cfg_scale', 1.4),
                         noise=fixed_noise,
-                        sampler_type="euler"
+                        sampler_type=config['training'].get('sampler_type', 'look-ahead'),
+                        p_percentile=float(config['training'].get('p_percentile', 0.4)),
+                        alpha=float(config['training'].get('alpha', 2.0)),
+                        inner_steps=int(config['training'].get('inner_steps', 4))
                     )
 
                     if use_tiny_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        # Un-normalize 128ch latents using VAE stats if available (inverse of cache_latents.py normalization)
                         if 'latents_mean' in locals() and 'latents_std' in locals() and latents_mean is not None and latents_std is not None:
-                            # Cast stats to samples dtype/device for mixed precision
                             mean = latents_mean.to(device=samples.device, dtype=samples.dtype)
                             std = latents_std.to(device=samples.device, dtype=samples.dtype)
                             latents = samples * std + mean
@@ -613,8 +584,6 @@ def train(config_path):
 
                     elif use_vae:
                         samples = samples.to(dtype=torch.bfloat16)
-                        # Un-normalize 128ch → pixel_shuffle to 32ch → decode with standard VAE
-                        # Prefer VAE stats (cache_latents.py) over hardcoded 0.82 scale
                         if 'latents_mean' in locals() and 'latents_std' in locals() and latents_mean is not None and latents_std is not None:
                             mean = latents_mean.to(device=samples.device, dtype=samples.dtype)
                             std = latents_std.to(device=samples.device, dtype=samples.dtype)
@@ -627,7 +596,6 @@ def train(config_path):
                         samples = samples.to(dtype=torch.float32)
 
                     grid = make_grid(samples, nrow=4)
-                    # Convert tensor grid to PIL image before logging (tensor in [0,1] -> PIL)
                     grid = grid.clamp(0, 1)
                     grid_pil = TF.to_pil_image(grid.cpu())
                     wandb.log({

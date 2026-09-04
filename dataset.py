@@ -410,7 +410,7 @@ class WDSLoader:
             )
             .shuffle(10_000, initial=1_000)
             .map(self.preprocess, handler=warn_and_continue)
-            .select(lambda x: x is not None)
+            .select(lambda x: x is not None and "general" in x["prompt"].lower())
             .compose(lambda data: bucket_batch(data, self.batch_size))
         )
 

@@ -12,16 +12,21 @@ training:
   image_size: 256
   num_workers: 4
   class_dropout_prob: 0.1
-  cfg_scale: 7
+  cfg_scale: 3
   output_dir: "outputs_dit"
   wandb_project: "nanoWaifu-C2I3"
   resume_from: "outputs_dit/"
   max_checkpoints: 3
   noise_inject_ratio: 0
   cross_ratio: 0
-  sampler_type: "euler"
-  p_percentile: 0.4
-  alpha: 2.0
+  timestep_sampler: "ltg"    # Patch Forcing: "ltg", "uniform", or "global"
+  ltg_loc: 0.0               # Logit-Normal location parameter m for t_max
+  ltg_scale: 1.0             # Logit-Normal scale parameter s for t_max
+  ltg_std: 0.2               # Truncated Gaussian spread sigma
+  sampler_type: "look-ahead" # "euler", "look-ahead", or "dual-loop"
+  p_percentile: 0.4          # Confidence threshold percentile (0.4 = 40th percentile)
+  alpha: 2.0                 # Context look-ahead factor
+  inner_steps: 4             # Sub-steps for dual-loop sampler
 
 model:
   type: "dit"      # Use TokenformerDiT
@@ -38,7 +43,7 @@ model:
   lambda_nll: 0.01 # Weight for the difficulty-aware NLL loss
 
 data:
-  cache_dir: '/workspace/data/latents-000{00..66}.tar'
+  cache_dir: '/workspace/data/latents-00{00..184}.tar'
   use_cached_latents: true
 
   use_advanced_captions: true
