@@ -374,9 +374,31 @@ def train(config_path):
         def state_dict(self):
             return {"opt1": self.opt1.state_dict(), "opt2": self.opt2.state_dict()}
 
+        def _adapt_state(self, opt):
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if p in opt.state:
+                        state = opt.state[p]
+                        for k, v in list(state.items()):
+                            if k != 'step' and torch.is_tensor(v) and v.shape != p.shape:
+                                new_v = torch.zeros(p.shape, dtype=v.dtype, device=v.device)
+                                slices = tuple(slice(0, min(s_old, s_new)) for s_old, s_new in zip(v.shape, p.shape))
+                                new_v[slices] = v[slices]
+                                state[k] = new_v
+                                print(f">>> Adapted optimizer state tensor '{k}' from {v.shape} to {p.shape}")
+
         def load_state_dict(self, state):
-            if "opt1" in state: self.opt1.load_state_dict(state["opt1"])
-            if "opt2" in state: self.opt2.load_state_dict(state["opt2"])
+            if "opt1" in state:
+                self.opt1.load_state_dict(state["opt1"])
+            elif "state" in state and "param_groups" in state:
+                try:
+                    self.opt1.load_state_dict(state)
+                except Exception:
+                    pass
+            if "opt2" in state:
+                self.opt2.load_state_dict(state["opt2"])
+            self._adapt_state(self.opt1)
+            self._adapt_state(self.opt2)
 
     optimizer = DualOptimizer(opt_adamw, opt_normuon)
 
