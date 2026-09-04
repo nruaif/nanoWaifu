@@ -505,18 +505,20 @@ class TokenformerDiT(nn.Module):
             if z3 is None or z9 is None:
                 infonce_loss = torch.tensor(0.0, device=x.device)
             else:
-                # Paired norm: for each channel, center and scale by joint stats across both latents
-                paired = torch.cat([z3, z9], dim=1)              # [B, 2N, dim]
-                paired_mean = paired.mean(dim=1, keepdim=True)            # [B, 1, dim]
-                paired_std = paired.std(dim=1, keepdim=True).clamp(min=1e-6)  # [B, 1, dim]
-                z3_pn = (z3 - paired_mean) / paired_std
-                z9_pn = (z9 - paired_mean) / paired_std
+                # Group-norm cosine similarity: split channels into groups of 64,
+                # normalize each group independently, compute cos sim per group
+                group_size = 64
+                dim = z3.shape[-1]
+                num_groups = dim // group_size  # e.g. 1024 // 64 = 16
 
-                # Per-token cosine similarity, averaged over all tokens and batch
-                z3_norm = F.normalize(z3_pn, dim=-1)  # [B, N, dim]
-                z9_norm = F.normalize(z9_pn, dim=-1)  # [B, N, dim]
-                cos_sim = (z3_norm * z9_norm).sum(dim=-1).mean()  # scalar in [-1, 1]
-                infonce_loss = 1.0 - cos_sim  # loss: 0 when perfectly aligned
+                z3_g = z3[..., :num_groups * group_size].reshape(*z3.shape[:2], num_groups, group_size)  # [B, N, G, 64]
+                z9_g = z9[..., :num_groups * group_size].reshape(*z9.shape[:2], num_groups, group_size)  # [B, N, G, 64]
+
+                z3_gn = F.normalize(z3_g, dim=-1)  # normalize within each 64-ch group
+                z9_gn = F.normalize(z9_g, dim=-1)
+
+                cos_sim = (z3_gn * z9_gn).sum(dim=-1).mean()  # [B, N, G] → scalar
+                infonce_loss = 1.0 - cos_sim
 
         res = [v_pred]
         if return_logvar:
