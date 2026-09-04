@@ -451,8 +451,8 @@ class TokenformerDiT(nn.Module):
             c_time_only = t_emb
 
         # 6. Process through DiTBlock sequence
-        cls4 = None
-        cls11 = None
+        z3 = None
+        z9 = None
         qkv_res = None
         for idx, block in enumerate(self.blocks):
             # Condition first 4 blocks (idx 0, 1, 2, 3) with timestep only
@@ -464,11 +464,11 @@ class TokenformerDiT(nn.Module):
             else:
                 x, qkv_res = block(x, c, H, W, self.rope, num_cls_tokens=self.num_cls_tokens, qkv_res=qkv_res)
             
-            # Capture CLS tokens for InfoNCE loss
-            if idx == 3:  # Block 4
-                cls4 =  x[:, self.num_cls_tokens:].mean(dim=1)
-            if idx == 11:  # Block 12
-                cls11 = x[:, self.num_cls_tokens:].mean(dim=1)
+            # Capture spatial latents for layer-match loss
+            if idx == 3:   # After block 4 — live gradients
+                z3 = x[:, self.num_cls_tokens:]            # [B, N, dim]
+            if idx == 9:   # After block 10 — detached target
+                z9 = x[:, self.num_cls_tokens:].detach()  # [B, N, dim]
 
         # 7. Strip CLS tokens — only spatial tokens go through the final layer
         x = x[:, self.num_cls_tokens:]  # [B, N, dim]
@@ -499,23 +499,23 @@ class TokenformerDiT(nn.Module):
                 t_clamped = t_clamped.unsqueeze(1)
             v_pred = (x_in.to(device=x0_pred.device, dtype=x0_pred.dtype) - x0_pred) / t_clamped
 
-        # 9. InfoNCE loss calculation (if requested)
+        # 9. Paired-Norm Cosine Similarity loss (if requested)
         infonce_loss = None
         if return_layer_match:
-            if cls4 is None or cls11 is None:
+            if z3 is None or z9 is None:
                 infonce_loss = torch.tensor(0.0, device=x.device)
             else:
-                cls4_norm = F.normalize(cls4, dim=-1)
-                cls11_norm = F.normalize(cls11, dim=-1)
-                
-                temperature = 0.07
-                logits = torch.matmul(cls4_norm, cls11_norm.T) / temperature
-                
-                # Symmetrical InfoNCE loss
-                labels = torch.arange(B, device=x.device)
-                loss_i2j = F.cross_entropy(logits, labels)
-                loss_j2i = F.cross_entropy(logits.T, labels)
-                infonce_loss = (loss_i2j + loss_j2i) / 2
+                # Paired norm: for each channel, compute joint std across both latents
+                paired = torch.cat([z3, z9], dim=1)              # [B, 2N, dim]
+                paired_std = paired.std(dim=1, keepdim=True).clamp(min=1e-6)  # [B, 1, dim]
+                z3_pn = z3 / paired_std
+                z9_pn = z9 / paired_std
+
+                # Per-token cosine similarity, averaged over all tokens and batch
+                z3_norm = F.normalize(z3_pn, dim=-1)  # [B, N, dim]
+                z9_norm = F.normalize(z9_pn, dim=-1)  # [B, N, dim]
+                cos_sim = (z3_norm * z9_norm).sum(dim=-1).mean()  # scalar in [-1, 1]
+                infonce_loss = 1.0 - cos_sim  # loss: 0 when perfectly aligned
 
         res = [v_pred]
         if return_logvar:
